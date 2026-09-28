@@ -248,7 +248,23 @@ dot_ac(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
  * (dot_ac above); the probe=/localgnd= keyword tail is parsed here (a
  * minimal, .stb-specific key=value reader -- not the generic dot_params()
  * helper from the unmerged loop_analysis branch, which this fork does not
- * carry). */
+ * carry).
+ *
+ * QUOTING (found while validating card #456): on a *netlist* ".stb" card,
+ * the numparam brace-expression preprocessor (src/frontend/numparam/
+ * xpressn.c) runs over every dot-card line before dot_stb ever sees it,
+ * and tries to evaluate the RHS of any bare (unquoted) "key=value" as a
+ * number -- so "probe=Vprobe" fails with "Undefined parameter [vprobe]"
+ * unless quoted: "probe="Vprobe"". This is not specific to .stb -- the
+ * unmerged loop_analysis branch's README.loop documents the same
+ * requirement for its own string-valued keyword params ("insrc="<src>":
+ * ... must be quoted inside \"\""). INPgetTok() (used below) already
+ * strips the quotes, so both quoted and unquoted forms parse the SAME way
+ * once past this preprocessing stage. The interactive "stb" control-block
+ * command (com_stb, runcoms.c) is not run through this preprocessor, so
+ * probe=Vprobe (unquoted) works there either way. See
+ * tests/test_stb_native.py and the card #456 report for both forms
+ * exercised against the same build. */
 static int
 dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
         TSKtask *task, CKTnode *gnode, JOB *foo)
