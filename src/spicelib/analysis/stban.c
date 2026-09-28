@@ -263,10 +263,14 @@ STBan(CKTcircuit *ckt, int restart)
                 "stb probe '%s': localgnd= has no effect in device mode "
                 "(there is no current-injection node to reference) -- ignored",
                 job->STBprobeName);
-        if (stb_mos1_probe(inst, &devp)) {
-            SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s': could not read device fields", job->STBprobeName);
-            return E_NOTFOUND;
-        }
+        /* NOTE: devp (node indices AND gm/gmbs) is filled in below, AFTER
+         * the DC operating point is computed -- NOT here. MOS1gm/MOS1gmbs
+         * are only valid once CKTop()+CKTload() have run for this job; a
+         * fresh (never-op'd) circuit reads back gm=gmbs=0 here (found
+         * empirically while validating this card: a device-mode run with
+         * no PRECEDING top-level "op" command silently read a stale
+         * gm=0, giving T=0 for every frequency -- see the card #459
+         * report's "what was not done" / bugs found). */
         branch_probe = 0; node_a = 0; node_b = 0;  /* unused in device mode */
     } else if (inst->GENmodPtr->GENmodType == CKTtypelook("Vsource")) {
         branch_probe = CKTfndBranch(ckt, job->STBprobeName);
@@ -427,6 +431,19 @@ STBan(CKTcircuit *ckt, int restart)
         return E_BADPARM;
     }
 
+    /* card #459: NOW read gm/gmbs and the node indices off the MOS1
+     * instance -- after CKTop()+CKTload() above (fresh start) or a prior
+     * call's op point (resume/pause: MOS1gm lives on the persistent
+     * instance struct, not this function's stack, so it is still valid
+     * here without recomputing). Doing this any earlier reads a
+     * never-computed (zero) gm on a fresh run -- see this file's comment
+     * where device_mode is set, above. */
+    if (device_mode && stb_mos1_probe(inst, &devp)) {
+        SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s': could not read device fields", job->STBprobeName);
+        ckt->CKTcurrentAnalysis = 0;
+        return E_NOTFOUND;
+    }
+
     ckt->CKTcurrentAnalysis = DOING_AC;
     size = SMPmatSize(ckt->CKTmatrix);
 
@@ -471,20 +488,44 @@ STBan(CKTcircuit *ckt, int restart)
              * RHS = u (the gm/gmbs output current's incidence vector):
              * +1 at the internal drain, -1 at the internal source (see
              * stb_mos1_probe()'s header comment for the normal/reverse-mode
-             * node choice). No probe branch equation exists in this mode. */
+             * node choice). No probe branch equation exists in this mode.
+             *
+             * Ground (node index 0) is NOT a real unknown: it is excluded
+             * from the factored system, and CKTrhs[0]/CKTirhs[0] is a
+             * "trash" slot that SMPcSolve does not touch -- so after the
+             * solve it still holds whatever this loop last wrote there,
+             * NOT the (always-exactly-0) ground voltage. Found empirically
+             * while smoke-testing this card (a grounded MOSFET source, the
+             * ordinary case, gave a frequency-INDEPENDENT s exactly equal
+             * to gm -- i.e. w[node_s] was silently reading back the -1.0
+             * this code itself had just written to the RHS, not a solved
+             * value). Guard both the write (skip it -- not needed for
+             * correctness, ground contributes nothing to a real solve
+             * either way) and every read (node 0 reads back as exactly
+             * 0+0j, never the trash slot). This is a general MNA fact, not
+             * specific to device mode; the existing loop-mode code above
+             * does not hit it because none of this fork's reference decks
+             * probe a wire with a literal-ground terminal -- see the card
+             * #459 report's "what was not done" for this latent issue. */
             for (i = 0; i <= size; i++) {
                 ckt->CKTrhs[i] = 0.0;
                 ckt->CKTirhs[i] = 0.0;
             }
-            ckt->CKTrhs[devp.node_d] += 1.0;
-            ckt->CKTrhs[devp.node_s] -= 1.0;
+            if (devp.node_d != 0) ckt->CKTrhs[devp.node_d] += 1.0;
+            if (devp.node_s != 0) ckt->CKTrhs[devp.node_s] -= 1.0;
             SMPcSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTirhs, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
             /* s = gm * v_gm^T w, w = Y^-1 u, v_gm = +1 at gate, -1 at the
              * internal source (gm-only production default; gmbs NOT
              * folded in here -- see stb_mos1_probe()'s doc comment on the
              * STBdevProbe struct, above). */
-            s.re = devp.gm * (ckt->CKTrhs[devp.node_g] - ckt->CKTrhs[devp.node_s]);
-            s.im = devp.gm * (ckt->CKTirhs[devp.node_g] - ckt->CKTirhs[devp.node_s]);
+            {
+                double wg_re = devp.node_g ? ckt->CKTrhs[devp.node_g]  : 0.0;
+                double wg_im = devp.node_g ? ckt->CKTirhs[devp.node_g] : 0.0;
+                double ws_re = devp.node_s ? ckt->CKTrhs[devp.node_s]  : 0.0;
+                double ws_im = devp.node_s ? ckt->CKTirhs[devp.node_s] : 0.0;
+                s.re = devp.gm * (wg_re - ws_re);
+                s.im = devp.gm * (wg_im - ws_im);
+            }
 
             if (getenv("STB_DEBUG"))
                 fprintf(stderr, "STB_DEBUG f=%g device node_d=%d node_s=%d node_g=%d node_b=%d "
