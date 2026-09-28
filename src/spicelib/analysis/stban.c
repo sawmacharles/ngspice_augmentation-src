@@ -66,6 +66,21 @@ implement (see the card #457 report's "what was not done").
 #include "ngspice/ipctiein.h"
 #endif
 
+/* card #459 (plan T3.4): device-based ("gain-nulling") .stb, probe=<MOSFET
+ * instance>. mos1defs.h resolves via the -I$(top_srcdir)/src/spicelib/
+ * devices already on this directory's AM_CPPFLAGS (see Makefile.am) -- no
+ * build-system change needed for this one extra include. This is the "small
+ * per-model hook" the plan calls for: a helper that reads the instance's own
+ * model-specific fields directly, not a new SPICEdev-wide function pointer
+ * (SPICEdev is shared by 100+ device tables in this fork; a field there for
+ * one device family was not worth the footprint for a private, non-upstream
+ * fork). BSIM4 is NOT implemented (see this file's stb_device_probe() and
+ * the card #459 report's "what was not done"): its DEVacLoad (b4acld.c)
+ * mixes the gm/gmbs stamp with NQS and forward/reverse transcapacitance sums
+ * in a way that does not visibly reduce to the same two-vector rank-1
+ * pattern without more study than this card's budget allowed. */
+#include "mos1/mos1defs.h"
+
 extern SPICEdev **DEVices;
 
 typedef struct { double re, im; } STBcplx;
@@ -131,6 +146,66 @@ push_crossing(CROSSING *arr, int *n, int *cap, double freq, double value, double
     return arr;
 }
 
+/* card #459: everything STBan's device-mode branch needs to null a
+ * MOSFET's dominant controlled source, in the rank-1 form
+ *   T = 1/(1 - s) - 1,  s = gm * v^T Y^-1 u
+ * with the ordinary (gm-included) complex AC matrix Y factored ONCE per
+ * frequency (the same factorization CKTacLoad/SMPcLUfac already produce for
+ * loop mode) and ONE extra back-solve, w = Y^-1 u (research/cadence-stb-
+ * pstb.md sec 2.5's "cheaper alternative", and this card's math derivation
+ * -- see the card #459 report):
+ *   u    = +1 at node_d, -1 at node_s   (the gm/gmbs current: drain row +,
+ *          source row -)
+ *   v_gm = +1 at node_g, -1 at node_s   (the controlling voltage: gate col
+ *          +, source col -)
+ * so s = gm * (w[node_g] - w[node_s]), read off the SAME solve vector
+ * SMPcSolve already overwrites CKTrhs/CKTirhs with (matching stban.c's
+ * existing loop-mode v1/v2/i1/i2 reads, immediately below in STBan()).
+ *
+ * gm-only vs gm+gmbs (documented per this card's requirement): production
+ * nulls gm ALONE -- x = the drain-source VCCS gm*vgs, node_b/gmbs below are
+ * computed but NOT added into s. This fork's read of "the dominant
+ * controlled source" (research/cadence-stb-pstb.md sec 2.5's [DOC-gap] on
+ * what Spectre itself nulls) is the transconductance alone: gmbs is a
+ * second, materially smaller VCCS on a typical device and folding it in
+ * changes the applicability argument (nulling gm+gmbs together is a rank-1
+ * update too, since both share the same output nodes node_d/node_s -- see
+ * the report -- but was not made the default). tests/test_stb_device.py's
+ * body-effect check shows this choice is NOT negligible: gm-only vs
+ * gm+gmbs read measurably different T on a source-degenerated stage. */
+typedef struct {
+    int node_d, node_s, node_g, node_b;
+    double gm, gmbs;
+} STBdevProbe;
+
+/* Node convention, worked out by hand against MOS1acLoad's own stamp
+ * (src/spicelib/devices/mos1/mos1acld.c -- DPdpPtr/SPspPtr/DPgPtr/SPgPtr/
+ * DPbPtr/SPbPtr/DPspPtr/SPdpPtr, the xnrm/xrev-gated terms), not merely
+ * assumed: the gm+gmbs contribution to the AC matrix is exactly the outer
+ * product u * (gm*v_gm + gmbs*v_gmbs)^T given above, in NORMAL mode
+ * (MOS1mode >= 0: node_d/node_s = the internal drain/source-prime nodes,
+ * i.e. dNodePrime/sNodePrime -- NOT the external dNode/sNode: when RD/RS
+ * != 0 the gm stamp sits on the internal nodes, on the far side of the
+ * drain/source series resistance). In REVERSE mode (MOS1mode < 0, Vds < 0:
+ * the model's own notion of "drain" and "source" swaps), the identical
+ * stamps reappear with dNodePrime and sNodePrime exchanged throughout --
+ * this function applies that substitution so callers never need to know
+ * the sign of MOS1mode themselves. */
+static int
+stb_mos1_probe(GENinstance *inst, STBdevProbe *p)
+{
+    MOS1instance *here = (MOS1instance *) inst;
+    bool normal = (here->MOS1mode >= 0);
+
+    p->node_d = normal ? here->MOS1dNodePrime : here->MOS1sNodePrime;
+    p->node_s = normal ? here->MOS1sNodePrime : here->MOS1dNodePrime;
+    p->node_g = here->MOS1gNode;
+    p->node_b = here->MOS1bNode;
+    p->gm     = here->MOS1gm;
+    p->gmbs   = here->MOS1gmbs;
+    return 0;
+}
+
 int
 STBan(CKTcircuit *ckt, int restart)
 {
@@ -146,6 +221,11 @@ STBan(CKTcircuit *ckt, int restart)
     GENinstance *inst2 = NULL;
     int branch_probe2 = 0, node_b2 = 0;
     double dmcm_sign = 1.0;
+
+    /* card #459: device-based (gain-nulling) mode, probe=<MOSFET instance>.
+     * See stb_mos1_probe() above and the card #459 report for the math. */
+    int device_mode = 0;
+    STBdevProbe devp;
 
     STBcplx v1, i1, v2, i2, s, t, lg;
 
@@ -166,19 +246,43 @@ STBan(CKTcircuit *ckt, int restart)
         SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s' not in circuit", job->STBprobeName);
         return E_NOTFOUND;
     }
-    if (inst->GENmodPtr->GENmodType != CKTtypelook("Vsource")) {
+    if (inst->GENmodPtr->GENmodType == CKTtypelook("Mos1")) {
+        /* card #459: device mode. probe2/mode=dm|cm (loop-mode DM/CM,
+         * card #457) is meaningless here -- refuse rather than silently
+         * ignore it (rule: no silent numbers). */
+        device_mode = 1;
+        if (job->STBprobeName2Given || job->STBmodeGiven) {
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb probe '%s' is a device (device-mode gain-nulling); "
+                "probe2=/mode=dm|cm (loop-mode differential probing) cannot "
+                "be combined with a device-mode probe", job->STBprobeName);
+            return E_PARMVAL;
+        }
+        if (job->STBlocalGndGiven)
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb probe '%s': localgnd= has no effect in device mode "
+                "(there is no current-injection node to reference) -- ignored",
+                job->STBprobeName);
+        if (stb_mos1_probe(inst, &devp)) {
+            SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s': could not read device fields", job->STBprobeName);
+            return E_NOTFOUND;
+        }
+        branch_probe = 0; node_a = 0; node_b = 0;  /* unused in device mode */
+    } else if (inst->GENmodPtr->GENmodType == CKTtypelook("Vsource")) {
+        branch_probe = CKTfndBranch(ckt, job->STBprobeName);
+        if (branch_probe == 0) {
+            SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s': no branch equation found", job->STBprobeName);
+            return E_NOTFOUND;
+        }
+        node_a = GENnode(inst)[0];
+        node_b = GENnode(inst)[1];
+    } else {
         SPfrontEnd->IFerrorf(ERR_WARNING,
             "stb probe '%s' must be a voltage source (an existing 0V V-source "
-            "in series with the loop-break wire)", job->STBprobeName);
+            "in series with the loop-break wire) or a supported active device "
+            "instance (device mode: mos1 only in this fork)", job->STBprobeName);
         return E_NOTFOUND;
     }
-    branch_probe = CKTfndBranch(ckt, job->STBprobeName);
-    if (branch_probe == 0) {
-        SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s': no branch equation found", job->STBprobeName);
-        return E_NOTFOUND;
-    }
-    node_a = GENnode(inst)[0];
-    node_b = GENnode(inst)[1];
 
     /* ---- card #457: resolve the optional branch-n probe (probe=Vp,Vn
      * mode=dm|cm) ---- */
@@ -362,6 +466,43 @@ STBan(CKTcircuit *ckt, int restart)
             if (error) { ckt->CKTcurrentAnalysis = 0; return error; }
         }
 
+        if (device_mode) {
+            /* card #459: device-based gain-nulling, ONE extra back-solve.
+             * RHS = u (the gm/gmbs output current's incidence vector):
+             * +1 at the internal drain, -1 at the internal source (see
+             * stb_mos1_probe()'s header comment for the normal/reverse-mode
+             * node choice). No probe branch equation exists in this mode. */
+            for (i = 0; i <= size; i++) {
+                ckt->CKTrhs[i] = 0.0;
+                ckt->CKTirhs[i] = 0.0;
+            }
+            ckt->CKTrhs[devp.node_d] += 1.0;
+            ckt->CKTrhs[devp.node_s] -= 1.0;
+            SMPcSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTirhs, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
+            /* s = gm * v_gm^T w, w = Y^-1 u, v_gm = +1 at gate, -1 at the
+             * internal source (gm-only production default; gmbs NOT
+             * folded in here -- see stb_mos1_probe()'s doc comment on the
+             * STBdevProbe struct, above). */
+            s.re = devp.gm * (ckt->CKTrhs[devp.node_g] - ckt->CKTrhs[devp.node_s]);
+            s.im = devp.gm * (ckt->CKTirhs[devp.node_g] - ckt->CKTirhs[devp.node_s]);
+
+            if (getenv("STB_DEBUG"))
+                fprintf(stderr, "STB_DEBUG f=%g device node_d=%d node_s=%d node_g=%d node_b=%d "
+                    "gm=%.10g gmbs=%.10g s=%.10g%+.10gj\n",
+                    freq, devp.node_d, devp.node_s, devp.node_g, devp.node_b,
+                    devp.gm, devp.gmbs, s.re, s.im);
+
+            /* T = 1/(1-s) - 1 (research/cadence-stb-pstb.md sec 2.5's
+             * rank-1 form, derived from the matrix determinant lemma --
+             * see the card #459 report). loopGain = -T, same convention
+             * as loop mode. */
+            {
+                STBcplx one = { 1.0, 0.0 };
+                t = stb_csub(stb_cdiv(one, stb_csub(one, s)), one);
+                lg.re = -t.re; lg.im = -t.im;
+            }
+        } else {
+
         /* RHS #1: unit voltage injection in the probe branch equation */
         ckt->CKTrhs[branch_probe] = -1.0;
         ckt->CKTirhs[branch_probe] = 0.0;
@@ -423,6 +564,7 @@ STBan(CKTcircuit *ckt, int restart)
             s = stb_cadd(stb_cadd(two_diff, v1), i2);
             t = stb_cdiv(s, stb_csub(one, s));
             lg.re = -t.re; lg.im = -t.im;
+        }
         }
 
         if (npts >= cap) {
