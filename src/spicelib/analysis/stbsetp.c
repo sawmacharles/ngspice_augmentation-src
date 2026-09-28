@@ -76,6 +76,20 @@ STBsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->STBlocalGndGiven = 1;
         break;
 
+    case STB_PROBE2:
+        job->STBprobeName2 = value->uValue;
+        job->STBprobeName2Given = 1;
+        break;
+
+    case STB_MODE:
+        if (value->iValue != STB_MODE_DM && value->iValue != STB_MODE_CM) {
+            errMsg = copy("stb mode= must be dm or cm");
+            return (E_PARMVAL);
+        }
+        job->STBmode = value->iValue;
+        job->STBmodeGiven = 1;
+        break;
+
     default:
         return (E_BADPARM);
     }
@@ -89,8 +103,10 @@ static IFparm STBparms[] = {
     { "dec",      STB_DEC,      IF_SET | IF_ASK | IF_FLAG,     "step by decades" },
     { "oct",      STB_OCT,      IF_SET | IF_ASK | IF_FLAG,     "step by octaves" },
     { "lin",      STB_LIN,      IF_SET | IF_ASK | IF_FLAG,     "step linearly" },
-    { "probe",    STB_PROBE,    IF_SET | IF_ASK | IF_INSTANCE, "loop-break probe: an existing 0V V-source" },
+    { "probe",    STB_PROBE,    IF_SET | IF_ASK | IF_INSTANCE, "loop-break probe: an existing 0V V-source, or inst:terminal" },
     { "localgnd", STB_LOCALGND, IF_SET | IF_ASK | IF_NODE,     "local ground reference node (optional)" },
+    { "probe2",   STB_PROBE2,   IF_SET | IF_ASK | IF_INSTANCE, "second (branch n) probe for probe=Vp,Vn mode=dm|cm (set via probe=)" },
+    { "mode",     STB_MODE,     IF_SET | IF_ASK | IF_INTEGER,  "1=dm, 2=cm (set via mode=dm|cm on probe=Vp,Vn)" },
 };
 
 SPICEanalysis STBinfo = {

@@ -6,6 +6,7 @@ Modified: 2000 AlansFixes
 
 #include "ngspice/ngspice.h"
 #include <stdio.h>
+#include <string.h>
 #include "ngspice/ifsim.h"
 #include "ngspice/iferrmsg.h"
 #include "ngspice/inpdefs.h"
@@ -15,6 +16,13 @@ Modified: 2000 AlansFixes
 #include "ngspice/cpdefs.h"
 #include "ngspice/tskdefs.h"
 #include "ngspice/stringutil.h"
+/* card #457: probe=<inst>:<terminal> auto-insert needs the CKT device/node
+ * manipulation API (CKTfndDev, CKTmkVolt, CKTmodCrt, CKTcrtElt, CKTbindNode,
+ * CKTnum2nod, CKTtypelook, CKTpName) and the device table (DEVices[]). */
+#include "ngspice/cktdefs.h"
+#include "ngspice/devdefs.h"
+#include "ngspice/gendefs.h"
+#include "ngspice/stbdefs.h"   /* STB_MODE_DM / STB_MODE_CM */
 
 static int
 dot_noise(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
@@ -240,12 +248,182 @@ dot_ac(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
     return (0);
 }
 
-/* ngspice_augmentation card #456: native .stb loop-stability analysis.
- * Syntax: .stb dec|oct|lin <n> <fstart> <fstop> probe=<Vname> [localgnd=<node>]
- * (spec.md stb_syntax; probe must be an existing 0V V-source already in the
- * loop -- see src/spicelib/analysis/stban.c for the a/b terminal convention).
+/* ngspice_augmentation card #457: probe=<inst>:<terminal> auto-insert.
+ *
+ * Splits the named terminal of an existing device instance onto a new
+ * internal node, in series with a freshly-inserted 0V V-source, so a loop
+ * can be probed without hand-editing the netlist to add a probe device.
+ * Modeled on (not copied from, and not compiled from) the unmerged
+ * loop_analysis branch's LOOPpreset (src/spicelib/analysis/loopan.c on
+ * branch loop_analysis, commit fb93986e, fetched read-only as
+ * origin/loop_analysis per card #457's brief -- research/
+ * ngspice-internals-pss-pac.md sec 2.6). LOOPpreset does the equivalent
+ * splice from an analysis's an_init hook, which in this fork's cktdojob.c
+ * flow runs AFTER CKTsetup has already sized/factored the matrix once for
+ * the run -- inserting a device there would need the (KLU-capable, per
+ * buildrecipe/README.md) sparse matrix to grow post-setup, which was not
+ * risked here. Doing the splice HERE instead, at netlist-parse time (both
+ * ".stb ... probe=inst:term" on a netlist card, and the interactive "stb
+ * ... probe=inst:term" command -- if_run() in spiceif.c builds the latter
+ * into a ".stb ..." line and feeds it through this SAME dot_stb, so both
+ * forms hit this code), is unconditionally before CKTsetup: CKTsetup runs
+ * once per CKTdoJob call, itself only reachable after the deck (or the
+ * interactive command's synthesized one-line deck) has been fully
+ * translate()d, i.e. after dot_stb has already returned. This means: this
+ * instance must already exist in the netlist by the time the .stb card
+ * naming it is reached (normal SPICE deck order: analysis cards after
+ * device cards); a forward reference is COULD-NOT-RUN, not silently
+ * ignored (see the "instance not found" case below).
+ *
+ * a/b convention (documented per card #457's requirement -- matches
+ * stban.c's existing probe=<Vname> doc and LOOPpreset's own node1/node2
+ * assignment): the new V-source's node 1 (a, "downstream": where run 1's
+ * voltage is read back) is the NEW internal node, now bound to the named
+ * device's terminal; node 2 (b, "upstream": where run 2's current is
+ * injected) is the ORIGINAL node the terminal used to connect straight to.
+ * Unlike LOOPpreset (whose node-name suffix is the constant "loopinj",
+ * regardless of which terminal), the suffix here includes the terminal
+ * name, so probing two different terminals of the SAME instance in one
+ * deck cannot collide on one synthesized node name.
+ *
+ * Idempotent like LOOPpreset: probing the same inst:terminal a second
+ * time (e.g. re-running the interactive "stb" command in one session)
+ * finds the already-inserted probe by its deterministic name and reuses
+ * it rather than splicing again.
+ *
+ * Red-proof (card #457): a nonexistent instance or terminal name attaches
+ * an error to the card via LITERR (current->error) -- the standard ngspice
+ * parse-error path, which refuses to run the circuit -- never a silent
+ * default probe. */
+static int
+stb_probe_splice(CKTcircuit *ckt, struct card *current, char *spec, IFuid *out_probe_uid)
+{
+    char *colon, *instname, *termname;
+    GENinstance *inst;
+    IFdevice *dev;
+    int termidx, ntermnames;
+    IFuid eltUid, modUid;
+    GENinstance *probesrc;
+    GENmodel *modvsrc;
+    CKTnode *nodeinj, *extnode;
+    IFvalue ptemp;
+    int error, vtype;
+    char sbuf[128];
+    char msg[256];
+
+    *out_probe_uid = NULL;
+
+    colon = strchr(spec, ':');
+    if (!colon)
+        return 1;  /* not this syntax; caller treats spec as a plain instance name */
+
+    instname = spec;
+    *colon = '\0';
+    termname = colon + 1;
+
+    if (!*instname || !*termname) {
+        current->error = INPerrCat(current->error,
+            INPmkTemp("'.stb' probe=inst:terminal needs both an instance name and a terminal name\n"));
+        return 2;
+    }
+
+    inst = CKTfndDev(ckt, (IFuid) instname);
+    if (!inst || inst->GENmodPtr->GENmodType < 0) {
+        snprintf(msg, sizeof msg, "stb probe: instance '%s' not in circuit (forward references "
+                 "to a probe=inst:terminal are not supported -- the instance must appear "
+                 "before the .stb card)\n", instname);
+        current->error = INPerrCat(current->error, INPmkTemp(msg));
+        return 2;
+    }
+
+    dev = &(DEVices[inst->GENmodPtr->GENmodType]->DEVpublic);
+    ntermnames = dev->numNames ? *(dev->numNames) : 0;
+    for (termidx = 0; termidx < ntermnames; termidx++)
+        if (strcasecmp(termname, dev->termNames[termidx]) == 0)
+            break;
+    if (termidx >= ntermnames) {
+        snprintf(msg, sizeof msg, "stb probe: instance '%s' has no terminal '%s'\n", instname, termname);
+        current->error = INPerrCat(current->error, INPmkTemp(msg));
+        return 2;
+    }
+
+    /* idempotent probe name, keyed on instance + terminal index */
+    snprintf(sbuf, sizeof sbuf, "stbprobe_%s", termname);
+    error = SPfrontEnd->IFnewUid(ckt, &eltUid, inst->GENname, sbuf, UID_INSTANCE, NULL);
+    if (error) {
+        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not allocate probe instance name\n"));
+        return 2;
+    }
+    probesrc = CKTfndDev(ckt, eltUid);
+    if (probesrc && probesrc->GENmodPtr->GENmodType == CKTtypelook("Vsource")) {
+        /* already spliced in (repeat interactive "stb ... probe=inst:term") */
+        *out_probe_uid = probesrc->GENname;
+        return 0;
+    }
+
+    extnode = CKTnum2nod(ckt, GENnode(inst)[termidx]);
+
+    error = CKTmkVolt(ckt, &nodeinj, inst->GENname, sbuf);
+    if (error) {
+        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not create the internal node\n"));
+        return 2;
+    }
+
+    error = SPfrontEnd->IFnewUid(ckt, &modUid, inst->GENname, "stbprobemod", UID_MODEL, NULL);
+    if (error) {
+        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not allocate probe model name\n"));
+        return 2;
+    }
+    vtype = CKTtypelook("Vsource");
+    modvsrc = NULL;
+    error = CKTmodCrt(ckt, vtype, &modvsrc, modUid);
+    if (error) {
+        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not create the probe's model\n"));
+        return 2;
+    }
+    error = CKTcrtElt(ckt, modvsrc, &probesrc, eltUid);
+    if (error) {
+        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not create the probe instance\n"));
+        return 2;
+    }
+    ptemp.rValue = 0;
+    error = CKTpName("dc", &ptemp, ckt, vtype, "probe", &probesrc);
+    if (error) {
+        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not set the probe's DC value\n"));
+        return 2;
+    }
+    error = CKTbindNode(ckt, probesrc, 1, nodeinj);
+    if (!error) error = CKTbindNode(ckt, probesrc, 2, extnode);
+    if (!error) error = CKTbindNode(ckt, inst, termidx + 1, nodeinj);
+    if (error) {
+        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not wire the probe in\n"));
+        return 2;
+    }
+
+    printf("stb: probe=%s:%s -- auto-inserted 0V probe '%s' "
+           "(a=new internal node bound to %s's terminal %s, b=%s, the original net)\n",
+           instname, termname, (char *) probesrc->GENname, instname, termname,
+           extnode->name ? (char *) extnode->name : "0");
+
+    *out_probe_uid = probesrc->GENname;
+    return 0;
+}
+
+/* ngspice_augmentation card #456/#457: native .stb loop-stability analysis.
+ * Syntax: .stb dec|oct|lin <n> <fstart> <fstop> probe=<probespec> [probe2=<Vn>] [localgnd=<node>] [mode=dm|cm]
+ *   <probespec> ::= <Vname>            | an existing 0V V-source already in the loop (#456)
+ *                  | <inst>:<terminal> | auto-insert a probe by splitting that terminal (#457,
+ *                                        stb_probe_splice() above)
+ *                  | <Vp>,<Vn>         | native DM/CM (#457, requires mode=dm|cm) -- best-effort;
+ *                                        may not survive the interactive command's own comma-
+ *                                        splitting tokenizer, see the probe2= case below
+ * Native DM/CM (#457, requires mode=dm|cm together with either probe=<Vp>,<Vn> or the
+ * RECOMMENDED probe=<Vp> probe2=<Vn>): Vp and Vn are each an existing 0V V-source, driven in
+ * lockstep (antiphase for dm, in phase for cm); T is read from Vp only (branch p), see stban.c
+ * and stb/diffprobe.lib's "reading branch 1 alone is enough" symmetry note.
+ * (spec.md stb_syntax; see src/spicelib/analysis/stban.c for the a/b terminal convention).
  * The dec/oct/lin/n/fstart/fstop prefix is parsed exactly like .ac
- * (dot_ac above); the probe=/localgnd= keyword tail is parsed here (a
+ * (dot_ac above); the probe=/localgnd=/mode= keyword tail is parsed here (a
  * minimal, .stb-specific key=value reader -- not the generic dot_params()
  * helper from the unmerged loop_analysis branch, which this fork does not
  * carry).
@@ -278,6 +456,7 @@ dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
     char *mline = line;
     double startval, stopval;
     bool sawProbe = FALSE;
+    bool sawProbe2 = FALSE, sawMode = FALSE;
 
     NG_IGNORE(gnode);
 
@@ -347,12 +526,103 @@ dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
         }
         line++; /* skip '=' */
         if (cieq(key, "probe")) {
-            char *name;
-            INPgetTok(&line, &name, 1);
-            INPinsert(&name, tab);
-            ptemp.uValue = name;
-            GCA(INPapName, (ckt, which, foo, "probe", &ptemp));
-            sawProbe = TRUE;
+            /* card #457: probe= now takes three forms --
+             *   probe=<Vname>              plain existing 0V V-source (unchanged, card #456)
+             *   probe=<inst>:<terminal>    auto-insert (stb_probe_splice() above)
+             *   probe=<Vp>,<Vn> mode=dm|cm native differential/common-mode (branch p is Vp)
+             * Two tokenizer quirks (inpgtok.c) both matter here, so this uses
+             * INPgetNetTok(), not INPgetTok():
+             *   (1) INPgetTok() splits tokens AT a comma (and gobbles it when
+             *       gobble=1), so "Vp,Vn" cannot be told apart from plain "Vp"
+             *       AFTER calling it once -- the comma is looked for in the
+             *       raw line FIRST, below, specifically to decide this.
+             *   (2) INPgetTok() also treats a bare '+'/'-' as a possible
+             *       floating-point exponent sign and can end a token on one
+             *       (e.g. terminal name "C+" -- a capacitor's IFdevice
+             *       termNames[0], see stb_probe_splice() -- reads back as
+             *       just "C", found while validating card #457's
+             *       probe=Cn:C+). INPgetNetTok() (used for localgnd= below
+             *       already) has no such sign-state logic. */
+            char *name, *name2 = NULL;
+            char *p;
+            bool hascomma = FALSE;
+            for (p = line; *p && *p != ' ' && *p != '\t' && *p != '\r'; p++)
+                if (*p == ',') { hascomma = TRUE; break; }
+
+            INPgetNetTok(&line, &name, 1);
+            if (hascomma) {
+                INPgetNetTok(&line, &name2, 1);
+                if (!*name || !*name2) {
+                    LITERR("'.stb' probe=<Vp>,<Vn> needs two non-empty probe names\n");
+                    tfree(name); tfree(name2);
+                    return (0);
+                }
+                INPinsert(&name, tab);
+                INPinsert(&name2, tab);
+                ptemp.uValue = name;
+                GCA(INPapName, (ckt, which, foo, "probe", &ptemp));
+                ptemp.uValue = name2;
+                GCA(INPapName, (ckt, which, foo, "probe2", &ptemp));
+                sawProbe = TRUE;
+                sawProbe2 = TRUE;
+            } else if (strchr(name, ':')) {
+                IFuid spliced = NULL;
+                int serr = stb_probe_splice(ckt, current, name, &spliced);
+                tfree(name);
+                if (serr) return (0);  /* error already attached to current->error */
+                ptemp.uValue = spliced;
+                GCA(INPapName, (ckt, which, foo, "probe", &ptemp));
+                sawProbe = TRUE;
+            } else {
+                INPinsert(&name, tab);
+                ptemp.uValue = name;
+                GCA(INPapName, (ckt, which, foo, "probe", &ptemp));
+                sawProbe = TRUE;
+            }
+        } else if (cieq(key, "probe2")) {
+            /* card #457: probe2=<Vn>, an explicit alternative to
+             * probe=<Vp>,<Vn> for native mode=dm|cm. Documented as the
+             * RECOMMENDED form (spec.md stb_syntax / this card's report):
+             * the interactive "stb ..." control command is tokenized into
+             * a wordlist by ngspice's OWN command-line lexer (cp_event
+             * loop) BEFORE if_run() ever reassembles it into a ".stb ..."
+             * line for dot_stb -- and that lexer ALSO splits on comma, so
+             * probe=Vp,Vn arrives here already mangled into "probe=vp" +
+             * a stray "vn" token (found validating card #457; a netlist
+             * ".stb" card's numparam preprocessing is a separate stage and
+             * was not exhaustively checked either). probe=<Vp> probe2=
+             * <Vn> mode=dm|cm, three independent key=value pairs, needs no
+             * character that any layer of ngspice's tokenizing treats as a
+             * separator, so it is reliable on both the interactive command
+             * and the netlist card. The comma form above is left in for
+             * whichever form it happens to survive on, but is not the
+             * form this card's own tests (or its docs) rely on. */
+            char *name2;
+            INPgetNetTok(&line, &name2, 1);
+            if (!*name2) {
+                LITERR("'.stb' probe2= needs a probe name\n");
+                tfree(name2);
+                return (0);
+            }
+            INPinsert(&name2, tab);
+            ptemp.uValue = name2;
+            GCA(INPapName, (ckt, which, foo, "probe2", &ptemp));
+            sawProbe2 = TRUE;
+        } else if (cieq(key, "mode")) {
+            char *mval;
+            INPgetTok(&line, &mval, 1);
+            if (cieq(mval, "dm")) {
+                ptemp.iValue = STB_MODE_DM;
+            } else if (cieq(mval, "cm")) {
+                ptemp.iValue = STB_MODE_CM;
+            } else {
+                LITERR("'.stb' mode= must be dm or cm\n");
+                tfree(mval);
+                return (0);
+            }
+            GCA(INPapName, (ckt, which, foo, "mode", &ptemp));
+            tfree(mval);
+            sawMode = TRUE;
         } else if (cieq(key, "localgnd")) {
             char *nname;
             CKTnode *nnode;
@@ -368,7 +638,11 @@ dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
         tfree(key);
     }
     if (!sawProbe) {
-        LITERR("'.stb' needs probe=<Vname> (an existing 0V V-source that breaks the loop)\n");
+        LITERR("'.stb' needs probe=<Vname> (an existing 0V V-source that breaks the loop), "
+               "probe=<inst>:<terminal>, or probe=<Vp>,<Vn> mode=dm|cm\n");
+    }
+    if (sawProbe2 != sawMode) {
+        LITERR("'.stb' probe=<Vp>,<Vn> and mode=dm|cm must be given together\n");
     }
     return (0);
 }

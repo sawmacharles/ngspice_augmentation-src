@@ -51,6 +51,14 @@ STBaskQuest(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         value->nValue = job->STBlocalGnd;
         break;
 
+    case STB_PROBE2:
+        value->uValue = job->STBprobeName2;
+        break;
+
+    case STB_MODE:
+        value->iValue = job->STBmode;
+        break;
+
     default:
         return (E_BADPARM);
     }
