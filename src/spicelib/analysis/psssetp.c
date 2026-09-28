@@ -7,6 +7,7 @@ Author: 2010-05 Stefano Perticaroli ``spertica''
 #include "ngspice/iferrmsg.h"
 #include "ngspice/cktdefs.h"
 #include "ngspice/pssdefs.h"
+#include <string.h>
 
 #include "analysis.h"
 
@@ -45,6 +46,22 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         break;
     case STEADY_COEFF:
         job->steady_coeff = value->rValue;
+        break;
+
+    /* card #458: `.pss ... method=shoot` selects the shooting-Newton
+     * driven-PSS path in place of the existing default algorithm. Any
+     * other value (including the unset default) keeps the existing
+     * algorithm, so old decks are unaffected. */
+    case PSS_METHOD:
+        if (value->sValue && strcmp(value->sValue, "shoot") == 0)
+            job->PSSmethod = PSS_METHOD_SHOOT;
+        else if (value->sValue && strcmp(value->sValue, "driven") == 0)
+            job->PSSmethod = PSS_METHOD_DRIVEN;
+        else {
+            fprintf(stderr, "Error: .pss method=%s not recognised "
+                    "(known: shoot, driven) - ignored\n",
+                    value->sValue ? value->sValue : "?");
+        }
         break;
 
     /* Enhancement-122: PAC sweep parameters (.pac card) */
@@ -112,6 +129,7 @@ static IFparm PSSparms[] = {
     { "uic",       PSS_UIC,		IF_SET|IF_INTEGER, 	"use initial conditions (1 true - 0 false)" },
     { "sc_iter",   SC_ITER,		IF_SET|IF_INTEGER, 	"maxmimum number of shooting cycle iterations" },
     { "steady_coeff",   STEADY_COEFF,	IF_SET|IF_INTEGER, 	"set steady coefficient for convergence test" },
+    { "method",     PSS_METHOD,	IF_SET|IF_STRING,	"PSS algorithm: driven (default) or shoot (shooting-Newton, card #458)" },
     { "pac",        PAC_DOPAC,		IF_SET|IF_INTEGER,	"run a PAC input-frequency sweep after PSS" },
     { "pac_fstart", PAC_FSTART,		IF_SET|IF_REAL,		"PAC input sweep start frequency" },
     { "pac_fstop",  PAC_FSTOP,		IF_SET|IF_REAL,		"PAC input sweep stop frequency" },

@@ -27,6 +27,15 @@ typedef struct {
     int sc_iter;
     double steady_coeff;
 
+    /* card #458, plan T4.1-T4.3: shooting-Newton PSS for driven (clocked)
+     * switching converters, as an alternative to the brute-force
+     * transient-to-steady-state loop above. 0 = existing algorithm
+     * (default, unchanged); 1 = shooting-Newton (`.pss ... method=shoot`).
+     * Only valid for driven circuits (Enhancement-176 detection); the
+     * autonomous/free-running case is explicitly out of scope (design
+     * ruling #447 A) and is rejected with an error at run time. */
+    int PSSmethod;
+
     /* Enhancement-119: the converged periodic operating point, retained past the
      * analysis as the substrate the periodic small-signal analyses (PAC / pnoise
      * / PXF) linearize around. PSS already samples the node voltages over one
@@ -79,6 +88,11 @@ typedef struct {
 } PSSan;
 
 enum {
+    PSS_METHOD_DRIVEN = 0,   /* existing brute-force periodicity-test algorithm */
+    PSS_METHOD_SHOOT  = 1    /* card #458: shooting-Newton */
+};
+
+enum {
     GUESSED_FREQ = 1,
     STAB_TIME,
     OSC_NODE,
@@ -87,6 +101,7 @@ enum {
     PSS_UIC,
     SC_ITER,
     STEADY_COEFF,
+    PSS_METHOD,
     PAC_DOPAC,
     PAC_FSTART,
     PAC_FSTOP,

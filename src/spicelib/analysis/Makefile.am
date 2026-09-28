@@ -109,7 +109,8 @@ libckt_la_SOURCES += \
 		dcpss.c		\
 		pssaskq.c	\
 		pssinit.c	\
-		psssetp.c
+		psssetp.c	\
+		pssshoot.c
 endif
 
 if SP_WANTED

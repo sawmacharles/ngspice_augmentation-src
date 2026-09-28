@@ -1141,11 +1141,30 @@ dot_pss(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* Steady coefficient */
     GCA(INPapName, (ckt, which, foo, "steady_coeff", parm));
 
-    if (*line) {
-        INPgetTok(&line, &word, 1);	/* uic? */
+    /* card #458: zero or more trailing tokens, `uic` and/or `method=shoot`
+     * (order-independent), on top of the existing (required, positional)
+     * arguments above -- the pre-existing single-optional-"uic" behaviour
+     * is unchanged for decks that don't use `method=`.
+     *
+     * Trap (found running the first shoot-mode smoke test): INPgetTok()
+     * treats '=' as a plain separator character (inpgtok.c), not part of
+     * either token either side of it -- "method=shoot" and "method shoot"
+     * both come back as two independent tokens "method" and "shoot", with
+     * no '=' anywhere. A single-token strncmp(word,"method=",7) check
+     * therefore never matches either half; read "method" as its own
+     * keyword and pull the value as a second, separate token. */
+    while (*line) {
+        INPgetTok(&line, &word, 1);
+        if (!*word)
+            break;
         if (strcmp(word, "uic") == 0) {
             ptemp.iValue = 1;
             GCA(INPapName, (ckt, which, foo, "uic", &ptemp));
+        } else if (strcmp(word, "method") == 0) {
+            char *mword;
+            INPgetTok(&line, &mword, 1);
+            ptemp.sValue = mword;
+            GCA(INPapName, (ckt, which, foo, "method", &ptemp));
         } else {
             fprintf(stderr,"Error: unknown parameter %s on .pss - ignored\n", word);
         }

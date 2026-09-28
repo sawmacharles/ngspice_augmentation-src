@@ -37,6 +37,9 @@
 
 extern char* eng(double value, int digits, bool numeric, bool bytes);
 
+/* card #458: shooting-Newton driven PSS, implemented in pssshoot.c */
+extern int PSSshootDriven(CKTcircuit *ckt, PSSan *job);
+
 #define INIT_STATS() \
 do { \
     startTime = SPfrontEnd->IFseconds();        \
@@ -3511,6 +3514,23 @@ DCpss(CKTcircuit *ckt,
             fprintf (stderr, "PSS: driven circuit detected -- shooting at the fixed source period (%g Hz), frequency estimation off\n",
                      ckt->CKTguessedFreq) ;
         }
+    }
+
+    /* card #458, plan T4.1-T4.3: shooting-Newton dispatch. Only meaningful
+     * for driven circuits (a known period T = 1/fguess, the clock); the
+     * autonomous/free-running case is out of scope for this card (design
+     * ruling #447 A) and is refused here rather than silently falling back,
+     * so a `method=shoot` deck without a driven source gets a clear error
+     * instead of a wrong answer. */
+    if (job->PSSmethod == PSS_METHOD_SHOOT) {
+        if (!pss_driven) {
+            fprintf(stderr, "Error: .pss method=shoot needs a driven "
+                    "(clocked) circuit -- no V/I source with a time "
+                    "function was found. Free-running shooting is not "
+                    "implemented (card #458 scope).\n");
+            return (E_UNSUPP);
+        }
+        return PSSshootDriven(ckt, job);
     }
 
     oscnNode = job->PSSoscNode->number ;
