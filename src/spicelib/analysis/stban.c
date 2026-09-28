@@ -325,6 +325,14 @@ STBan(CKTcircuit *ckt, int restart)
             ckt->CKTirhs[i] = 0.0;
         }
         ckt->CKTrhs[node_b] += 1.0;
+        /* localgnd=: reference the injected current to the given local
+         * ground node instead of true ground (same two-terminal-source
+         * pattern as the unmerged loop_analysis branch's LOOPan() used for
+         * its optional refnode=). NOT independently validated numerically
+         * (no reference deck here uses localgnd=) -- see the card #456
+         * report's "what was not done". */
+        if (job->STBlocalGndGiven && job->STBlocalGnd)
+            ckt->CKTrhs[job->STBlocalGnd->number] -= 1.0;
         SMPcSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTirhs, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
         v2.re = ckt->CKTrhs[node_b];  v2.im = ckt->CKTirhs[node_b];
         i2.re = -ckt->CKTrhs[branch_probe]; i2.im = -ckt->CKTirhs[branch_probe];
