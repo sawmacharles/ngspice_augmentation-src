@@ -148,6 +148,14 @@ com_ac(wordlist *wl)
 }
 
 
+/* ngspice_augmentation card #456: native .stb loop-stability analysis */
+void
+com_stb(wordlist *wl)
+{
+    dosim("stb", wl);
+}
+
+
 void
 com_tf(wordlist *wl)
 {

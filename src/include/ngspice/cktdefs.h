@@ -344,6 +344,10 @@ struct CKTcircuit {
 extern int ACan(CKTcircuit *, int);
 extern int ACaskQuest(CKTcircuit *, JOB *, int , IFvalue *);
 extern int ACsetParm(CKTcircuit *, JOB *, int , IFvalue *);
+/* ngspice_augmentation card #456: native .stb loop-stability analysis */
+extern int STBan(CKTcircuit *, int);
+extern int STBaskQuest(CKTcircuit *, JOB *, int , IFvalue *);
+extern int STBsetParm(CKTcircuit *, JOB *, int , IFvalue *);
 extern int CKTacDump(CKTcircuit *, double , runDesc *);
 extern int CKTacLoad(CKTcircuit *);
 extern int CKTaccept(CKTcircuit *);

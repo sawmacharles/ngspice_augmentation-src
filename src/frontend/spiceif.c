@@ -235,6 +235,7 @@ if_run(CKTcircuit *ckt, char *what, wordlist *args, INPtables *tab)
     /*CDHW Look for an interactive task CDHW*/
     if (eq(what, "tran") ||
         eq(what, "ac") ||
+        eq(what, "stb") ||
         eq(what, "dc") ||
         eq(what, "op") ||
         eq(what, "pz") ||
@@ -363,6 +364,7 @@ if_run(CKTcircuit *ckt, char *what, wordlist *args, INPtables *tab)
 
     if ((eq(what, "tran")) ||
         (eq(what, "ac")) ||
+        (eq(what, "stb")) ||
         (eq(what, "dc")) ||
         (eq(what, "op")) ||
         (eq(what, "pz")) ||

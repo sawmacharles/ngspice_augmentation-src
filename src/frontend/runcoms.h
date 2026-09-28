@@ -11,6 +11,7 @@ void com_pz(wordlist *wl);
 void com_op(wordlist *wl);
 void com_dc(wordlist *wl);
 void com_ac(wordlist *wl);
+void com_stb(wordlist *wl); /* ngspice_augmentation card #456 */
 void com_tf(wordlist *wl);
 void com_tran(wordlist *wl);
 /* SP: Stady State Analysis */

@@ -8,6 +8,9 @@ libckt_la_SOURCES = \
 		acsetp.c	\
 		analysis.c	\
 		analysis.h	\
+		stban.c		\
+		stbaskq.c	\
+		stbsetp.c	\
 		cktacct.c	\
 		cktacdum.c	\
 		cktaskaq.c	\

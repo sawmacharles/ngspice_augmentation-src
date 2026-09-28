@@ -15,6 +15,8 @@ extern SPICEanalysis TFinfo;
 extern SPICEanalysis DISTOinfo;
 extern SPICEanalysis NOISEinfo;
 extern SPICEanalysis SENSinfo;
+/* ngspice_augmentation card #456: native .stb loop-stability analysis */
+extern SPICEanalysis STBinfo;
 
 #ifdef RFSPICE
 extern SPICEanalysis SPinfo;
@@ -44,6 +46,7 @@ SPICEanalysis *analInfo[] = {
     &DISTOinfo,
     &NOISEinfo,
     &SENSinfo,
+    &STBinfo,
 #ifdef WITH_PSS
     &PSSinfo,
 #endif

@@ -14,6 +14,7 @@ Modified: 2000 AlansFixes
 #include "inpxx.h"
 #include "ngspice/cpdefs.h"
 #include "ngspice/tskdefs.h"
+#include "ngspice/stringutil.h"
 
 static int
 dot_noise(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
@@ -235,6 +236,123 @@ dot_ac(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
     if (pdef) {
         fprintf(stderr, "Warning, ngspice assumes default parameter(s) for ac simulation\n");
         fprintf(stderr, "    Check your input line '.ac %s'\n\n", mline);
+    }
+    return (0);
+}
+
+/* ngspice_augmentation card #456: native .stb loop-stability analysis.
+ * Syntax: .stb dec|oct|lin <n> <fstart> <fstop> probe=<Vname> [localgnd=<node>]
+ * (spec.md stb_syntax; probe must be an existing 0V V-source already in the
+ * loop -- see src/spicelib/analysis/stban.c for the a/b terminal convention).
+ * The dec/oct/lin/n/fstart/fstop prefix is parsed exactly like .ac
+ * (dot_ac above); the probe=/localgnd= keyword tail is parsed here (a
+ * minimal, .stb-specific key=value reader -- not the generic dot_params()
+ * helper from the unmerged loop_analysis branch, which this fork does not
+ * carry). */
+static int
+dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
+        TSKtask *task, CKTnode *gnode, JOB *foo)
+{
+    int error;
+    IFvalue ptemp;
+    IFvalue *parm;
+    int which;
+    char *steptype;
+    bool pdef = FALSE;
+    char *mline = line;
+    double startval, stopval;
+    bool sawProbe = FALSE;
+
+    NG_IGNORE(gnode);
+
+    which = ft_find_analysis("STB");
+    if (which == -1) {
+        LITERR("STB loop-stability analysis unsupported.\n");
+        return (0);
+    }
+    IFC(newAnalysis, (ckt, which, "STB Loop Stability Analysis", &foo, task));
+
+    INPgetTok(&line, &steptype, 1);
+    if (!*steptype || (!ciprefix("dec", steptype) && !ciprefix("oct", steptype) && !ciprefix("lin", steptype))) {
+        LITERR("Missing DEC, OCT, or LIN.\n");
+        tfree(steptype);
+        return (0);
+    }
+    ptemp.iValue = 1;
+    GCA(INPapName, (ckt, which, foo, steptype, &ptemp));
+    tfree(steptype);
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+    if (parm->iValue < 1) {
+        pdef = TRUE;
+        parm->iValue = 10;
+    }
+    GCA(INPapName, (ckt, which, foo, "numsteps", parm));
+
+    if ((*line != '.' && !isdigit(*line)) || (*line == '.' && !isdigit(*(line + 1))))
+        pdef = TRUE;
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);
+    startval = parm->rValue;
+    if (startval <= 0) {
+        pdef = TRUE;
+        startval = parm->rValue = 1.;
+    }
+    GCA(INPapName, (ckt, which, foo, "start", parm));
+
+    if ((*line != '.' && !isdigit(*line)) || (*line == '.' && !isdigit(*(line + 1))))
+        pdef = TRUE;
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);
+    stopval = parm->rValue;
+    if (stopval < startval) {
+        pdef = TRUE;
+        parm->rValue = 1000. * startval;
+    }
+    GCA(INPapName, (ckt, which, foo, "stop", parm));
+
+    if (pdef) {
+        fprintf(stderr, "Warning, ngspice assumes default parameter(s) for stb simulation\n");
+        fprintf(stderr, "    Check your input line '.stb %s'\n\n", mline);
+    }
+
+    /* tail: probe=<Vname> [localgnd=<node>], any order */
+    while (*line) {
+        char *key;
+        while (*line == ' ' || *line == '\t' || *line == '+')
+            line++;
+        if (!*line)
+            break;
+        INPgetTok(&line, &key, 0);
+        if (!*key) { tfree(key); break; }
+        if (*line != '=') {
+            fprintf(stderr, "Error: expected key=value on .stb, got '%s'\n", key);
+            LITERR("bad syntax [.stb dec|oct|lin n fstart fstop probe=<Vname> [localgnd=<node>]]\n");
+            tfree(key);
+            return (0);
+        }
+        line++; /* skip '=' */
+        if (cieq(key, "probe")) {
+            char *name;
+            INPgetTok(&line, &name, 1);
+            INPinsert(&name, tab);
+            ptemp.uValue = name;
+            GCA(INPapName, (ckt, which, foo, "probe", &ptemp));
+            sawProbe = TRUE;
+        } else if (cieq(key, "localgnd")) {
+            char *nname;
+            CKTnode *nnode;
+            INPgetNetTok(&line, &nname, 1);
+            INPtermInsert(ckt, &nname, tab, &nnode);
+            ptemp.nValue = nnode;
+            GCA(INPapName, (ckt, which, foo, "localgnd", &ptemp));
+        } else {
+            fprintf(stderr, "Error: unknown parameter '%s' on .stb - ignored\n", key);
+            INPgetTok(&line, &mline, 1); /* consume the value so parsing can continue */
+            tfree(mline);
+        }
+        tfree(key);
+    }
+    if (!sawProbe) {
+        LITERR("'.stb' needs probe=<Vname> (an existing 0V V-source that breaks the loop)\n");
     }
     return (0);
 }
@@ -1213,6 +1331,9 @@ INP2dot(CKTcircuit *ckt, INPtables *tab, struct card *current, TSKtask *task, CK
         goto quit;
     } else if ((strcmp(token, ".ac") == 0)) {
         rtn = dot_ac(line, ckt, tab, current, task, gnode, foo);
+        goto quit;
+    } else if ((strcmp(token, ".stb") == 0)) {
+        rtn = dot_stb(line, ckt, tab, current, task, gnode, foo);
         goto quit;
     } else if ((strcmp(token, ".pz") == 0)) {
         rtn = dot_pz(line, ckt, tab, current, task, gnode, foo);
