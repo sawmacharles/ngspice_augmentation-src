@@ -65,6 +65,11 @@ static struct type types[NUMTYPES] = {
 /* The stuff for plot names. */
 
 static struct plotab plotabs[NUMPLOTTYPES] = {
+    /* ngspice_augmentation card #456: checked first, since "stb" analysis
+     * titles ("STB Loop Stability Analysis") would otherwise substring-match
+     * the "op" entry below via "l-OOP-...", per ft_plotabbrev()'s plain
+     * substring search -- found while smoke-testing card #456's native .stb. */
+    { "stb", "stb", FALSE, FALSE },
     { "tran", "transient", FALSE, FALSE },
     { "op", "op", FALSE, FALSE },
     { "tf", "function", FALSE, FALSE },
