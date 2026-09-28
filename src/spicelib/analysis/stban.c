@@ -27,6 +27,26 @@ Probe convention (documented per card #456's requirement):
   probe=<inst>:<terminal> (auto-inserting the probe by rebinding a device
   terminal, as the loop_analysis branch's LOOPpreset did) is NOT implemented
   in this fork -- deferred, see the plan T3.2/T3.3 report.
+
+card #457 follow-up (2026-09-28): probe=<inst>:<terminal> IS now implemented
+(at netlist-parse time, in dot_stb()/stb_probe_splice(), src/spicelib/parser/
+inp2dot.c -- by the time STBan() runs, the synthesized probe is an ordinary
+probe=<Vname>, indistinguishable here from a hand-written one). Also added:
+native probe=<Vp>,<Vn> mode=dm|cm -- Vp (STBprobeName, "branch p") is read
+exactly as the single-ended case; Vn (STBprobeName2, "branch n") is driven
+in lockstep with the SAME two RHS injections, sign-flipped for mode=dm
+(antiphase) and same-signed for mode=cm (in phase), but never read back.
+This mirrors stb/diffprobe.lib's two correlated branches (tools/stb.py
+--mode dm|cm), which documents why reading branch p alone gives the whole
+coupled network's DM/CM loop gain: for an EXACTLY symmetric linear network,
+a purely antisymmetric (DM) or purely symmetric (CM) excitation makes the
+whole network's response equally antisymmetric/symmetric, so the ratio T is
+the same read at either symmetric point. This is the standard differential/
+common-mode half-circuit theorem -- exact for an exactly symmetric linear
+circuit, NOT exact in general for an asymmetric network or where Spectre's
+own diffprobe would coupled the two branches by DEPENDENT sources (an E/F
+pair whose gain is the actual mismatch), which this native version does not
+implement (see the card #457 report's "what was not done").
 **********/
 
 #include "ngspice/ngspice.h"
@@ -120,6 +140,12 @@ STBan(CKTcircuit *ckt, int restart)
     int error, size, i, ignore;
     GENinstance *inst;
     int branch_probe, node_a, node_b;
+    /* card #457: probe=<Vp>,<Vn> mode=dm|cm -- branch n, driven in lockstep
+     * with branch p (this file's existing branch_probe/node_a/node_b) but
+     * never read back; see this file's top-of-file comment. */
+    GENinstance *inst2 = NULL;
+    int branch_probe2 = 0, node_b2 = 0;
+    double dmcm_sign = 1.0;
 
     STBcplx v1, i1, v2, i2, s, t, lg;
 
@@ -153,6 +179,40 @@ STBan(CKTcircuit *ckt, int restart)
     }
     node_a = GENnode(inst)[0];
     node_b = GENnode(inst)[1];
+
+    /* ---- card #457: resolve the optional branch-n probe (probe=Vp,Vn
+     * mode=dm|cm) ---- */
+    if (job->STBprobeName2Given) {
+        if (!job->STBmodeGiven) {
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb probe2 '%s' given without mode=dm|cm", job->STBprobeName2);
+            return E_PARMVAL;
+        }
+        inst2 = CKTfndDev(ckt, job->STBprobeName2);
+        if (!inst2 || inst2->GENmodPtr->GENmodType < 0) {
+            SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe2 '%s' not in circuit", job->STBprobeName2);
+            return E_NOTFOUND;
+        }
+        if (inst2->GENmodPtr->GENmodType != CKTtypelook("Vsource")) {
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb probe2 '%s' must be a voltage source (an existing 0V V-source "
+                "in series with the loop-break wire)", job->STBprobeName2);
+            return E_NOTFOUND;
+        }
+        branch_probe2 = CKTfndBranch(ckt, job->STBprobeName2);
+        if (branch_probe2 == 0) {
+            SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe2 '%s': no branch equation found", job->STBprobeName2);
+            return E_NOTFOUND;
+        }
+        node_b2 = GENnode(inst2)[1];
+        /* dm = antiphase (branch n's excitation is the negative of branch
+         * p's, same as stb/diffprobe.lib's diffprobe_dm baking acphase=180
+         * on its second branch); cm = in phase (diffprobe_cm, acphase=0). */
+        dmcm_sign = (job->STBmode == STB_MODE_DM) ? -1.0 : 1.0;
+    } else if (job->STBmodeGiven) {
+        SPfrontEnd->IFerrorf(ERR_WARNING, "stb mode=dm|cm given without probe=<Vp>,<Vn>");
+        return E_PARMVAL;
+    }
 
     /* ---- DC operating point (identical to the closed loop: the probe is
      * an ordinary 0V branch already in the netlist, not a mutation) ---- */
@@ -305,6 +365,13 @@ STBan(CKTcircuit *ckt, int restart)
         /* RHS #1: unit voltage injection in the probe branch equation */
         ckt->CKTrhs[branch_probe] = -1.0;
         ckt->CKTirhs[branch_probe] = 0.0;
+        /* card #457 probe=Vp,Vn mode=dm|cm: drive branch n's voltage
+         * injection in lockstep, sign-flipped for dm (see dmcm_sign above).
+         * branch n's own v/i are never read -- only branch p's (below). */
+        if (job->STBprobeName2Given) {
+            ckt->CKTrhs[branch_probe2] = -1.0 * dmcm_sign;
+            ckt->CKTirhs[branch_probe2] = 0.0;
+        }
         SMPcSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTirhs, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
         v1.re = ckt->CKTrhs[node_b];  v1.im = ckt->CKTirhs[node_b];
         /* The raw MNA branch unknown for a V-source is the current flowing
@@ -333,6 +400,10 @@ STBan(CKTcircuit *ckt, int restart)
          * report's "what was not done". */
         if (job->STBlocalGndGiven && job->STBlocalGnd)
             ckt->CKTrhs[job->STBlocalGnd->number] -= 1.0;
+        /* card #457 probe=Vp,Vn mode=dm|cm: drive branch n's current
+         * injection in lockstep (same dmcm_sign as run 1, above). */
+        if (job->STBprobeName2Given)
+            ckt->CKTrhs[node_b2] += dmcm_sign * 1.0;
         SMPcSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTirhs, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
         v2.re = ckt->CKTrhs[node_b];  v2.im = ckt->CKTirhs[node_b];
         i2.re = -ckt->CKTrhs[branch_probe]; i2.im = -ckt->CKTirhs[branch_probe];
