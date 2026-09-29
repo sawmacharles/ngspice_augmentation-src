@@ -561,9 +561,20 @@ dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
             break;
         INPgetTok(&line, &key, 0);
         if (!*key) { tfree(key); break; }
+        /* card #500: "instant" is a bare flag (no "="), same convention as
+         * the dec/oct/lin leading token above -- see stbdefs.h's
+         * STBinstant doc comment. Checked BEFORE the generic key=value
+         * requirement just below, since a bare word would otherwise hit
+         * that "expected key=value" error. */
+        if (cieq(key, "instant")) {
+            ptemp.iValue = 1;
+            GCA(INPapName, (ckt, which, foo, "instant", &ptemp));
+            tfree(key);
+            continue;
+        }
         if (*line != '=') {
             fprintf(stderr, "Error: expected key=value on .stb, got '%s'\n", key);
-            LITERR("bad syntax [.stb dec|oct|lin n fstart fstop probe=<Vname> [localgnd=<node>]]\n");
+            LITERR("bad syntax [.stb dec|oct|lin n fstart fstop probe=<Vname> [localgnd=<node>] [instant]]\n");
             tfree(key);
             return (0);
         }

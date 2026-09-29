@@ -106,6 +106,12 @@ STBsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->STBmodeGiven = 1;
         break;
 
+    case STB_INSTANT:
+        /* card #500: bare flag, same IF_FLAG convention as dec/oct/lin --
+         * see stbdefs.h's STBinstant doc comment. */
+        job->STBinstant = value->iValue ? 1 : 0;
+        break;
+
     case STB_SENS:
         /* card #475: sens=all | sens=<name> (repeatable). "all"
          * (case-insensitive) short-circuits any prior/later sens=<name>
@@ -139,6 +145,7 @@ static IFparm STBparms[] = {
     { "probe2",   STB_PROBE2,   IF_SET | IF_ASK | IF_INSTANCE, "second (branch n) probe for probe=Vp,Vn mode=dm|cm (set via probe=)" },
     { "mode",     STB_MODE,     IF_SET | IF_ASK | IF_INTEGER,  "1=dm, 2=cm (set via mode=dm|cm on probe=Vp,Vn)" },
     { "sens",     STB_SENS,     IF_SET | IF_INSTANCE,          "adjoint sensitivity: sens=all or sens=<name> (repeatable, loop mode only)" },
+    { "instant",  STB_INSTANT,  IF_SET | IF_ASK | IF_FLAG,     "skip the internal op-point solve; linearise about whatever state is already loaded (e.g. a preceding 'tran ... uic' stopped at t_k)" },
 };
 
 SPICEanalysis STBinfo = {

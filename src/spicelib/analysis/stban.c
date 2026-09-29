@@ -714,6 +714,85 @@ STBan(CKTcircuit *ckt, int restart)
             return E_BADPARM;
         }
 
+        /* card #500 (instant mode): SKIP the DC operating-point solve
+         * entirely and reuse whatever state is already loaded in `ckt`.
+         * The normal (default) path below calls CKTop()/EVTop() -- full
+         * Newton -- which ALWAYS converges to the circuit's true DC
+         * equilibrium given the present independent-source values,
+         * discarding any prior .tran/IC=/.nodeset/savestate state (this is
+         * exactly the limitation docs/stb-tran.md documents in detail,
+         * verified three independent ways). "instant" exists specifically
+         * so a `.control` sequence can do
+         *   tran <step> {t_k} 0 uic
+         *   stb dec ... probe=Vprobe instant
+         * and have the second command linearise about the FIRST command's
+         * own accepted transient solution at t=t_k (already sitting in
+         * CKTrhsOld and in every device's own persistent small-signal
+         * fields, e.g. MOS1gm/BSIM4gm/a diode's geq, set by the .tran's
+         * own last DEVload call at t_k) instead of re-solving to
+         * equilibrium. This is architecturally sound because CKTop's
+         * Newton loop is a fixed-point SEARCH (it always converges to the
+         * SAME true equilibrium regardless of the starting guess, barring
+         * genuine bistability) -- skipping the search is the only way to
+         * linearise about a point Newton would otherwise walk straight
+         * past. The CKTload(MODEINITSMSIG) call just below still runs
+         * (unconditionally, both paths): it is a SINGLE evaluation of the
+         * device load routines at whatever node voltages are already
+         * present, not an iteration, so calling it at the frozen t_k
+         * voltages is exactly as valid as calling it at a converged DC
+         * equilibrium -- the per-device algebraic quantities it computes
+         * (gm, gds, an incremental capacitance) are pure functions of
+         * terminal voltages, not of how those voltages were reached. What
+         * the load computes UNDER MODEDCOP (no transient charge/current
+         * integration -- reactive elements are treated as open/short and
+         * folded into the matrix only via CKTacLoad's separate jwC/jwL
+         * stamp, below) is unaffected by which analysis last touched the
+         * circuit. The one thing instant mode does NOT get right: at a
+         * genuine transient (non-equilibrium) point, this MODEDCOP-style
+         * reload's OWN scratch RHS residual (computed from the frozen
+         * voltages, ignoring capacitor currents) is not zero -- but
+         * that residual is simply overwritten by CKTacLoad/the
+         * probe-injection RHS a few lines below and never used: AC
+         * analysis is a pure LINEARISATION (a single complex-matrix
+         * solve of Y*x=b for the probe excitation), not a Newton search,
+         * so a nonzero "DC" residual at a non-equilibrium point is
+         * irrelevant to it -- see docs/stb.md's "instant mode" section
+         * for the full KCL-residual argument.
+         *
+         * XSPICE event-driven instances are refused outright (not
+         * silently wrong): EVTop() (the event-system equivalent of
+         * CKTop, above) also re-solves to a fresh digital/event
+         * equilibrium, and this fork's instant-mode patch does not
+         * attempt an event-side equivalent of the CKTop skip -- an event
+         * netlist with instant would otherwise appear to work but
+         * silently mix a frozen analog state with a re-initialised
+         * event state. */
+        if (job->STBinstant) {
+#ifdef XSPICE
+            if (ckt->evt && ckt->evt->counts.num_insts != 0) {
+                SPfrontEnd->IFerrorf(ERR_WARNING,
+                    "stb instant: XSPICE event-driven instances are present -- "
+                    "instant mode (card #500) only skips the analog CKTop() "
+                    "solve, not EVTop()'s event-side equilibrium re-solve, so "
+                    "the result would silently mix a frozen analog state with "
+                    "a re-initialised event state. Not supported; refusing.");
+                return E_PARMVAL;
+            }
+#endif
+            fprintf(stdout,
+                "\n stb instant: skipping the op-point solve, linearising "
+                "about the circuit's CURRENT state (e.g. a preceding "
+                "'tran ... uic')\n");
+            if (getenv("STB_DEBUG_INSTANT")) {
+                int dbgsize = SMPmatSize(ckt->CKTmatrix);
+                int dbgi;
+                fprintf(stderr, "STB_DEBUG_INSTANT CKTtime=%.9g CKTmode=0x%x size=%d\n",
+                        ckt->CKTtime, ckt->CKTmode, dbgsize);
+                for (dbgi = 1; dbgi <= dbgsize; dbgi++)
+                    fprintf(stderr, "  CKTrhsOld[%d]=%.9g CKTrhs[%d]=%.9g\n",
+                            dbgi, ckt->CKTrhsOld[dbgi], dbgi, ckt->CKTrhs[dbgi]);
+            }
+        } else {
 #ifdef XSPICE
         g_mif_info.circuit.anal_type = MIF_DC;
         g_mif_info.circuit.anal_init = MIF_TRUE;
@@ -738,6 +817,7 @@ STBan(CKTcircuit *ckt, int restart)
             }
         } else {
             fprintf(stdout, "\n Linear circuit, option noopac given: no OP analysis\n");
+        }
         }
 
         ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODEDCOP | MODEINITSMSIG;

@@ -59,6 +59,10 @@ STBaskQuest(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         value->iValue = job->STBmode;
         break;
 
+    case STB_INSTANT:
+        value->iValue = job->STBinstant;
+        break;
+
     case STB_SENS:
         /* card #475: readback is informational only -- the actual list
          * lives in STBsensNames/STBsensAll, not reachable through the

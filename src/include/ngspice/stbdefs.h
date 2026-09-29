@@ -55,6 +55,26 @@ typedef struct {
     IFuid *STBsensNames;
     int STBsensCount;
     unsigned int STBsensAll : 1;
+    /* card #500 (plan: instant/transient-time-point small-signal): bare
+     * "instant" flag on `.stb`/`stb`. Default (0, unchanged behaviour):
+     * STBan() calls CKTop() (full Newton DC operating-point solve) before
+     * loading the small-signal matrix, exactly as before -- .stb always
+     * linearises about the circuit's TRUE DC equilibrium regardless of
+     * any preceding .tran/IC=/.nodeset/savestate, see docs/stb-tran.md.
+     * When set: STBan() SKIPS CKTop() entirely and reuses whatever
+     * operating point is already loaded in `ckt` (CKTrhsOld and every
+     * device's own internal small-signal state, e.g. MOS1gm/BSIM4gm/a
+     * capacitor's incremental C) -- the intended caller is a `.control`
+     * sequence that first runs `tran <step> {t_k} 0 uic` (which stops
+     * exactly at t_k and leaves the accepted transient solution in
+     * place) and THEN `stb ... instant` in the same session, so the
+     * linearisation point is the genuine, possibly non-equilibrium,
+     * transient state at t_k -- not a re-solved DC equilibrium. See
+     * stban.c's STBan() for the KCL-residual reasoning (why this is
+     * still a well-defined linear AC problem even though the frozen
+     * point is not a DC equilibrium) and docs/stb.md's "instant mode"
+     * section for validation. */
+    unsigned int STBinstant : 1;
 } STBAN;
 
 enum {
@@ -69,6 +89,7 @@ enum {
     STB_PROBE2,
     STB_MODE,
     STB_SENS,
+    STB_INSTANT,
 };
 
 enum {
