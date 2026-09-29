@@ -3774,6 +3774,54 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
             mag = sqrt(eig[kk].re * eig[kk].re + eig[kk].im * eig[kk].im);
             if (mag > specrad) specrad = mag;
         }
+        /* card #503: NEAR-DEGENERATE TRIVIAL EIGENVALUE diagnostic. The
+         * "smallest-modulus = trivial (projected flow direction)" pick
+         * above assumes that eigenvalue is well SEPARATED from the rest --
+         * true on every fixture measured before this card, but R5
+         * (refs/r5_hysteretic_buck.cir, Csw~1ps RC and Cq~1ns RC, both
+         * orders of magnitude faster than the ~2.4us switching period)
+         * was found this card to report a genuine near-zero COMPLEX-
+         * CONJUGATE PAIR (both |.|~9.8e-6, at whatever two indices the
+         * eigensolver happens to order them) instead of a single real
+         * near-zero trivial eigenvalue the theory predicts -- i.e. TWO
+         * fast/stiff directions collapse close to zero, not one, and the
+         * "smallest modulus" tie-break picks one member of that pair
+         * arbitrarily. This does not by itself change pacshoot.c's
+         * trigger-node-based projection (pac_find_trig_idx() resolves
+         * trig_idx from the trigger= NODE NAME, never from this
+         * eigenvalue pick), but it is corroborating evidence (card #503's
+         * report, docs/pss-pac.md) that R5's own finite-difference
+         * monodromy sits close to its own numerical noise floor -- print
+         * a loud warning rather than let a mislabelled "trivial" direction
+         * pass silently, same honesty convention as this file's other
+         * WARNING lines. Threshold: the two smallest magnitudes within
+         * 5x of each other (conservative -- R5's own two multipliers were
+         * IDENTICAL to 6 significant figures, a much tighter case than
+         * this threshold requires). */
+        if (n >= 3) {
+            double second_mag = 1e300;
+            for (kk = 0; kk < n; kk++) {
+                double mag;
+                if (kk == trivial_idx) continue;
+                mag = sqrt(eig[kk].re * eig[kk].re + eig[kk].im * eig[kk].im);
+                if (mag < second_mag) second_mag = mag;
+            }
+            if (second_mag > 0.0 && second_mag < 5.0 * trivial_mag) {
+                fprintf(stderr, "PSS-FREERUN: WARNING -- the \"trivial\" "
+                        "(projected flow direction) eigenvalue |.|=%.6g is "
+                        "NOT well separated from the next-smallest genuine "
+                        "Floquet multiplier |.|=%.6g (ratio %.3g < 5x) -- "
+                        "the smallest-modulus tie-break may have picked the "
+                        "wrong direction, or this orbit has more than one "
+                        "near-zero (very fast/heavily damped) mode; the "
+                        "Floquet report below may mislabel which multiplier "
+                        "is \"trivial\". Common on circuits with more than "
+                        "one time constant far faster than the switching "
+                        "period (e.g. R5's Csw~1ps and Cq~1ns) -- see "
+                        "docs/pss-pac.md's card #503 section.\n",
+                        trivial_mag, second_mag, second_mag / trivial_mag);
+            }
+        }
         fprintf(stdout, "\nPSS-FREERUN: CONVERGED iter=%d residual=%.6e "
                 "period=%.9g fsw=%.6g spectral_radius=%.6f %s "
                 "wall_time=%.3fs\n", iter, residual, T, 1.0 / T,
