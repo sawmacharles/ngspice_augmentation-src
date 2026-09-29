@@ -3871,14 +3871,82 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                                     max_period, x1trial, &T_meas2,
                                     x_prev, &t_prev)) {
             double dt = T_meas2 - t_prev;
-            if (dt > 0.0) {
-                int k, pac_err;
+            /* card #493: root-cause investigation of the 150kHz (35% of
+             * R5's fsw) disagreement flagged in the comment above this
+             * block. PSS_FREERUN_FT_DEBUG=1 on the original backward-
+             * difference below showed dt itself is already fine (~15.8ps
+             * on R5, not the outer Points-grid's ~11.8ns) -- but the Csw
+             * (switch-node) row still swings ~0.7V over that window
+             * (~4.5e10 V/s average slope): the conductance transition
+             * this node rides on is driven by q's own tanh(ksw*(q-0.5))
+             * argument crossing zero over roughly a ~130ps window (from
+             * fT[q]'s own measured ~2.5e8 V/s and ksw=30's 1/ksw~=0.033
+             * transition width), so a 15.8ps BACKWARD-difference window
+             * (positioned by wherever the outer probe run's own adaptive
+             * step happened to land, not centred on the crossing) is only
+             * ~8x smaller than that -- resolving the local slope with a
+             * plausible O(1) curvature error, not merely fine sampling
+             * noise. PAC_EXACT_JACOBIAN=1 (pacshoot.c's OWN documented
+             * accuracy floor, unrelated to this file) was cross-checked
+             * on the SAME point and changed the result by <1e-4 relative
+             * -- ruling out that floor as a meaningful contributor here.
+             *
+             * FIX: replace the backward difference (whatever the outer
+             * probe run's own bracketing step happened to give) with a
+             * FORWARD difference of a fixed, small, controlled width
+             * PSS_FREERUN_FT_DT (default 1e-13s, ~130x smaller than the
+             * conductance transition width above and ~1e5x smaller than
+             * the old dt) run from the converged crossing point x_T
+             * itself -- f+ = f- (design ruling #447 A, no true event) so
+             * evaluating the "+" side is exactly as valid as the "-" side
+             * this file's monodromy FD columns already use, and a forward
+             * probe from x_T (already the exact converged crossing state)
+             * needs no re-location of the crossing the way a backward
+             * difference does. PSS_FREERUN_FT_BACKWARD=1 keeps the OLD
+             * (pre-card-#493) backward-difference behaviour for direct
+             * A/B comparison; unset (default whenever
+             * PSS_FREERUN_PAC_EXPERIMENTAL=1 is set at all, itself still
+             * required) uses this new forward difference. Both remain
+             * behind PSS_FREERUN_PAC_EXPERIMENTAL -- this does not change
+             * default (gated) behaviour either way. */
+            if (dt > 0.0 && !getenv("PSS_FREERUN_FT_BACKWARD")) {
+                double dt_fine_req = getenv("PSS_FREERUN_FT_DT") ?
+                    atof(getenv("PSS_FREERUN_FT_DT")) : 1e-13;
+                double *x_fine = TMALLOC(double, n);
+                int fine_err;
+                pss_state_set_ic(&map, x1trial);
+                fine_err = pss_run_period(ckt, dt_fine_req,
+                                          "PSS freerun (f(T) forward "
+                                          "difference, card #493)");
+                if (!fine_err && x_fine) {
+                    pss_state_get(&map, ckt, x_fine);
+                    for (k = 0; k < n; k++)
+                        fT[k] = (x_fine[k] - x1trial[k]) / dt_fine_req;
+                    if (getenv("PSS_FREERUN_FT_DEBUG"))
+                        fprintf(stderr, "DEBUG (card #493 forward diff) "
+                                "dt_fine=%.6g (old backward dt=%.6g)\n",
+                                dt_fine_req, dt);
+                    dt = dt_fine_req;   /* only used below as the >0 gate */
+                } else {
+                    fprintf(stderr, "PSS-FREERUN: WARNING -- card #493's "
+                            "fine forward f(T) probe failed (dt=%.3g s); "
+                            "falling back to the old backward-difference "
+                            "estimate.\n", dt_fine_req);
+                    for (k = 0; k < n; k++)
+                        fT[k] = (x1trial[k] - x_prev[k]) / dt;
+                }
+                if (x_fine) tfree(x_fine);
+            } else if (dt > 0.0) {
                 for (k = 0; k < n; k++)
                     fT[k] = (x1trial[k] - x_prev[k]) / dt;
+            }
+            if (dt > 0.0) {
+                int pac_err;
                 fprintf(stdout, "PSS-FREERUN: .pac/.pstb period-variation "
-                        "term: f(T) estimated from a %.6g s backward "
+                        "term: f(T) estimated from a %.6g s %s "
                         "difference at the trigger crossing (card #489 "
-                        "second pass -- see docs/pss-pac.md).\n", dt);
+                        "second pass / card #493 -- see docs/pss-pac.md).\n",
+                        dt, getenv("PSS_FREERUN_FT_BACKWARD") ? "backward" : "forward");
                 if (getenv("PSS_FREERUN_FT_DEBUG")) {
                     int kk;
                     fprintf(stderr, "DEBUG T_meas2=%.12g t_prev=%.12g dt=%.6g\n",

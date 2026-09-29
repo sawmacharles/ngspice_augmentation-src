@@ -1383,6 +1383,58 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
                         "SIXTH pass, and patches-wip/salt/README.md.\n",
                         freqs[f], fs_nyquist, ratio);
         }
+        /* card #493: FREE-RUNNING VALIDATED-BAND GUARD. .pac/.pstb on a
+         * free-running (trigger=) orbit is EXPERIMENTAL and refused by
+         * default (PSSshootFreerun()'s own gate, pssshoot.c); reaching
+         * this code at all means the caller already opted in with
+         * PSS_FREERUN_PAC_EXPERIMENTAL=1. This card cross-validated BOTH
+         * the period-variation-corrected result (fT/trig_idx given, no
+         * PAC_FREERUN_NO_PROJ) AND the uncorrected one (PAC_FREERUN_NO_PROJ
+         * set, or fT missing) against tools/pac_perturbed.py's --freerun
+         * backend (an independent, nonlinear Hann-windowed perturbed-
+         * transient DFT sharing no code with this engine) on R5
+         * (refs/r5_hysteretic_buck.cir, fsw~=422.68kHz): agreement is
+         * inside the project's usual 0.5dB/3deg target at 20kHz (4.7% of
+         * fsw, +0.07dB/+0.08deg) and 60kHz (14.2%, +0.34dB/+0.61deg,
+         * corrected) but breaks down sharply by 100kHz (23.7%,
+         * +1.1dB/+3.0deg) and is wildly wrong by 150-200kHz (35%/47%,
+         * several dB and tens of degrees) -- BOTH corrected and
+         * uncorrected, growing together, not diverging from each other.
+         * Root cause NOT in the period-variation projection term itself
+         * (ruled out this card: a from-scratch, controlled fine forward-
+         * difference f(T) estimate, PSS_FREERUN_FT_BACKWARD unset -- see
+         * pssshoot.c's PSSshootFreerun() -- barely changes the result;
+         * PAC_EXACT_JACOBIAN=1, this file's own unrelated documented
+         * accuracy-floor toggle, changes the 150kHz result by <1e-4
+         * relative; pacpoints=4000 vs the fixture's default 200 changes
+         * the wrong answer to a DIFFERENT wrong answer, not a smaller
+         * one) -- consistent with a general per-step-linearisation
+         * accuracy floor on R5's own extremely stiff switch node (Csw,
+         * ~1ps local RC, far faster than any R3/R4 state) that is
+         * independent of trigger=/free-running specifically, just never
+         * stress-tested against dynamics this fast before this project's
+         * R5 fixtures existed -- see docs/pss-pac.md's card #493 section
+         * for the full numbers table and what was and was not tried.
+         * 0.10 (10% of the measured free-running switching frequency, NOT
+         * fs/2 -- there is no fixed fs here) is used as the trigger ratio:
+         * conservative relative to the ~14% point actually measured
+         * clean, since only ONE fixture/output was checked. */
+        if (trig_idx >= 0 && T > 0.0) {
+            double fsw = 1.0 / T;
+            double ratio = freqs[f] / fsw;
+            if (ratio >= 0.10)
+                fprintf(stderr, "PAC-TD: WARNING -- free-running (trigger=) "
+                        ".pac/.pstb result at f=%.6g Hz is inside the "
+                        "UNVALIDATED margin relative to the measured "
+                        "free-running switching frequency (fsw=%.6g Hz, "
+                        "f/fsw=%.4f >= 0.10); cross-validated to 0.5dB/3deg "
+                        "only up to ~14%% of fsw on R5, breaking down "
+                        "sharply by ~24%% and badly wrong by 35%% -- both "
+                        "the period-variation-corrected and the uncorrected "
+                        "result are affected, root cause not isolated to "
+                        "the correction term -- see docs/pss-pac.md's card "
+                        "#493 section.\n", freqs[f], fsw, ratio);
+        }
         if (!A || !rhs || !sol) {
             if (A) tfree(A); if (rhs) tfree(rhs); if (sol) tfree(sol);
             if (PhiCorr) tfree(PhiCorr); if (zCorr) tfree(zCorr);
