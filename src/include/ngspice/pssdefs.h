@@ -61,6 +61,27 @@ typedef struct {
     int    PACstepType;      /* 0 = LIN, 1 = DEC, 2 = OCT */
     int    PACmaxSideband;   /* number of output conversion sidebands each side (0 = sb0 only) */
 
+    /* card #465 (plan T5.1-T5.2): `.pac ... method=shoot solver=td` selects
+     * the time-domain shooting-based PAC engine (pacshoot.c) in place of
+     * the frequency-domain harmonic-conversion-matrix engine above, which
+     * stays completely unchanged and is still the default. Only usable
+     * together with PSSmethod==PSS_METHOD_SHOOT (refused otherwise -- the
+     * time-domain engine needs the shooting orbit's own per-step
+     * companion/Jacobian structure, which the driven brute-force PSS
+     * algorithm does not produce). See pacshoot.c's header comment for
+     * the design. */
+    int    PACsolver;        /* 0 = frequency-domain (default), 1 = time-domain (card #465) */
+
+    /* card #465: `.pstb` periodic loop gain (Tian two-injection on the
+     * LPTV orbit, sideband 0), built on the SAME time-domain PAC engine.
+     * A `.pstb` card creates its own PSS-type job (like `.pac`) with
+     * PSSdoPSTB=1 and a probe name; it always needs method=shoot (refused
+     * otherwise). Reuses the PAC sweep fields above (PACfStart/Stop/
+     * points/stepType) for its own frequency sweep -- a `.pstb` job never
+     * also sets PSSdoPAC, so there is no field clash. */
+    int    PSSdoPSTB;        /* 1 if this job runs a .pstb loop-gain sweep */
+    IFuid  PSTBprobeName;    /* name of the probe V-source instance (probe=) */
+
     /* Enhancement-124: periodic noise (.pnoise). Runs PSS, then folds each device's
      * noise through the conversion-matrix adjoint over all sidebands to get the
      * output noise spectrum. Reuses the PAC sweep fields for the frequency sweep. */
@@ -93,6 +114,11 @@ enum {
 };
 
 enum {
+    PAC_SOLVER_FD = 0,       /* existing frequency-domain harmonic conversion matrix */
+    PAC_SOLVER_TD = 1        /* card #465: time-domain shooting-based PAC/PSTB */
+};
+
+enum {
     GUESSED_FREQ = 1,
     STAB_TIME,
     OSC_NODE,
@@ -115,6 +141,9 @@ enum {
     PXF_OUT,
     PNOISE_CYCLO,
     PSP_DOPSP,
+    PAC_SOLVER,
+    PSTB_DO,
+    PSTB_PROBE,
 };
 
 #endif

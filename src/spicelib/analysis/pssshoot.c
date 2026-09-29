@@ -92,6 +92,7 @@ What this does NOT do (see the card #458 report for the full list):
 #include <stdlib.h>
 
 #include "pssshoot.h"
+#include "pacshoot.h"   /* card #465: time-domain PAC/PSTB, hooked in after convergence below */
 
 /* ------------------------------------------------------------------ */
 /* State-vector bookkeeping: one entry per native capacitor (terminal
@@ -2579,6 +2580,22 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 "trajectory output run failed (ngspice error %d); the "
                 "PSS-SHOOT CONVERGED line above is still accurate for the "
                 "orbit itself, just not the emitted plot.\n", err);
+    }
+
+    /* card #465 (plan T5.1-T5.2): `.pac ... solver=td` / `.pstb`
+     * post-processing on the converged orbit -- see pacshoot.c's header
+     * for the design. x0 (n entries, this function's own converged
+     * reduced state) is passed as-is; pac_pstb_run() is a no-op (returns
+     * OK immediately) unless job->PSSdoPAC&&PACsolver==td or
+     * job->PSSdoPSTB, so every plain `.pss method=shoot` run (and every
+     * `.pac`/`.pstb` NOT selecting this engine) is unaffected. */
+    {
+        int pac_err = pac_pstb_run(ckt, job, x0, n, T);
+        if (pac_err)
+            fprintf(stderr, "PSS-SHOOT: WARNING -- the PSS orbit itself "
+                    "converged (see CONVERGED line above), but the .pac/"
+                    ".pstb time-domain post-processing failed (error %d).\n",
+                    pac_err);
     }
 
     err = OK;

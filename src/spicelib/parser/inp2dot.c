@@ -1240,18 +1240,175 @@ dot_pac(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
     GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
 
-    {   /* optional trailing maxsideband: output conversion sidebands each side */
-        char *p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p) {
-            parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
-            GCA(INPapName, (ckt, which, foo, "pac_maxsb", parm));
+    /* card #465: optional trailing tokens, in any order --
+     *   maxsideband          (bare integer, existing Enhancement-122 syntax)
+     *   method shoot|driven  (which PSS algorithm the .pac card's OWN PSS
+     *                         pass uses -- same keyword/value split as
+     *                         dot_pss's tail, see that function's comment
+     *                         on why INPgetTok() needs two separate
+     *                         tokens for "method=shoot")
+     *   solver td|fd         (card #465: time-domain vs the existing
+     *                         frequency-domain PAC engine; td needs
+     *                         method=shoot)
+     * A bare integer is accepted only once, and only where the existing
+     * Enhancement-122 maxsideband token could appear -- old decks with
+     * just a trailing maxsideband are completely unaffected. */
+    {
+        int maxsb_seen = 0;
+        while (*line) {
+            char *word;
+            char *save = line;
+            INPgetTok(&line, &word, 1);
+            if (!*word) { tfree(word); break; }
+            if (!maxsb_seen && strcmp(word, "method") != 0 && strcmp(word, "solver") != 0 &&
+                (isdigit((unsigned char) word[0]) ||
+                 ((word[0] == '+' || word[0] == '-') && isdigit((unsigned char) word[1])))) {
+                line = save;
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "pac_maxsb", parm));
+                maxsb_seen = 1;
+            } else if (strcmp(word, "method") == 0) {
+                char *mword;
+                tfree(word);
+                INPgetTok(&line, &mword, 1);
+                ptemp.sValue = mword;
+                GCA(INPapName, (ckt, which, foo, "method", &ptemp));
+            } else if (strcmp(word, "solver") == 0) {
+                char *sword;
+                tfree(word);
+                INPgetTok(&line, &sword, 1);
+                ptemp.sValue = sword;
+                GCA(INPapName, (ckt, which, foo, "solver", &ptemp));
+            } else {
+                fprintf(stderr, "Error: unknown trailing token '%s' on .pac - ignored\n", word);
+                tfree(word);
+            }
         }
     }
 
     ptemp.iValue = 1;						/* enable the PAC sweep */
     GCA(INPapName, (ckt, which, foo, "pac", &ptemp));
+
+    return (0);
+}
+
+/* card #465 (plan T5.1-T5.2): `.pstb` -- periodic loop gain. Runs its own PSS
+ * (shooting-Newton only, method=shoot; the time-domain PAC/PSTB engine needs
+ * the shooting orbit's per-step structure), then Tian two-injection loop-gain
+ * sweep at a probe, on the sideband-0 LPTV response (pacshoot.c). Same PSS
+ * params + sweep tail as .pac/.pss, plus a required probe=<Vname> (an
+ * existing 0V V-source on the loop, same convention as native .stb's
+ * probe=<Vname> loop-mode -- device-mode and probe=inst:terminal auto-insert
+ * are NOT supported here, card #465 scope cut). */
+static int
+dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
+         void *task, void *gnode, JOB *foo)
+{
+    int error;
+    IFvalue ptemp;
+    IFvalue *parm;
+    char *nname;
+    CKTnode *nnode;
+    int which;
+    char *steptype;
+    int probe_seen = 0;
+
+    NG_IGNORE(gnode);
+    NG_IGNORE(current);
+
+    /* .pstb Fguess StabTime OscNode Points Harmonics SC_iter Steady_coeff
+     *       <DEC|OCT|LIN> NumPts Fstart Fstop probe=<Vname> [method=shoot] */
+    which = ft_find_analysis("PSS");
+    if (which == -1) {
+        LITERR("Periodic loop-stability (PSTB) analysis unsupported.\n");
+        return (0);
+    }
+    IFC(newAnalysis, (ckt, which, "Periodic Loop Stability (PSTB) Analysis", &foo, task));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* Fguess */
+    GCA(INPapName, (ckt, which, foo, "fguess", parm));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* StabTime */
+    GCA(INPapName, (ckt, which, foo, "stabtime", parm));
+
+    INPgetNetTok(&line, &nname, 0);
+    INPtermInsert(ckt, &nname, tab, &nnode);
+    ptemp.nValue = nnode;
+    GCA(INPapName, (ckt, which, foo, "oscnode", &ptemp));	/* OscNode given as string */
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);		/* PSS points */
+    GCA(INPapName, (ckt, which, foo, "points", parm));
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);		/* PSS harmonics */
+    GCA(INPapName, (ckt, which, foo, "harmonics", parm));
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);		/* SC iterations */
+    GCA(INPapName, (ckt, which, foo, "sc_iter", parm));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* Steady coefficient */
+    GCA(INPapName, (ckt, which, foo, "steady_coeff", parm));
+
+    /* sweep tail: <DEC|OCT|LIN> NumPts Fstart Fstop */
+    INPgetTok(&line, &steptype, 1);
+    ptemp.iValue = (strcmp(steptype, "dec") == 0) ? 1 :
+                   (strcmp(steptype, "oct") == 0) ? 2 : 0;	/* default LIN */
+    tfree(steptype);
+    GCA(INPapName, (ckt, which, foo, "pac_step", &ptemp));
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);		/* number of points */
+    GCA(INPapName, (ckt, which, foo, "pac_points", parm));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstart */
+    GCA(INPapName, (ckt, which, foo, "pac_fstart", parm));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
+    GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
+
+    /* trailing tokens: probe=<Vname> (required) and method shoot|driven
+     * (optional, no '=' -- same INPgetTok split as dot_pss/dot_pac). */
+    while (*line) {
+        char *word;
+        while (*line == ' ' || *line == '\t' || *line == '+')
+            line++;
+        if (!*line)
+            break;
+        if (strncmp(line, "probe=", 6) == 0) {
+            char *name;
+            line += 6;
+            INPgetNetTok(&line, &name, 1);
+            if (!*name) {
+                LITERR("'.pstb' probe=<Vname> needs a non-empty probe name\n");
+                tfree(name);
+                return (0);
+            }
+            INPinsert(&name, tab);
+            ptemp.uValue = name;
+            GCA(INPapName, (ckt, which, foo, "pstb_probe", &ptemp));
+            probe_seen = 1;
+            continue;
+        }
+        INPgetTok(&line, &word, 1);
+        if (!*word) { tfree(word); break; }
+        if (strcmp(word, "method") == 0) {
+            char *mword;
+            tfree(word);
+            INPgetTok(&line, &mword, 1);
+            ptemp.sValue = mword;
+            GCA(INPapName, (ckt, which, foo, "method", &ptemp));
+        } else {
+            fprintf(stderr, "Error: unknown trailing token '%s' on .pstb - ignored\n", word);
+            tfree(word);
+        }
+    }
+
+    if (!probe_seen) {
+        LITERR("'.pstb' needs probe=<Vname> (an existing 0V V-source on the loop)\n");
+        return (0);
+    }
+
+    ptemp.iValue = 1;						/* enable the PSTB sweep */
+    GCA(INPapName, (ckt, which, foo, "pstb", &ptemp));
 
     return (0);
 }
@@ -1711,6 +1868,10 @@ INP2dot(CKTcircuit *ckt, INPtables *tab, struct card *current, TSKtask *task, CK
         /* Enhancement-122: Periodic AC */
     } else if ((strcmp(token, ".pac") == 0)) {
         rtn = dot_pac(line, ckt, tab, current, task, gnode, foo);
+        goto quit;
+        /* card #465: Periodic loop gain (PSTB) */
+    } else if ((strcmp(token, ".pstb") == 0)) {
+        rtn = dot_pstb(line, ckt, tab, current, task, gnode, foo);
         goto quit;
         /* Enhancement-124: Periodic noise */
     } else if ((strcmp(token, ".pnoise") == 0)) {

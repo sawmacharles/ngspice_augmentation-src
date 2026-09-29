@@ -113,6 +113,26 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->PSSdoPSP = value->iValue;
         break;
 
+    /* card #465: `.pac ... solver=td` (time-domain shooting-based PAC),
+     * and `.pstb` (periodic loop gain, built on the same engine). */
+    case PAC_SOLVER:
+        if (value->sValue && strcmp(value->sValue, "td") == 0)
+            job->PACsolver = PAC_SOLVER_TD;
+        else if (value->sValue && strcmp(value->sValue, "fd") == 0)
+            job->PACsolver = PAC_SOLVER_FD;
+        else {
+            fprintf(stderr, "Error: .pac solver=%s not recognised "
+                    "(known: fd (default), td) - ignored\n",
+                    value->sValue ? value->sValue : "?");
+        }
+        break;
+    case PSTB_DO:
+        job->PSSdoPSTB = value->iValue;
+        break;
+    case PSTB_PROBE:
+        job->PSTBprobeName = value->uValue;
+        break;
+
     default:
         return(E_BADPARM);
     }
@@ -142,7 +162,10 @@ static IFparm PSSparms[] = {
     { "pxf",          PXF_DO,		IF_SET|IF_INTEGER,	"run a periodic transfer-function sweep after PSS" },
     { "pxf_out",      PXF_OUT,		IF_SET|IF_STRING,	"pxf output node" },
     { "pnoise_cyclo", PNOISE_CYCLO,	IF_SET|IF_INTEGER,	"pnoise cyclostationary mode (per-sample bias, period average)" },
-    { "psp",          PSP_DOPSP,	IF_SET|IF_INTEGER,	"run a periodic S-parameter sweep after PSS (needs RF ports)" }
+    { "psp",          PSP_DOPSP,	IF_SET|IF_INTEGER,	"run a periodic S-parameter sweep after PSS (needs RF ports)" },
+    { "solver",       PAC_SOLVER,	IF_SET|IF_STRING,	"PAC solver: fd (default, frequency-domain) or td (card #465, time-domain shooting-based)" },
+    { "pstb",         PSTB_DO,		IF_SET|IF_INTEGER,	"run a .pstb periodic loop-gain sweep (card #465)" },
+    { "pstb_probe",   PSTB_PROBE,	IF_SET|IF_STRING,	"pstb probe V-source instance name" }
 };
 
 SPICEanalysis PSSinfo  = {

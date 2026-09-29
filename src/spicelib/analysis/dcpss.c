@@ -4525,8 +4525,28 @@ shootingexit:
 
                 /* Enhancement-122: for a .pac card, sweep the input frequency and
                  * emit the sideband-0 node responses as a complex plot. */
-                if (job->PSSdoPAC)
+                if (job->PSSdoPAC) {
+                    /* card #465: solver=td needs method=shoot (the time-domain
+                     * engine hooks into PSSshootDriven(), which this brute-force
+                     * driven-mode path never reaches) -- warn rather than
+                     * silently running the (still fully supported, unchanged)
+                     * frequency-domain engine instead. */
+                    if (job->PACsolver == PAC_SOLVER_TD)
+                        fprintf (stderr, "PAC: solver=td needs method=shoot (card #465) -- "
+                                 "this .pac card used the default driven-mode PSS, so the "
+                                 "existing frequency-domain PAC engine ran instead.\n") ;
                     pac_sweep (ckt, job) ;
+                }
+                /* card #465: `.pstb` needs method=shoot -- this brute-force
+                 * driven-mode path never reaches PSSshootDriven(), where the
+                 * time-domain PSTB engine hooks in, so a `.pstb` card without
+                 * method=shoot would otherwise silently produce no PSTB output
+                 * at all (rule: no silent numbers -- and no silent NOTHING
+                 * either, here). */
+                if (job->PSSdoPSTB)
+                    fprintf (stderr, "PSTB: '.pstb' needs method=shoot (card #465) -- "
+                             "this job used the default driven-mode PSS, so no PSTB "
+                             "sweep was run.\n") ;
 
                 /* Enhancement-124: for a .pnoise card, fold each device's noise
                  * through the conversion matrix to get the output noise spectrum. */

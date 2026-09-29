@@ -111,7 +111,8 @@ libckt_la_SOURCES += \
 		pssinit.c	\
 		psssetp.c	\
 		pssshoot.c	\
-		psseigen.c
+		psseigen.c	\
+		pacshoot.c
 endif
 
 if SP_WANTED

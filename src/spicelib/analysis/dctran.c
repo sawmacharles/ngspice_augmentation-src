@@ -23,6 +23,7 @@ Modified: 2023 XSPICE breakpoint fix for shared ngspice by Vyacheslav Shevchuk
 #include "ngspice/missing_math.h"
 #ifdef WITH_PSS
 #include "pssshoot.h"   /* card #458 second pass: breakpoint-forcing hooks */
+#include "pacshoot.h"   /* card #465: time-domain PAC/PSTB recording hook */
 #endif
 
 /* for setting breakpoints required by dbs data base */
@@ -507,6 +508,11 @@ DCtran(CKTcircuit *ckt,
        active. */
     if (PSSrippleRecordActive)
         PSSrippleRecordStep(ckt);
+    /* card #465: time-domain PAC/PSTB per-step complex propagation, same
+       call site again. No-op unless a `.pac solver=td` / `.pstb` recording
+       pass has it active. */
+    if (PSSpacActive)
+        PSSpacRecordStep(ckt);
 #endif
 
 #ifdef XSPICE
