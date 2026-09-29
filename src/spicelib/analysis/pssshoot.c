@@ -88,6 +88,8 @@ What this does NOT do (see the card #458 report for the full list):
 #include "ind/inddefs.h"
 #include "sw/swdefs.h"   /* card #494 (plan T6.1): saltation for ideal `sw` events */
 #include "res/resdefs.h"   /* card #494 fifth pass: pss_salt_local_cond() below */
+#include "dio/diodefs.h"   /* card #510: pss_salt_ind_jump() diode term below */
+#include "vsrc/vsrcdefs.h"   /* card #510: pss_salt_node_is_stable() below */
 
 #include <math.h>
 #include <string.h>
@@ -1007,6 +1009,296 @@ pss_salt_local_cond(CKTcircuit *ckt, int node)
     return g;
 }
 
+/* card #510 (silently-wrong-result bug, high priority): a switch power
+ * node whose AC/sensitivity perturbation reaches it, with NO local
+ * capacitor there (pss_salt_local_cap()==0, e.g. a hard-switched buck's
+ * own switching node feeding straight into an inductor, no snubber cap)
+ * was silently giving dfdt_pos/dfdt_neg=0 -- the THIRD pass's comment
+ * calls this "correctly no jump: an exogenous source's own voltage is not
+ * a state that can jump", true ONLY for a node that is itself an
+ * independent source's own terminal. For a node that is instead the near
+ * terminal of an INDUCTOR (tests/fixtures/pac_sw_ctrl_direct.cir: node
+ * `sw`, S1's negNode, feeding L1 with no capacitor anywhere on `sw`), it
+ * is WRONG: `.pac`/`.pxf` measured exactly 0+0j control-to-output at
+ * every frequency with no warning, while a `.tran` shows ~13 V/V DC gain
+ * and the saltation machinery's own fs/2-band warning fires (proving it
+ * DOES see the event) -- confirmed via PSS_SALT_TRACE=1
+ * (dfdt_pos=0 dfdt_neg=0 at the real duty-cycle event) and via two
+ * bracketing experiments (docs/pss-pac.md's card #510 section): (a) an
+ * RC softening the CONTROL path (Vctrl -> switch control) does NOT change
+ * the zero result at all, at any RC -- ruling out the control-path
+ * hypothesis the card's brief floated ("the AC source enters the event
+ * function directly, no state in between" -- refuted: the state-driven
+ * coeff/dtau term, y_prev[posCntrl]-y_prev[negCntrl], already reaches a
+ * directly-forced control node correctly, via the SAME full-circuit
+ * per-step SMPsolve() that handles it for R6o); (b) adding a capacitor
+ * directly AT the switch's POWER node (`sw`) DOES make the result
+ * nonzero, confirming the actual missing piece is the (f+-f-) JUMP
+ * TARGET, not the event-time-shift coeff.
+ *
+ * Root cause: PSSsensRecordStep()/PSSpacRecordStep()'s smooth per-step
+ * recursion only ever READS a state's history (g_sens_Sprev/g_pac_Cprev)
+ * at STATE rows -- capacitor node pairs and inductor branch-current rows,
+ * the `for (d=0; d<n; d++)` loop in both files. A jump written onto a
+ * NON-state node's own row (e.g. `sw` with no local cap) is therefore
+ * INERT for propagation: it is overwritten from scratch, correctly, by
+ * the very next accepted step's own SMPsolve() (which recomputes every
+ * algebraic node fresh from the, by then correctly-jumped, states) --
+ * this is exactly WHY pss_salt_local_cap()'s "0 at an exogenous node"
+ * case is harmless there (nothing forward-propagating was ever lost) but
+ * is a genuine bug at an inductor-adjacent node with no cap: the ONE
+ * state that DOES persist there (the inductor's own current) was never
+ * given its jump at all.
+ *
+ * Fix (pss_salt_ind_jump() below): when posNode/negNode has no local
+ * capacitor, look for a UNIQUE adjacent inductor and route the jump onto
+ * ITS branch-current row instead, in inductor-current-derivative units
+ * (f_L=(V(pos)-V(neg))/L). f_L+-f_L- = (V(node)+ - V(node)-)/L, and
+ * V(node)+ is simply the ACTUAL, already-solved accepted-point value
+ * (ckt->CKTrhsOld[node]) -- no approximation needed there at all. Only
+ * V(node)- (the COUNTERFACTUAL "what would this node's voltage be at
+ * this same instant, holding the ADJACENT INDUCTOR's current I_L at its
+ * (continuous, unable to jump) actual value, if the triggering switch
+ * had NOT flipped") needs deriving, from a LOCAL one-node KCL solve at
+ * `node`: the triggering switch (conductance g_prev, to the verified-
+ * stable `otherNode`) plus every OTHER device actually touching `node`
+ * (pss_salt_ind_jump() below walks R/other-SW/diode, same scope as
+ * pss_salt_local_cond()) plus the fixed I_L, using PRE-EVENT (CKTstate1,
+ * NOT CKTstate0) small-signal Norton equivalents for every nonlinear one
+ * of those -- full derivation (including the two diode sign cases,
+ * cathode vs RS=0 anode) in docs/pss-pac.md's card #510 section.
+ *
+ *   V(node)- = [g_prev*V(otherNode) + K_other_prev - s*I_L] /
+ *              (g_prev + G_other_prev)
+ *
+ * (s = +1 if `node` is the found inductor's OWN posNode, else -1;
+ * K_other_prev/G_other_prev = the sum of every other device's own
+ * PRE-event Norton current/conductance at `node`, from its CKTstate1
+ * history). No ag0, no step size, anywhere -- same step-size-
+ * independence property the capacitor case has.
+ *
+ * EARLIER VERSION OF THIS FIX (this pass, superseded, kept here for the
+ * record -- see docs/pss-pac.md's card #510 section, "a second bug
+ * found"): a simpler `dV=dI/(g_prev+G_other)` shortcut, using ONLY the
+ * POST-event G_other, gave a WILDLY wrong (many orders of magnitude)
+ * answer on this very fixture's turn-ON edge, where the freewheeling
+ * diode at the same node is ITSELF effectively co-switching (conducting
+ * heavily just before the edge, off just after) -- that shortcut's
+ * implicit assumption ("every other device at the node has a FIXED
+ * conductance across the event") silently fails whenever the "other"
+ * device is a diode whose own bias flips in sympathy with the switch, a
+ * completely ordinary situation in a synchronous/freewheeling topology.
+ * Caught by re-validating against tools/pac_perturbed.py rather than
+ * trusting the first formula that removed the original all-zero bug --
+ * see the report. The Norton/prev-state version above does not have this
+ * failure mode: it solves the counterfactual PRE-event topology's own
+ * node equation properly (using that topology's OWN diode operating
+ * point, not a value borrowed from the post-event one).
+ *
+ * When neither a capacitor nor a usable unique adjacent inductor is
+ * found, and the node is not itself an exogenous (source/ground/
+ * capacitor-anchored) node either, this is refused outright (a stderr
+ * message, PSSsaltFindEvents() returns -1) rather than silently
+ * returning 0 -- per the card's own brief. Scope limits, stated
+ * honestly: only ONE inductor per node; the switch's OTHER terminal, and
+ * every "other" device's OWN far terminal, must be independently
+ * verified stable (pss_salt_node_is_stable()) -- refused otherwise, a
+ * genuinely coupled multi-node event this local solve cannot resolve;
+ * the diode term only covers the cathode side and an RS=0 anode; a
+ * NON-triggering switch's own PRE-event conductance is approximated by
+ * its CURRENT SWcond (no separate CKTstate history kept for that field,
+ * unlike the diode's) -- fine unless that other switch is ALSO flipping
+ * at this exact same instant, not exercised by any fixture checked;
+ * CSW, XSPICE, MOSFET/BJT conductances at such a node are NOT modelled
+ * and fall through to the same refusal. */
+
+/* card #510: is `node` guaranteed NOT to be jumping at this same event --
+ * safe to hold fixed as a reference in pss_salt_ind_jump()'s local KCL?
+ * True for ground/unused (node<=0), a node with its own local
+ * capacitance (a real state, by construction slowly-varying across one
+ * instantaneous event), or a node that is directly an independent
+ * voltage source's own terminal (algebraically fixed by the source
+ * regardless of current -- the same "exogenous node" pss_salt_local_
+ * cap()'s own comment already argues can never jump). */
+static int
+pss_salt_node_is_stable(CKTcircuit *ckt, int node)
+{
+    int vtype;
+    VSRCmodel *vm;
+    VSRCinstance *vi;
+
+    if (node <= 0)
+        return 1;
+    if (pss_salt_local_cap(ckt, node) > 0.0)
+        return 1;
+
+    vtype = CKTtypelook("Vsource");
+    if (vtype >= 0)
+        for (vm = (VSRCmodel *) ckt->CKThead[vtype]; vm; vm = VSRCnextModel(vm))
+            for (vi = VSRCinstances(vm); vi; vi = VSRCnextInstance(vi))
+                if (vi->VSRCposNode == node || vi->VSRCnegNode == node)
+                    return 1;
+
+    return 0;
+}
+
+/* card #510: the inductor-routed forcing term for `node` (one of a
+ * switch's two power terminals) -- see the derivation comment above.
+ * `otherNode` is the switch's OTHER power terminal (held fixed, must be
+ * pss_salt_node_is_stable()). `g_prev` is the caller's already-computed
+ * pre-event conductance of the TRIGGERING switch itself. On success
+ * (return 1) fills *out_row (the target inductor's INDbrEq) and
+ * *out_djump (the (f+-f-) value, in Amps/second, to be scaled by coeff
+ * exactly like the capacitor case). Returns 0 if there is genuinely
+ * nothing to do (no adjacent inductor -- a purely algebraic node, no
+ * persistent state, no jump needed, same as an exogenous node). Returns
+ * -1 (REFUSE) and fills *out_why if this event is outside what this
+ * function can safely resolve. */
+static int
+pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
+                   double g_prev, int *out_row, double *out_djump, double *out_tau,
+                   const char **out_why)
+{
+    int indtype, n_found = 0;
+    INDmodel *im;
+    INDinstance *ii, *found = NULL;
+    int found_sign = 0;
+    int restype, swtype, diotype;
+    RESmodel *rm; RESinstance *ri;
+    SWmodel *sm; SWinstance *si;
+    DIOmodel *dm; DIOinstance *di;
+    double Gsum, Ksum, Vfar;
+    double V_now, V_other, I_L, V_prev, dV;
+
+    if (node <= 0)
+        return 0;
+
+    indtype = CKTtypelook("Inductor");
+    if (indtype < 0)
+        return 0;
+
+    for (im = (INDmodel *) ckt->CKThead[indtype]; im; im = INDnextModel(im))
+        for (ii = INDinstances(im); ii; ii = INDnextInstance(ii)) {
+            if (ii->INDposNode == node) {
+                found = ii; found_sign = +1; n_found++;
+            } else if (ii->INDnegNode == node) {
+                found = ii; found_sign = -1; n_found++;
+            }
+        }
+
+    if (n_found == 0)
+        return 0;   /* purely algebraic node -- correctly nothing to do */
+    if (n_found > 1) {
+        *out_why = "more than one inductor terminal at the switching node "
+                   "(ambiguous which one absorbs the jump)";
+        return -1;
+    }
+    if (!pss_salt_node_is_stable(ckt, otherNode)) {
+        *out_why = "the switch's other terminal is not itself a verified-"
+                   "stable node (no local capacitor, not a source terminal) "
+                   "-- a simultaneous double jump this engine cannot resolve";
+        return -1;
+    }
+
+    Gsum = 0.0; Ksum = 0.0;
+
+    restype = CKTtypelook("Resistor");
+    if (restype >= 0)
+        for (rm = (RESmodel *) ckt->CKThead[restype]; rm; rm = RESnextModel(rm))
+            for (ri = RESinstances(rm); ri; ri = RESnextInstance(ri))
+                if (ri->RESposNode == node || ri->RESnegNode == node) {
+                    int far = (ri->RESposNode == node) ? ri->RESnegNode : ri->RESposNode;
+                    if (!pss_salt_node_is_stable(ckt, far)) {
+                        *out_why = "a resistor's own far terminal at the switching "
+                                   "node is not itself a verified-stable node";
+                        return -1;
+                    }
+                    Vfar = (far <= 0) ? 0.0 : ckt->CKTrhsOld[far];
+                    Gsum += ri->RESconduct;
+                    Ksum += ri->RESconduct * Vfar;
+                }
+
+    swtype = CKTtypelook("Switch");
+    if (swtype >= 0)
+        for (sm = (SWmodel *) ckt->CKThead[swtype]; sm; sm = SWnextModel(sm))
+            for (si = SWinstances(sm); si; si = SWnextInstance(si))
+                if (si != sw && (si->SWposNode == node || si->SWnegNode == node)) {
+                    int far = (si->SWposNode == node) ? si->SWnegNode : si->SWposNode;
+                    if (!pss_salt_node_is_stable(ckt, far)) {
+                        *out_why = "another switch's own far terminal at the switching "
+                                   "node is not itself a verified-stable node";
+                        return -1;
+                    }
+                    Vfar = (far <= 0) ? 0.0 : ckt->CKTrhsOld[far];
+                    /* approximation: this OTHER switch's OWN pre-event
+                     * conductance is not separately tracked (unlike the
+                     * diode's CKTstate1 below) -- its CURRENT SWcond
+                     * stands in for both; see the header comment. */
+                    Gsum += si->SWcond;
+                    Ksum += si->SWcond * Vfar;
+                }
+
+    diotype = CKTtypelook("Diode");
+    if (diotype >= 0)
+        for (dm = (DIOmodel *) ckt->CKThead[diotype]; dm; dm = DIOnextModel(dm))
+            for (di = DIOinstances(dm); di; di = DIOnextInstance(di)) {
+                int is_cathode = (di->DIOnegNode == node);
+                int is_anode = (di->DIOposNode == node && di->DIOposPrimeNode == di->DIOposNode);
+                int far;
+                double Gd, Vd, Id;
+
+                if (!is_cathode && !is_anode)
+                    continue;
+
+                far = is_cathode ? di->DIOposNode : di->DIOnegNode;
+                if (!pss_salt_node_is_stable(ckt, far)) {
+                    *out_why = "a diode's own far terminal at the switching node "
+                               "is not itself a verified-stable node";
+                    return -1;
+                }
+                Vfar = (far <= 0) ? 0.0 : ckt->CKTrhsOld[far];
+                Gd = ckt->CKTstate1[di->DIOconduct];
+                Vd = ckt->CKTstate1[di->DIOvoltage];   /* anode-cathode, PREV point */
+                Id = ckt->CKTstate1[di->DIOcurrent];   /* anode->cathode current, PREV point */
+
+                Gsum += Gd;
+                if (is_cathode)
+                    /* current injected into the cathode = +I_D(V_D),
+                     * V_D = Vfar(anode) - V(node); see the header comment. */
+                    Ksum += Id + Gd * (Vfar - Vd);
+                else
+                    /* node is the anode; current injected = -I_D(V_D),
+                     * V_D = V(node) - Vfar(cathode). */
+                    Ksum += -Id + Gd * (Vfar + Vd);
+            }
+
+    if (g_prev + Gsum <= 0.0) {
+        *out_why = "degenerate switch model (g_prev+G_other_prev <= 0)";
+        return -1;
+    }
+
+    V_now = ckt->CKTrhsOld[node];
+    V_other = (otherNode <= 0) ? 0.0 : ckt->CKTrhsOld[otherNode];
+    I_L = ckt->CKTrhsOld[found->INDbrEq];
+
+    V_prev = (g_prev * V_other + Ksum - (double) found_sign * I_L) / (g_prev + Gsum);
+
+    dV = V_now - V_prev;
+    *out_djump = (double) found_sign * dV / found->INDinduct;
+    *out_row = found->INDbrEq;
+    /* card #510: L/R settle-window estimate for PSSsaltForceOrder1() below
+     * (the FIFTH pass's L-stable-propagation fix), mirroring tau=C/G for
+     * the capacitor case -- see PSSsaltFindEvents()'s own wiring of this
+     * into tau_max/g_salt_settle_until. Without this, the accepted steps
+     * right after an inductor-routed jump propagate through the
+     * surrounding TRAPEZOIDAL (order 2) recursion instead of L-stable
+     * backward Euler, the same ringing-into-the-slow-states failure mode
+     * the FIFTH pass root-caused for the capacitor case (docs/pss-pac.md's
+     * "FOURTH pass"/"FIFTH pass" sections) -- found to matter here too. */
+    *out_tau = found->INDinduct / (g_prev + Gsum);
+    return 1;
+}
+
 int
 PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
 {
@@ -1042,10 +1334,20 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     /* card #494 third pass: restart filter -- see PSSsaltReset()'s own
      * header comment in pssshoot.h. Consumes the latch unconditionally,
      * even if this particular step has no real sw event, so it only ever
-     * suppresses the FIRST call after a reset. */
+     * suppresses the FIRST call after a reset. card #510 DIAGNOSTIC ONLY
+     * (not the fix, opt-in, default-off, zero behaviour change unless set):
+     * PSS_SALT_NOFILTER=1 skips this suppression, to test the hypothesis
+     * that a REAL switching edge landing at/near a period boundary (e.g.
+     * tests/fixtures/pac_sw_ctrl_direct.cir's Vramp, whose fast fall-back
+     * edge lands essentially exactly at t=T) is being discarded by this
+     * filter along with the stale-history artifact it was designed for --
+     * see docs/pss-pac.md's card #510 section. NOT part of the shipped
+     * fix (not validated, no regression run under it) -- reverting this
+     * one-line change is `git revert`/dropping just this hunk. */
     if (g_salt_first_step_pending) {
         g_salt_first_step_pending = 0;
-        return 0;
+        if (!(getenv("PSS_SALT_NOFILTER") && strcmp(getenv("PSS_SALT_NOFILTER"), "1") == 0))
+            return 0;
     }
 
     tau_max = 0.0;
@@ -1061,6 +1363,10 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             double prev = ckt->CKTstate1[here->SWswitchstate];
             double vctrl_now, vctrl_prev, h_dot, g_now, g_prev, dG, v_switch, dI;
             double Cpos, Cneg, Gpos, Gneg, tau_pos, tau_neg;
+            int posRow, negRow, indrc;
+            double dfdt_pos, dfdt_neg;
+            double tau_ind_pos = 0.0, tau_ind_neg = 0.0;
+            const char *why = NULL;
 
             if (pss_salt_is_on(now) == pss_salt_is_on(prev))
                 continue;   /* hysteresis-band-only or no-change: no real event */
@@ -1080,6 +1386,49 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             Cpos = pss_salt_local_cap(ckt, here->SWposNode);
             Cneg = pss_salt_local_cap(ckt, here->SWnegNode);
 
+            /* card #510: capacitor case unchanged (THIRD pass, validated);
+             * otherwise try the inductor-routed forcing term; otherwise
+             * (no cap, no unique adjacent inductor) posRow/negRow stay 0
+             * -- correctly no jump, e.g. an exogenous source node or a
+             * purely algebraic/resistive one, see the derivation comment
+             * above pss_salt_ind_jump(). A REFUSE (-1) from
+             * pss_salt_ind_jump() aborts the whole call immediately. */
+            if (Cpos > 0.0) {
+                posRow = here->SWposNode;
+                dfdt_pos = -dI / Cpos;
+            } else {
+                posRow = 0;
+                dfdt_pos = 0.0;
+                indrc = pss_salt_ind_jump(ckt, here, here->SWposNode, here->SWnegNode,
+                                           g_prev, &posRow, &dfdt_pos, &tau_ind_pos, &why);
+                if (indrc < 0) {
+                    fprintf(stderr, "PSS-SALT: REFUSING saltation correction for "
+                            "switch %s at t=%.9g (posNode=%d): %s -- this .pss/.pac/"
+                            ".pxf run cannot be trusted for this deck; aborting rather "
+                            "than return a silently-wrong 0 (card #510).\n",
+                            here->SWname, ckt->CKTtime, here->SWposNode, why);
+                    return -1;
+                }
+            }
+
+            if (Cneg > 0.0) {
+                negRow = here->SWnegNode;
+                dfdt_neg = dI / Cneg;
+            } else {
+                negRow = 0;
+                dfdt_neg = 0.0;
+                indrc = pss_salt_ind_jump(ckt, here, here->SWnegNode, here->SWposNode,
+                                           g_prev, &negRow, &dfdt_neg, &tau_ind_neg, &why);
+                if (indrc < 0) {
+                    fprintf(stderr, "PSS-SALT: REFUSING saltation correction for "
+                            "switch %s at t=%.9g (negNode=%d): %s -- this .pss/.pac/"
+                            ".pxf run cannot be trusted for this deck; aborting rather "
+                            "than return a silently-wrong 0 (card #510).\n",
+                            here->SWname, ckt->CKTtime, here->SWnegNode, why);
+                    return -1;
+                }
+            }
+
             ev[n].posNode = here->SWposNode;
             ev[n].negNode = here->SWnegNode;
             ev[n].posCntrl = here->SWposCntrlNode;
@@ -1087,8 +1436,10 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             ev[n].v_switch = v_switch;
             ev[n].dG = dG;
             ev[n].h_dot = h_dot;
-            ev[n].dfdt_pos = (Cpos > 0.0) ? (-dI / Cpos) : 0.0;
-            ev[n].dfdt_neg = (Cneg > 0.0) ? ( dI / Cneg) : 0.0;
+            ev[n].posRow = posRow;
+            ev[n].negRow = negRow;
+            ev[n].dfdt_pos = dfdt_pos;
+            ev[n].dfdt_neg = dfdt_neg;
             ev[n].name = here->SWname;
 
             /* card #494 fifth pass (task 2): estimate this event's own
@@ -1100,6 +1451,11 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             tau_neg = (Cneg > 0.0 && Gneg > 0.0) ? Cneg / Gneg : 0.0;
             if (tau_pos > tau_max) tau_max = tau_pos;
             if (tau_neg > tau_max) tau_max = tau_neg;
+            /* card #510: same settle-window estimate, inductor-routed case
+             * (tau_ind_pos/neg, filled by pss_salt_ind_jump() above -- 0
+             * when that path did not apply). */
+            if (tau_ind_pos > tau_max) tau_max = tau_ind_pos;
+            if (tau_ind_neg > tau_max) tau_max = tau_ind_neg;
 
             n++;
         }
@@ -1301,6 +1657,14 @@ PSSsensRecordStep(CKTcircuit *ckt)
         PSSsaltEvent salt_ev[PSS_SALT_MAX_EVENTS];
         int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
 
+        /* card #510: PSSsaltFindEvents() already printed why; a REFUSE
+         * here must fail this whole (PSS-sens/monodromy) pass cleanly,
+         * not silently continue with an unhandled event's jump missing. */
+        if (n_salt < 0) {
+            g_sens_failed = 1;
+            return;
+        }
+
         /* card #494 fifth pass (task 2): force backward Euler (L-stable)
          * for the whole step, all columns, while a post-event settle
          * window from a PREVIOUS event is still open -- see
@@ -1373,7 +1737,7 @@ PSSsensRecordStep(CKTcircuit *ckt)
      * complementary switches) never see a partially-applied correction. */
     if (n_salt > 0) {
         for (j = 0; j < n; j++) {
-            double djump[PSS_SALT_MAX_EVENTS][2];   /* [i_salt][0]=posNode, [1]=negNode */
+            double djump[PSS_SALT_MAX_EVENTS][2];   /* [i_salt][0]=posRow, [1]=negRow */
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 PSSsaltEvent *e = &salt_ev[i_salt];
                 double Sp = pss_sens_get(g_sens_Sprev, e->posCntrl, n, j);
@@ -1384,12 +1748,18 @@ PSSsensRecordStep(CKTcircuit *ckt)
             }
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 PSSsaltEvent *e = &salt_ev[i_salt];
-                if (e->posNode > 0)
-                    pss_sens_set(g_sens_Snew, e->posNode, n, j,
-                                 pss_sens_get(g_sens_Snew, e->posNode, n, j) + djump[i_salt][0]);
-                if (e->negNode > 0)
-                    pss_sens_set(g_sens_Snew, e->negNode, n, j,
-                                 pss_sens_get(g_sens_Snew, e->negNode, n, j) + djump[i_salt][1]);
+                /* card #510: posRow/negRow (posNode/negNode for the
+                 * THIRD pass's original capacitor case, an adjacent
+                 * inductor's own INDbrEq row for the new inductor-routed
+                 * case, or 0/skip) -- never posNode/negNode directly, see
+                 * pssshoot.h's PSSsaltEvent comment for why a non-state
+                 * node's own row is inert. */
+                if (e->posRow > 0)
+                    pss_sens_set(g_sens_Snew, e->posRow, n, j,
+                                 pss_sens_get(g_sens_Snew, e->posRow, n, j) + djump[i_salt][0]);
+                if (e->negRow > 0)
+                    pss_sens_set(g_sens_Snew, e->negRow, n, j,
+                                 pss_sens_get(g_sens_Snew, e->negRow, n, j) + djump[i_salt][1]);
             }
         }
     }

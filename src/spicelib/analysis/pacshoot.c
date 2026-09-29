@@ -852,6 +852,14 @@ PSSpacRecordStep(CKTcircuit *ckt)
     int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
     int i_salt;
 
+    /* card #510: PSSsaltFindEvents() already printed why; REFUSE this
+     * whole PAC-TD pass rather than silently continue missing an event's
+     * forcing term. */
+    if (n_salt < 0) {
+        g_pac_failed = 1;
+        return;
+    }
+
     /* card #494 fifth pass (task 2): same L-stable-settle-window override
      * as PSSsensRecordStep() (pssshoot.c) -- see PSSsaltForceOrder1()'s
      * header comment in pssshoot.h. Must run after PSSsaltFindEvents()
@@ -926,7 +934,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
      * complementary switches) never see a partially-applied correction. */
     if (n_salt > 0) {
         for (m = 0; m < M; m++) {
-            PACc djump[PSS_SALT_MAX_EVENTS][2];   /* [i_salt][0]=posNode, [1]=negNode */
+            PACc djump[PSS_SALT_MAX_EVENTS][2];   /* [i_salt][0]=posRow, [1]=negRow */
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 PSSsaltEvent *e = &salt_ev[i_salt];
                 PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m);
@@ -937,12 +945,16 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 PSSsaltEvent *e = &salt_ev[i_salt];
-                if (e->posNode > 0)
-                    pac_set(g_pac_Cnew, e->posNode, M, m,
-                            pc_add(pac_get(g_pac_Cnew, e->posNode, M, m), djump[i_salt][0]));
-                if (e->negNode > 0)
-                    pac_set(g_pac_Cnew, e->negNode, M, m,
-                            pc_add(pac_get(g_pac_Cnew, e->negNode, M, m), djump[i_salt][1]));
+                /* card #510: posRow/negRow -- posNode/negNode for the
+                 * capacitor case, or an adjacent inductor's INDbrEq row
+                 * for the new inductor-routed case, or 0/skip; see
+                 * pssshoot.h's PSSsaltEvent comment. */
+                if (e->posRow > 0)
+                    pac_set(g_pac_Cnew, e->posRow, M, m,
+                            pc_add(pac_get(g_pac_Cnew, e->posRow, M, m), djump[i_salt][0]));
+                if (e->negRow > 0)
+                    pac_set(g_pac_Cnew, e->negRow, M, m,
+                            pc_add(pac_get(g_pac_Cnew, e->negRow, M, m), djump[i_salt][1]));
             }
         }
     }

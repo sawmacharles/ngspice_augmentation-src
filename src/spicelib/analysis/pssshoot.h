@@ -130,17 +130,32 @@ void PSStrigRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), sa
  * accepted step. ---- */
 
 typedef struct {
-    int posNode, negNode;       /* switch power terminals (where the state jump applies) */
+    int posNode, negNode;       /* switch power terminals */
     int posCntrl, negCntrl;     /* switch control terminals (h = v(posCntrl)-v(negCntrl)-vt) */
     double v_switch;            /* V(posNode)-V(negNode) at the accepted point */
     double dG;                  /* conductance jump, g_after - g_before */
     double h_dot;                /* d(v_ctrl)/dt across this step (finite difference,
                                    * denominator = the step's TRUE elapsed accepted time,
                                    * card #494 fifth pass -- see PSSsaltFindEvents()) */
-    double dfdt_pos;             /* (f+-f-) at posNode: -dG*v_switch / C_local(posNode),
-                                   * 0 if posNode has no capacitor directly on it (e.g. an
-                                   * ideal voltage source's own node -- no state to jump) */
-    double dfdt_neg;             /* (f+-f-) at negNode: +dG*v_switch / C_local(negNode) */
+    /* card #510: posRow/negRow is the STATE ROW the dfdt_pos/dfdt_neg jump
+     * is actually applied to -- posNode/negNode themselves (the THIRD
+     * pass's original capacitor case, unchanged) when a capacitor sits
+     * directly on that node, OR an adjacent inductor's own branch-current
+     * row (INDbrEq, card #510's new "input-forcing"/inductor-routed case,
+     * see pss_salt_ind_jump() in pssshoot.c) when there is no capacitor
+     * there but there IS a unique adjacent inductor, OR 0 (skip, no jump
+     * applied -- an exogenous/purely-algebraic node, correctly a no-op)
+     * when neither applies. Always use posRow/negRow, never posNode/
+     * negNode directly, when applying the correction -- see
+     * PSSsaltFindEvents()'s header comment for why a non-state node's own
+     * row is inert (overwritten from scratch next step) even when
+     * nonzero. */
+    int posRow, negRow;
+    double dfdt_pos;             /* (f+-f-) for posRow: capacitor case
+                                   * -dG*v_switch/C_local(posNode); inductor
+                                   * case, see pss_salt_ind_jump(); 0 if
+                                   * posRow==0 */
+    double dfdt_neg;             /* (f+-f-) for negRow, mirror of dfdt_pos */
     const char *name;           /* instance name, for diagnostics */
 } PSSsaltEvent;
 
@@ -153,7 +168,12 @@ extern int PSSsaltActive;   /* env-var gated (PSS_SALTATION, default on); see ps
  * ckt->CKTdelta as the just-taken step size). Returns 0 if none (the
  * overwhelmingly common case -- every step of every deck with no ideal
  * switch, or whose switches didn't change state this step). Cheap unless
- * PSSsaltActive. */
+ * PSSsaltActive. Returns -1 (card #510) if a real event was found whose
+ * forcing term this engine cannot compute safely (see pss_salt_ind_jump()
+ * in pssshoot.c) -- a clear stderr message is printed before returning;
+ * the caller (PSSsensRecordStep()/PSSpacRecordStep()) must treat this as
+ * a hard failure (set its own g_sens_failed/g_pac_failed and return) --
+ * REFUSE, not a silent wrong answer, per card #510's brief. */
 int PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max);
 
 /* card #494 third pass: call once at the START of every fresh
