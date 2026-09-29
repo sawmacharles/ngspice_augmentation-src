@@ -267,6 +267,34 @@ pac_state_row(const PACstateRef *ref)
     return ref->isCap ? ref->dev.cap->CAPposNode : ref->dev.ind->INDbrEq;
 }
 
+/* card #489 SECOND pass (plan T6.2, task 5): resolve a `trigger=` node
+ * (its raw circuit node number, job->PSStrigNode->number in pssshoot.c) to
+ * an index into THIS map's reduced-state vector, for the free-running
+ * period-variation projection (see pacshoot.h's pac_pstb_run_ex() comment
+ * and docs/pss-pac.md's free-running section for the derivation). Only a
+ * native capacitor's OWN positive terminal is handled -- the paradigm case
+ * for every hysteretic/bang-bang/COT reference this project has (the
+ * trigger is the latch/comparator-state capacitor itself, e.g. R5's `q`),
+ * and the only case pss_run_until_trigger()'s own f(T) estimate lines up
+ * with exactly (a reduced STATE, not a derived algebraic node). Returns
+ * -1 (not -- e.g. -- 0, a valid index) if trig_node_num < 0 (ordinary
+ * driven call) or no match is found (an inductor-current trigger, or a
+ * trigger node not directly a reduced state -- e.g. separated from the
+ * nearest cap by a series resistance) -- the caller must treat -1 as "no
+ * correction available" and refuse rather than silently running the
+ * uncorrected engine on what would then be a free-running orbit. */
+static int
+pac_find_trig_idx(const PACstateMap *map, int trig_node_num)
+{
+    int d;
+    if (trig_node_num < 0)
+        return -1;
+    for (d = 0; d < map->n; d++)
+        if (map->refs[d].isCap && map->refs[d].dev.cap->CAPposNode == trig_node_num)
+            return d;
+    return -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* card #465 SECOND pass (plan T5.3, task 3 "speed"): PAC_RECORD_POINTS
  * decouples the grid resolution of pacshoot.c's OWN two recording-period
@@ -1007,7 +1035,12 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
                 const double *freqs, int nfreq,
                 const int *outrows, int nout,
                 PACc *Phi_out /* n*n, may be NULL */,
-                PACc *Y0_out  /* nout*nfreq */)
+                PACc *Y0_out  /* nout*nfreq */,
+                const double *fT /* card #489 second pass: n, NULL = ordinary
+                                     driven (fixed-period) boundary condition */,
+                int trig_idx /* index of the trigger state in fT/map's own
+                                order, -1 = no correction (driven case, or
+                                fT==NULL) */)
 {
     int n = map->n, neq = SMPmatSize(ckt->CKTmatrix);
     int M1 = n + nfreq, f, d, j, err;
@@ -1087,7 +1120,55 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
     if (Phi_out) memcpy(Phi_out, Phi, (size_t) n * n * sizeof(PACc));
     pac_free();
 
-    /* dense boundary solve per frequency: (e^{jwT} I - Phi) xi = z(w) */
+    /* card #489 SECOND pass (plan T6.2, task 5): free-running period-
+     * variation correction. Applied to LOCAL copies (PhiB/zB below) used
+     * ONLY for the boundary-value solve immediately below -- the stored
+     * Phi_out (if requested) stays the RAW monodromy, and pass 2's
+     * re-propagation below is unaffected (see docs/pss-pac.md's
+     * free-running section: the re-propagation/demodulation correction is
+     * second order in the response and does not need this term).
+     * Proj = I - f(T) e_trig^T / (e_trig . f(T)) is never built as a
+     * dense matrix: (Proj . A)[d][*] = A[d][*] - (fT[d]/fT[trig_idx]) *
+     * A[trig_idx][*] is a rank-1 update using ROW trig_idx of A, applied
+     * to every row d (including d==trig_idx itself, which becomes
+     * identically zero -- the expected rank-(n-1) signature, same as
+     * pssshoot.c's own FD-projected monodromy M). */
+    {
+        PACc *PhiB = Phi, *zB = z;
+        PACc *PhiCorr = NULL, *zCorr = NULL;
+        /* card #489 SECOND pass, task 5 validation (TEST-ONLY, default off,
+         * same convention as PAC_REDPROOF_FREEZE_PHI/PAC_REDPROOF_SIGNFLIP
+         * above): PAC_FREERUN_NO_PROJ skips the period-variation projection
+         * below even when fT/trig_idx were supplied -- used to confirm the
+         * term actually changes the answer (not a silent no-op) by A/B
+         * comparison against the same independent reference this pass's
+         * own report validates against. Never set in production. */
+        if (fT && trig_idx >= 0 && fT[trig_idx] != 0.0 && !getenv("PAC_FREERUN_NO_PROJ")) {
+            double denom = fT[trig_idx];
+            PhiCorr = TMALLOC(PACc, (size_t) n * n);
+            zCorr = TMALLOC(PACc, (size_t) n * nfreq);
+            if (!PhiCorr || !zCorr) {
+                if (PhiCorr) tfree(PhiCorr); if (zCorr) tfree(zCorr);
+                err = 1; goto cleanup;
+            }
+            for (d = 0; d < n; d++) {
+                double coeff = fT[d] / denom;
+                for (j = 0; j < n; j++)
+                    PhiCorr[(size_t) d * n + j] =
+                        pc_sub(Phi[(size_t) d * n + j],
+                               pc_scale(Phi[(size_t) trig_idx * n + j], coeff));
+                for (f = 0; f < nfreq; f++)
+                    zCorr[(size_t) d * nfreq + f] =
+                        pc_sub(z[(size_t) d * nfreq + f],
+                               pc_scale(z[(size_t) trig_idx * nfreq + f], coeff));
+            }
+            PhiB = PhiCorr; zB = zCorr;
+        }
+
+    /* dense boundary solve per frequency: (e^{jwT} I - Phi) xi = z(w)
+     * (PhiB/zB: the free-running-corrected boundary condition above when
+     * fT/trig_idx were given, otherwise identically Phi/z -- the ordinary
+     * driven-engine equation, byte-for-byte unchanged). */
     for (f = 0; f < nfreq; f++) {
         PACc *A = TMALLOC(PACc, (size_t) n * n);
         PACc *rhs = TMALLOC(PACc, n);
@@ -1095,14 +1176,18 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         double w = 2.0 * M_PI * freqs[f];
         double wT = w * T;
         PACc ephase = { cos(wT), sin(wT) };
-        if (!A || !rhs || !sol) { if (A) tfree(A); if (rhs) tfree(rhs); if (sol) tfree(sol); err = 1; goto cleanup; }
+        if (!A || !rhs || !sol) {
+            if (A) tfree(A); if (rhs) tfree(rhs); if (sol) tfree(sol);
+            if (PhiCorr) tfree(PhiCorr); if (zCorr) tfree(zCorr);
+            err = 1; goto cleanup;
+        }
         for (d = 0; d < n; d++)
             for (j = 0; j < n; j++) {
-                PACc v = pc_scale(Phi[(size_t) d * n + j], -1.0);
+                PACc v = pc_scale(PhiB[(size_t) d * n + j], -1.0);
                 if (d == j) v = pc_add(v, ephase);
                 A[(size_t) d * n + j] = v;
             }
-        for (d = 0; d < n; d++) rhs[d] = z[(size_t) d * nfreq + f];
+        for (d = 0; d < n; d++) rhs[d] = zB[(size_t) d * nfreq + f];
         if (pac_complex_solve(A, rhs, n, sol)) {
             fprintf(stderr, "PAC-TD: WARNING -- boundary solve singular at f=%.6g Hz "
                     "(e^{jwT}=1 is a Floquet multiplier there: an undamped oscillation "
@@ -1113,6 +1198,9 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         for (d = 0; d < n; d++)
             xi[(size_t) d * nfreq + f] = sol[d];
         tfree(A); tfree(rhs); tfree(sol);
+    }
+    if (PhiCorr) tfree(PhiCorr);
+    if (zCorr) tfree(zCorr);
     }
 
     /* pass 2: re-propagate from y0=xi per frequency, demodulate at the
@@ -1170,14 +1258,17 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
 
 /* ------------------------------------------------------------------ */
 /* `.pac ... method=shoot solver=td`: sideband-0 response at every node,
- * forcing = the netlist AC-source stimulus B0. */
+ * forcing = the netlist AC-source stimulus B0. fT/trig_node_num: card #489
+ * second pass, see pacshoot.h's pac_pstb_run_ex() comment -- NULL/-1 for
+ * the ordinary driven case. */
 static int
-pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
+pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
+           const double *fT, int trig_node_num)
 {
     PACstateMap map;
     int neq = SMPmatSize(ckt->CKTmatrix);
     double *br, *bi;
-    int nfreq, *outrows, i, numNames, err;
+    int nfreq, *outrows, i, numNames, err, trig_idx;
     double *freqs;
     PACc *Y0;
     IFuid freqUid, *nameList = NULL;
@@ -1194,6 +1285,19 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
         fprintf(stderr, "PAC-TD: internal state-map mismatch -- skipped\n");
         if (map.refs) tfree(map.refs);
         return E_INTERN;
+    }
+
+    trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    if (trig_node_num >= 0 && trig_idx < 0) {
+        fprintf(stderr, "PAC-TD: REFUSED -- the trigger= node (free-running "
+                "orbit, card #489) is not a native capacitor's own positive "
+                "terminal among this circuit's reduced states, so the "
+                "period-variation terminal projection this engine needs "
+                "(docs/pss-pac.md's free-running section) cannot be formed. "
+                "Not running the fixed-period engine uncorrected on a "
+                "moving-period orbit.\n");
+        tfree(map.refs);
+        return E_UNSUPP;
     }
 
     br = TMALLOC(double, neq + 1);
@@ -1227,7 +1331,8 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
             numNames, numNames == 1 ? "" : "s", "netlist AC-flagged source(s)");
 
     t0 = SPfrontEnd->IFseconds();
-    err = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq, outrows, numNames, NULL, Y0);
+    err = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq, outrows, numNames, NULL, Y0,
+                          fT, trig_idx);
     t1 = SPfrontEnd->IFseconds();
     fprintf(stderr, "PAC-TD: %s, wall_time=%.3fs (%.4fs/point)\n",
             err ? "FAILED" : "done", t1 - t0, nfreq > 0 ? (t1 - t0) / nfreq : 0.0);
@@ -1292,14 +1397,15 @@ pac_interp_logf(double f0, double f1, double y0, double y1, double target)
 }
 
 static int
-pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
+pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
+            const double *fT, int trig_node_num)
 {
     PACstateMap map;
     int neq = SMPmatSize(ckt->CKTmatrix);
     GENinstance *inst;
     int branch_probe, node_a, node_b;
     double *br1, *bi1, *br2, *bi2;
-    int nfreq, i, err;
+    int nfreq, i, err, trig_idx;
     double *freqs;
     int outrows[2];   /* node_b, branch_probe */
     PACc *Phi, *Y1, *Y2;
@@ -1341,6 +1447,19 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
         fprintf(stderr, "PSTB: internal state-map mismatch -- skipped\n");
         if (map.refs) tfree(map.refs);
         return E_INTERN;
+    }
+
+    trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    if (trig_node_num >= 0 && trig_idx < 0) {
+        fprintf(stderr, "PSTB: REFUSED -- the trigger= node (free-running "
+                "orbit, card #489) is not a native capacitor's own positive "
+                "terminal among this circuit's reduced states, so the "
+                "period-variation terminal projection this engine needs "
+                "(docs/pss-pac.md's free-running section) cannot be formed. "
+                "Not running the fixed-period engine uncorrected on a "
+                "moving-period orbit.\n");
+        tfree(map.refs);
+        return E_UNSUPP;
     }
 
     br1 = TMALLOC(double, neq + 1); bi1 = TMALLOC(double, neq + 1);
@@ -1390,9 +1509,11 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
             n, n == 1 ? "" : "s");
 
     t0 = SPfrontEnd->IFseconds();
-    err = pac_engine_run(ckt, job, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, Phi, Y1);
+    err = pac_engine_run(ckt, job, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, Phi, Y1,
+                          fT, trig_idx);
     if (!err)
-        err = pac_engine_run(ckt, job, &map, x0, T, br2, bi2, freqs, nfreq, outrows, 2, NULL, Y2);
+        err = pac_engine_run(ckt, job, &map, x0, T, br2, bi2, freqs, nfreq, outrows, 2, NULL, Y2,
+                              fT, trig_idx);
     t1 = SPfrontEnd->IFseconds();
     fprintf(stderr, "PSTB: %s, wall_time=%.3fs (%.4fs/point, 2 forcing patterns)\n",
             err ? "FAILED" : "done", t1 - t0, nfreq > 0 ? (t1 - t0) / (2 * nfreq) : 0.0);
@@ -1578,17 +1699,24 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
 /* ------------------------------------------------------------------ */
 
 int
-pac_pstb_run(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
+pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
+                 const double *fT, int trig_node_num)
 {
     int err = OK;
 
     if (job->PSSdoPAC && job->PACsolver == PAC_SOLVER_TD) {
-        int e = pac_td_pac(ckt, job, x0, n, T);
+        int e = pac_td_pac(ckt, job, x0, n, T, fT, trig_node_num);
         if (e) err = e;
     }
     if (job->PSSdoPSTB) {
-        int e = pac_td_pstb(ckt, job, x0, n, T);
+        int e = pac_td_pstb(ckt, job, x0, n, T, fT, trig_node_num);
         if (e) err = e;
     }
     return err;
+}
+
+int
+pac_pstb_run(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
+{
+    return pac_pstb_run_ex(ckt, job, x0, n, T, NULL, -1);
 }

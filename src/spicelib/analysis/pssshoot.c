@@ -2967,11 +2967,26 @@ PSStrigRecordStep(CKTcircuit *ckt)
  * that exact instant. Returns 0 and fills x_T/T_measured on success, 1 on
  * failure (no crossing within max_period, or an integration error) --
  * failure is the caller's cue to report FAILED/non-convergence, never a
- * false steady state (see this file's card #489 header comment). */
+ * false steady state (see this file's card #489 header comment).
+ *
+ * card #489 SECOND pass (plan T6.2, task 5): x_prev_out/t_prev_out are
+ * optional (NULL-able, every existing call site below passes NULL/NULL and
+ * is byte-for-byte unaffected) outputs of the LAST accepted-step state/time
+ * BEFORE the trigger bracket (g_trig_prev_x/g_trig_prev_t, which
+ * PSStrigRecordStep() already freezes at exactly that point and which this
+ * function would otherwise discard). Together with x_T/T_measured, this
+ * gives a cheap backward-difference estimate of f(T) = dx/dt at the
+ * trigger crossing on the converged orbit -- f(T) e_trig^T / (e_trig .
+ * f(T)) is the flow-direction/terminal-projection term PSSshootFreerun()
+ * uses below to enable `.pac`/`.pstb` on a free-running orbit (see that
+ * function's own comment and docs/pss-pac.md's free-running section for
+ * the derivation). No new run is needed for this: g_trig_prev_x is a
+ * sample the SAME probe run already took. */
 static int
 pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
                        int node_num, double trigval, int dir,
-                       double max_period, double *x_T, double *T_measured)
+                       double max_period, double *x_T, double *T_measured,
+                       double *x_prev_out, double *t_prev_out)
 {
     int err, iter;
     double dt_lo, dt_hi, v_lo, v_hi, dt_mid = 0.0, v_mid = 0.0;
@@ -3022,6 +3037,12 @@ pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
     if (!err)
         pss_state_get(map, ckt, x_T);
     *T_measured = g_trig_t_lo + dt_mid;
+    if (!err && x_prev_out && t_prev_out && g_trig_have_prev) {
+        int k;
+        for (k = 0; k < map->n; k++)
+            x_prev_out[k] = g_trig_prev_x[k];
+        *t_prev_out = g_trig_prev_t;
+    }
     pss_trig_free();
     return err;
 }
@@ -3132,7 +3153,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         pss_ripple_reset(&map, x0);
         PSSrippleRecordActive = 1;
         err = pss_run_until_trigger(ckt, &map, x0, node_num, trigval, dir,
-                                     max_period, x1, &Tmeas);
+                                     max_period, x1, &Tmeas, NULL, NULL);
         PSSrippleRecordActive = 0;
         if (err) {
             fprintf(stderr, "PSS-FREERUN: no trigger crossing found within "
@@ -3169,7 +3190,8 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n; k++) xtrial[k] = x0[k];
             xtrial[j] += h;
             if (pss_run_until_trigger(ckt, &map, xtrial, node_num, trigval,
-                                       dir, max_period, x1trial, &Tp)) {
+                                       dir, max_period, x1trial, &Tp,
+                                       NULL, NULL)) {
                 fprintf(stderr, "PSS-FREERUN: monodromy perturbation (+h, "
                         "state %d) lost the trigger crossing at iter=%d; "
                         "treating this attempt as non-convergent.\n", j, iter);
@@ -3180,7 +3202,8 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n; k++) xtrial[k] = x0[k];
             xtrial[j] -= h;
             if (pss_run_until_trigger(ckt, &map, xtrial, node_num, trigval,
-                                       dir, max_period, x1trial, &Tm)) {
+                                       dir, max_period, x1trial, &Tm,
+                                       NULL, NULL)) {
                 fprintf(stderr, "PSS-FREERUN: monodromy perturbation (-h, "
                         "state %d) lost the trigger crossing at iter=%d; "
                         "treating this attempt as non-convergent.\n", j, iter);
@@ -3207,7 +3230,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                 for (k = 0; k < n; k++) xtrial[k] = x0[k] + damp * delta[k];
                 ok2 = !pss_run_until_trigger(ckt, &map, xtrial, node_num,
                                               trigval, dir, max_period,
-                                              x1trial, &Tt);
+                                              x1trial, &Tt, NULL, NULL);
                 if (ok2) {
                     for (k = 0; k < n; k++) {
                         double r = fabs(x1trial[k] - xtrial[k]) / scale[k];
@@ -3295,24 +3318,106 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                 "itself, just not the emitted plot.\n", err);
     }
 
-    /* card #489: `.pac`/`.pstb` on a free-running orbit -- NOT implemented
-     * this pass. pacshoot.c's LPTV linearisation (pac_pstb_run()) assumes
-     * a FIXED period T with no period-variation term; a free-running
-     * orbit's true small-signal response needs that term (how T itself
-     * shifts under a perturbation feeds back into every sideband -- see
-     * docs/pss-pac.md's free-running section for the derivation of what
-     * is missing and why). Refused here with a clear, honest message
-     * rather than silently running the fixed-period engine on a moving-
-     * period orbit and reporting a wrong number. */
-    if (job->PSSdoPAC || job->PSSdoPSTB) {
+    /* card #489 SECOND pass (plan T6.2, task 5): `.pac`/`.pstb` on a
+     * free-running orbit. pacshoot.c's LPTV linearisation (pac_pstb_run())
+     * assumes a FIXED period T; a free-running orbit's small-signal
+     * response needs the period-VARIATION term (how T itself shifts under
+     * a perturbation feeds back into the periodicity boundary condition).
+     * A correction was DERIVED and IMPLEMENTED this pass (docs/pss-pac.md's
+     * free-running section has the full derivation): the SAME terminal
+     * projection this file's own monodromy already needs for the
+     * LARGE-signal (Newton/Floquet) problem, `Proj = I - f(T) e_trig^T /
+     * (e_trig . f(T))`, applied to pacshoot.c's complex periodicity
+     * boundary condition (Phi, z) instead of to the real FD monodromy M.
+     *
+     * NOT trusted by default (still gated -- see the "else" branch below):
+     * validated on R5 control-to-output against an independent, tightly
+     * self-consistent (amplitude-halving <=0.01dB) transient-injection
+     * Hann-windowed-DFT reference at 20kHz (0.07dB/0.34deg from the
+     * reference) and 60kHz (0.30dB/0.59deg) -- both inside the project's
+     * usual 0.5dB/3deg target -- but at 150kHz the SAME comparison shows a
+     * 3.7dB/9.6deg disagreement, worse than leaving the correction OFF
+     * (3.0dB/-7.2deg uncorrected) though neither is close to right. Root
+     * cause NOT identified this pass: plausible candidates are (1) the
+     * single-local-step backward-difference f(T) estimate below being too
+     * imprecise at R5's OWN extremely stiff switch-node time constant
+     * (Csw's RC ~= 1ps, two orders of magnitude faster than the ~1ns
+     * comparator/latch constant every other timing estimate in this file
+     * assumes is the fast scale) -- the correction's own row weights
+     * fT[d]/fT[trig_idx] could be amplifying that imprecision at higher
+     * frequency; or (2) pacshoot.c's own documented (docs/pss-pac.md
+     * "Accuracy") Jacobian-reuse floor, never previously characterised on
+     * a circuit this stiff (R3/R4 do not have anything like Csw's 1ps
+     * constant), being exposed for the first time now that .pac finally
+     * runs on R5 at all. NOT distinguished this pass -- see the card #489
+     * report. Because of this, .pac/.pstb on a free-running orbit STAYS
+     * REFUSED by default (same honest-failure principle as before this
+     * pass); PSS_FREERUN_PAC_EXPERIMENTAL=1 opts into the implementation
+     * above for further investigation, never for production use. */
+    if ((job->PSSdoPAC || job->PSSdoPSTB) && getenv("PSS_FREERUN_PAC_EXPERIMENTAL")) {
+        double *fT = TMALLOC(double, n);
+        double *x_prev = TMALLOC(double, n);
+        double t_prev = 0.0, T_meas2 = 0.0;
+        fprintf(stderr, "PSS-FREERUN: PSS_FREERUN_PAC_EXPERIMENTAL=1 -- running "
+                ".pac/.pstb on this free-running orbit with the UNVALIDATED "
+                "(above ~60kHz on R5; root cause not identified) period-"
+                "variation correction. Not for production use -- see this "
+                "file's own card #489 SECOND pass comment and docs/"
+                "pss-pac.md's free-running section.\n");
+        if (fT && x_prev &&
+            !pss_run_until_trigger(ckt, &map, x0, node_num, trigval, dir,
+                                    max_period, x1trial, &T_meas2,
+                                    x_prev, &t_prev)) {
+            double dt = T_meas2 - t_prev;
+            if (dt > 0.0) {
+                int k, pac_err;
+                for (k = 0; k < n; k++)
+                    fT[k] = (x1trial[k] - x_prev[k]) / dt;
+                fprintf(stdout, "PSS-FREERUN: .pac/.pstb period-variation "
+                        "term: f(T) estimated from a %.6g s backward "
+                        "difference at the trigger crossing (card #489 "
+                        "second pass -- see docs/pss-pac.md).\n", dt);
+                if (getenv("PSS_FREERUN_FT_DEBUG")) {
+                    int kk;
+                    fprintf(stderr, "DEBUG T_meas2=%.12g t_prev=%.12g dt=%.6g\n",
+                            T_meas2, t_prev, dt);
+                    for (kk = 0; kk < n; kk++)
+                        fprintf(stderr, "DEBUG fT[%d]=%.9g x_T=%.9g x_prev=%.9g\n",
+                                kk, fT[kk], x1trial[kk], x_prev[kk]);
+                }
+                pac_err = pac_pstb_run_ex(ckt, job, x0, n, T, fT, node_num);
+                if (pac_err)
+                    fprintf(stderr, "PSS-FREERUN: .pac/.pstb on the "
+                            "free-running orbit did not complete (see "
+                            "pacshoot.c's own diagnostic above); the "
+                            "PSS-FREERUN orbit/Floquet result above this "
+                            "is still valid on its own.\n");
+            } else {
+                fprintf(stderr, "PSS-FREERUN: WARNING -- could not estimate "
+                        "f(T) at the trigger crossing (degenerate dt=%.3g); "
+                        ".pac/.pstb skipped.\n", dt);
+            }
+        } else {
+            fprintf(stderr, "PSS-FREERUN: WARNING -- could not re-locate "
+                    "the trigger crossing from the converged x0 to estimate "
+                    "the period-variation term; .pac/.pstb skipped.\n");
+        }
+        if (fT) tfree(fT);
+        if (x_prev) tfree(x_prev);
+    } else if (job->PSSdoPAC || job->PSSdoPSTB) {
         fprintf(stderr, "PSS-FREERUN: WARNING -- .pac/.pstb on a free-"
-                "running (trigger=) orbit is NOT implemented this pass "
-                "(card #489): pacshoot.c's existing engine assumes a FIXED "
-                "period and has no period-variation term, which a free-"
-                "running orbit's small-signal response needs (see docs/"
-                "pss-pac.md's free-running section). Skipping the .pac/"
-                ".pstb post-processing; the PSS-FREERUN orbit/Floquet "
-                "result above is still valid on its own.\n");
+                "running (trigger=) orbit is REFUSED by default (card #489 "
+                "SECOND pass): a period-variation correction was derived "
+                "and implemented, but a 3+dB/10deg disagreement against an "
+                "independent reference at higher frequency (validated only "
+                "up to roughly 60kHz on R5's own 422.68kHz switching "
+                "frequency; root cause not identified -- see this file's "
+                "own comment above and docs/pss-pac.md's free-running "
+                "section) means it is not yet trustworthy. Skipping the "
+                ".pac/.pstb post-processing; the PSS-FREERUN orbit/Floquet "
+                "result above is still valid on its own. Set "
+                "PSS_FREERUN_PAC_EXPERIMENTAL=1 to run it anyway for "
+                "further investigation -- NOT for production use.\n");
     }
 
     err = OK;

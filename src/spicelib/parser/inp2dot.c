@@ -1284,6 +1284,13 @@ dot_pac(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
     GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
 
+    /* card #489 SECOND pass: trigval/trigdir defaults, same rationale as
+     * dot_pss's identical lines -- only used if trigger= also appears. */
+    ptemp.rValue = 0.5;
+    GCA(INPapName, (ckt, which, foo, "trigval", &ptemp));
+    ptemp.sValue = "rise";
+    GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+
     /* card #465: optional trailing tokens, in any order --
      *   maxsideband          (bare integer, existing Enhancement-122 syntax)
      *   method shoot|driven  (which PSS algorithm the .pac card's OWN PSS
@@ -1333,6 +1340,29 @@ dot_pac(char *line, void *ckt, INPtables *tab, struct card *current,
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
                 GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
+            } else if (strcmp(word, "trigger") == 0) {
+                /* card #489 SECOND pass (plan T6.2, task 5): a `.pac`
+                 * card's OWN `.pss` pass may be free-running (trigger=)
+                 * too -- same three tokens/split as dot_pss's identical
+                 * branch above (trigger= takes a node, not a plain
+                 * value/string token). */
+                char *tnname;
+                CKTnode *tnnode;
+                tfree(word);
+                INPgetNetTok(&line, &tnname, 0);
+                INPtermInsert(ckt, &tnname, tab, &tnnode);
+                ptemp.nValue = tnnode;
+                GCA(INPapName, (ckt, which, foo, "trigger", &ptemp));
+            } else if (strcmp(word, "trigval") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_REAL, tab);
+                GCA(INPapName, (ckt, which, foo, "trigval", parm));
+            } else if (strcmp(word, "trigdir") == 0) {
+                char *dword;
+                tfree(word);
+                INPgetTok(&line, &dword, 1);
+                ptemp.sValue = dword;
+                GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
             } else {
                 fprintf(stderr, "Error: unknown trailing token '%s' on .pac - ignored\n", word);
                 tfree(word);
@@ -1418,6 +1448,13 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
     GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
 
+    /* card #489 SECOND pass: trigval/trigdir defaults, same rationale as
+     * dot_pss's identical lines -- only used if trigger= also appears. */
+    ptemp.rValue = 0.5;
+    GCA(INPapName, (ckt, which, foo, "trigval", &ptemp));
+    ptemp.sValue = "rise";
+    GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+
     /* trailing tokens: probe=<Vname> (required) and method shoot|driven
      * (optional, no '=' -- same INPgetTok split as dot_pss/dot_pac). */
     while (*line) {
@@ -1455,6 +1492,26 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
             tfree(word);
             parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
             GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
+        } else if (strcmp(word, "trigger") == 0) {
+            /* card #489 SECOND pass (plan T6.2, task 5): see dot_pac()'s
+             * identical branch. */
+            char *tnname;
+            CKTnode *tnnode;
+            tfree(word);
+            INPgetNetTok(&line, &tnname, 0);
+            INPtermInsert(ckt, &tnname, tab, &tnnode);
+            ptemp.nValue = tnnode;
+            GCA(INPapName, (ckt, which, foo, "trigger", &ptemp));
+        } else if (strcmp(word, "trigval") == 0) {
+            tfree(word);
+            parm = INPgetValue(ckt, &line, IF_REAL, tab);
+            GCA(INPapName, (ckt, which, foo, "trigval", parm));
+        } else if (strcmp(word, "trigdir") == 0) {
+            char *dword;
+            tfree(word);
+            INPgetTok(&line, &dword, 1);
+            ptemp.sValue = dword;
+            GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
         } else {
             fprintf(stderr, "Error: unknown trailing token '%s' on .pstb - ignored\n", word);
             tfree(word);

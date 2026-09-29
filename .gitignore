@@ -65,6 +65,7 @@ src/frontend/snp2va.cpp
 
 /release*
 /debug*
+/asan*
 
 /visualc-tcl*
 
