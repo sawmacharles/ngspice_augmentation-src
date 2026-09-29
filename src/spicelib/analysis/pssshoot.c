@@ -544,6 +544,177 @@ pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
 }
 
 
+/* card #498: does this circuit contain a native ideal Switch (SW) instance
+ * anywhere? Both of this card's fallbacks (pss_run_period_ex_safe()'s
+ * looser-reltol retry, and pss_fd_perturb_side()'s shrinking-h retry) exist
+ * ONLY to rescue the specific numerical pathology an ideal `sw` device's
+ * hard threshold creates right at a saltation event (see those two
+ * functions' own header comments, and patches-wip/salt/README.md, for the
+ * full characterisation) -- found, on this card's own repro
+ * (tests/fixtures/pss_r6s_shoot.cir), to NOT be a safe blanket change for
+ * every deck: an early version of this card's fix (gating only on "did the
+ * period run fail", with no device-type check) rescued OTHERWISE-honest
+ * convergence failures on the pss_r4_d55_unstable.cir red-proof fixture
+ * (peak-current-mode instability, no `sw`/`csw` device anywhere in that
+ * deck) into a spurious CONVERGED verdict -- a looser reltol or a
+ * different perturbation size is not a side-effect-free "try harder", it
+ * is a genuinely different (less accurate) trajectory, and for a marginal/
+ * oscillating operating point that is enough to fool the residual test the
+ * red-proof exists to exercise. Gating both fallbacks behind "this
+ * circuit actually has a switch" makes them a provable, checked no-op for
+ * every fixture in this project's regression suite that doesn't use one
+ * (confirmed: test_pss.py back to its pre-card-#498 40/44+4info baseline
+ * with this gate in place -- see the card #498 report) while still
+ * reaching the deck family (R2, R6/R6o/R6s, pac_r6o_ctrl2out, ...) the
+ * fallback was built for. Scanned once per PSSshootDriven() call (see its
+ * own call site below) -- CSwitch (current-controlled) is intentionally
+ * NOT included: this project's own switch-event work is SW-only so far
+ * (patches-wip/salt/README.md's own "NOT reached" list), so treating a
+ * CSW-only deck as switch-free is the conservative (no fallback) choice,
+ * not an assumption that CSW is safe either way. */
+static int
+pss_ckt_has_switch(CKTcircuit *ckt)
+{
+    int swtype = CKTtypelook("Switch");
+    SWmodel *sm;
+
+    if (swtype < 0)
+        return 0;
+    for (sm = (SWmodel *) ckt->CKThead[swtype]; sm; sm = SWnextModel(sm))
+        if (SWinstances(sm))
+            return 1;
+    return 0;
+}
+
+/* card #498 (plan: pss_r6s_shoot.cir closed-loop convergence): the deck's
+ * own reltol (save_reltol in PSSshootDriven, e.g. the 1e-3 default), set
+ * here once per PSSshootDriven() call, right after that value is known,
+ * and ONLY if pss_ckt_has_switch() above says this deck can even reach the
+ * pathology this fallback targets -- see pss_run_period_ex_safe() below.
+ * 0.0 (the initial value, and the value shoot_cleanup restores it to, and
+ * what a switch-free deck always leaves it at) means "no fallback
+ * available", making pss_run_period_ex_safe() an exact pass-through -- so
+ * a caller that never sets this (every OTHER analysis path,
+ * PSSshootFreerun(), and every switch-free driven deck) is completely
+ * unaffected. */
+static double g_pss_loose_reltol = 0.0;
+
+/* card #498: companion gate for pss_fd_perturb_side()'s own shrinking-h
+ * retry -- see pss_ckt_has_switch()'s header comment for why this needs
+ * the SAME gate as g_pss_loose_reltol. Set alongside it. */
+static int g_pss_has_switch = 0;
+
+/* card #498: every Newton-loop period run (baseline, FD monodromy
+ * perturbation columns, damped-step trial, fast-state detection, Floquet
+ * re-evaluation, final trajectory emission) runs at CKTreltol tightened to
+ * PSS_SHOOT_RELTOL/1e-5 (see PSSshootDriven's own comment on tight_reltol
+ * for why: it is what lets the shooting engine resolve a switching edge
+ * tightly enough for the monodromy to mean anything). On
+ * tests/fixtures/pss_r6s_shoot.cir (card #498's own repro) this tight
+ * value made the corrector need a sub-attosecond step exactly at the
+ * "second", fast-ramp-fall saltation event patches-wip/salt/README.md's
+ * FIFTH/SIXTH passes already characterise for this same deck family --
+ * "Timestep too small ... trouble with swmod-instance shs" -- even though
+ * a plain `.tran` of the identical circuit, and this same shooter's own
+ * (always-loose) pre-stabilization warm-up transient, sail through the
+ * identical instant every period. Confirmed by hand (card #498): rerunning
+ * ONLY the failing period run at the deck's own looser reltol (no other
+ * change) removes the failure outright. This wrapper automates exactly
+ * that recovery, and ONLY that: the first attempt is always at whatever
+ * CKTreltol the caller already set (byte-for-byte the pre-card-#498
+ * behaviour), so a deck whose period runs already succeed there -- every
+ * existing fixture -- never reaches the retry branch at all. Only a run
+ * that already FAILED gets a second, looser-tolerance attempt before the
+ * failure is reported upward; CKTreltol is restored to the caller's value
+ * either way (this must never leak a looser tolerance into a later,
+ * unrelated period run). */
+static int
+pss_run_period_ex_safe(CKTcircuit *ckt, double T, const char *jobname,
+                        int record, int force)
+{
+    int err = pss_run_period_ex(ckt, T, jobname, record, force);
+
+    if (err && g_pss_loose_reltol > 0.0 && ckt->CKTreltol < g_pss_loose_reltol) {
+        double saved_reltol = ckt->CKTreltol;
+        if (getenv("PSS_SHOOT_DEBUG"))
+            fprintf(stderr, "DEBUG %s failed at reltol=%.3g (ngspice error "
+                    "%d); retrying once at the deck's own reltol=%.3g "
+                    "(card #498 guarded fallback) before giving up.\n",
+                    jobname, saved_reltol, err, g_pss_loose_reltol);
+        ckt->CKTreltol = g_pss_loose_reltol;
+        err = pss_run_period_ex(ckt, T, jobname, record, force);
+        ckt->CKTreltol = saved_reltol;
+    }
+    return err;
+}
+
+
+/* card #498: run ONE side (sign_h = +1.0 or -1.0) of a monodromy FD
+ * perturbation column, retrying at a shrinking step if the period run
+ * fails outright (ngspice error, e.g. the same swmod-instance "Timestep
+ * too small" failure pss_run_period_ex_safe()'s own header comment
+ * describes, but surfacing INSIDE a perturbed trajectory instead of the
+ * baseline -- found on pss_r6s_shoot.cir, card #498, once the baseline-run
+ * failure above was fixed: a large-enough perturbation can add or remove
+ * an entire switching event relative to the baseline's forced grid,
+ * corrupting or outright breaking that one column). Up to
+ * PSS_FD_RETRY_MAX halvings of h (default 5; PSS_FD_RETRY_MAX overrides,
+ * no effect unless set, same pattern as this file's other tunables)
+ * before giving up on this side. Exact no-op (one call, no retry) for
+ * every column that already succeeds at the first, unshrunk h -- every
+ * existing fixture's own FD columns, confirmed by the regression suite
+ * (card #498 report). Returns 0 and fills outbuf/*h_used on success (the
+ * LAST h tried, which is h_start on the very first attempt); returns the
+ * failing ngspice error code, unchanged outbuf, otherwise. */
+static int
+pss_fd_perturb_side(CKTcircuit *ckt, PSSstateMap *map, double T,
+                     const double *x_full, int n_full, int jf, double x0j,
+                     double sign_h, double h_start, const char *jobname,
+                     double *outbuf, double *h_used)
+{
+    static int retry_max_base = -1;
+    double h = h_start;
+    double *icbuf;
+    int err = 1, tries;   /* retry_max >= 1 guarantees this is overwritten below */
+    int retry_max;
+
+    if (retry_max_base < 0) {
+        retry_max_base = getenv("PSS_FD_RETRY_MAX") ? atoi(getenv("PSS_FD_RETRY_MAX")) : 5;
+        if (retry_max_base < 1) retry_max_base = 1;
+    }
+    /* card #498: see pss_ckt_has_switch()'s header comment -- a switch-
+     * free deck gets exactly one attempt, byte-for-byte the pre-card-#498
+     * behaviour (no shrinking, no chance to mask a genuine non-convergence
+     * behind a smaller perturbation). */
+    retry_max = g_pss_has_switch ? retry_max_base : 1;
+
+    icbuf = TMALLOC(double, n_full);
+    if (!icbuf)
+        return E_NOMEM;
+
+    for (tries = 0; tries < retry_max; tries++) {
+        int i;
+        for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
+        icbuf[jf] = x0j + sign_h * h;
+        pss_state_set_ic(map, icbuf);
+        err = pss_run_period_ex_safe(ckt, T, jobname, 0, 1);
+        if (!err) {
+            pss_state_get(map, ckt, outbuf);
+            *h_used = h;
+            tfree(icbuf);
+            return 0;
+        }
+        if (getenv("PSS_SHOOT_DEBUG"))
+            fprintf(stderr, "DEBUG %s h=%.6g failed (ngspice error %d); "
+                    "shrinking (try %d/%d).\n", jobname, h, err, tries + 1,
+                    retry_max);
+        h *= 0.25;
+    }
+    tfree(icbuf);
+    return err;
+}
+
+
 /* ------------------------------------------------------------------ */
 /* Small dense linear solve (Gauss elimination, partial pivoting) --
  * n is never more than a handful of states here, so this is simpler and
@@ -2032,11 +2203,19 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
            *xtrial = NULL, *x1trial = NULL, *A = NULL, *b = NULL,
            *M = NULL, *s = NULL, *y = NULL, *Ms = NULL;
     double *icbuf = NULL, *outbuf = NULL, *ripple_full = NULL, *Phi_full = NULL;
+    double *plus_raw = NULL;   /* card #498: see the FD perturbation loop below */
     int *is_slow = NULL;
     int have_baseline = 0;   /* do x0/x1/F already hold a valid, just-run point? */
     int recompute = 1;       /* does THIS iteration's Jacobian need a fresh FD sweep? */
     int since_recompute = 0;
     int result = 0;
+    /* card #498: does M currently hold a complete, valid monodromy estimate
+     * (fresh FD, seeded, or Broyden-carried) that a LATER failing FD column
+     * could fall back on? Set true only once a full sweep -- fresh or with
+     * some columns themselves falling back -- has completed without an
+     * unrecoverable failure, or once an M_init seed is consumed; see
+     * pss_fd_perturb_side()'s call site below for the fallback itself. */
+    int m_has_prior = 0;
     if (seed_used_out) *seed_used_out = 0;
     /* card #458 FIFTH pass, task 1: the floor under a state's RIPPLE
      * (not, as in the second/third pass, under its magnitude). The old
@@ -2097,8 +2276,10 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     ripple_full = TMALLOC(double, n_full);
     Phi_full    = TMALLOC(double, (size_t) n_full * n_full);
     is_slow     = TMALLOC(int, n_full);
+    plus_raw    = TMALLOC(double, n);
     if (!x0 || !x1 || !F || !scale || !delta_x || !xtrial || !x1trial || !A || !b ||
-        !M || !s || !y || !Ms || !icbuf || !outbuf || !ripple_full || !Phi_full || !is_slow) {
+        !M || !s || !y || !Ms || !icbuf || !outbuf || !ripple_full || !Phi_full || !is_slow ||
+        !plus_raw) {
         fprintf(stderr, "PSS-SHOOT: %s out of memory allocating Newton "
                 "scratch space.\n", stage_label);
         result = 0;
@@ -2145,10 +2326,10 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                  * instead of running bare/unforced -- see below. */
                 pss_sens_reset(ckt, map);
                 PSSsensActive = 1;
-                err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period, analytic)", 1, 0);
+                err = pss_run_period_ex_safe(ckt, T, "PSS shoot (Newton baseline period, analytic)", 1, 0);
                 PSSsensActive = 0;
             } else {
-                err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
+                err = pss_run_period_ex_safe(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
             }
             PSSrippleRecordActive = 0;
             pss_ripple_get(map, ripple_full);
@@ -2295,6 +2476,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
              * trial before self-correcting, never a wrong convergence. */
             for (k = 0; k < n * n; k++) M[k] = M_init[k];
             since_recompute = 0;
+            m_has_prior = 1;   /* card #498: seeded M is a valid fallback source */
             if (seed_used_out) *seed_used_out = 1;
             if (getenv("PSS_SHOOT_DEBUG"))
                 fprintf(stderr, "DEBUG %s iter=0: seeded Jacobian from "
@@ -2322,43 +2504,85 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
             for (j = 0; j < n; j++) {
                 int jf = slow_idx[j];
                 double h = fabs(x0[j]) * eps;
+                double h_plus, h_minus;
+                int err_plus, err_minus;
                 if (h < 1e-6) h = 1e-6;
+                h_plus = h_minus = h;
 
-                for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
-                icbuf[jf] = x0[j] + h;
-                pss_state_set_ic(map, icbuf);
-                err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation +)", 0, 1);
-                if (err) {
-                    fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
-                            "run for state %s (+h) did not complete at "
-                            "Newton iteration %d (ngspice error %d).\n",
-                            stage_label, map->refs[jf].name, iter, err);
-                    result = 0;
-                    goto newton_done;
-                }
-                pss_state_get(map, ckt, outbuf);
-                for (k = 0; k < n; k++) M[k * n + j] = outbuf[slow_idx[k]];
+                /* card #498: each side gets its OWN shrink-retry (see
+                 * pss_fd_perturb_side()'s header comment) instead of the
+                 * single fixed-h attempt this loop used before. plus_raw
+                 * holds the raw f(x0+h) result (NOT yet a derivative) until
+                 * -h is also known to have succeeded -- M's own column j is
+                 * touched only once both sides are in hand, so a failing
+                 * -h (after a successful +h) never leaves M's fallback
+                 * column (the previous iteration's own valid estimate,
+                 * m_has_prior below) partially overwritten. */
+                for (k = 0; k < n; k++) plus_raw[k] = 0.0;
+                err_plus = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
+                                                x0[j], 1.0, h,
+                                                "PSS shoot (monodromy perturbation +)",
+                                                outbuf, &h_plus);
+                if (!err_plus)
+                    for (k = 0; k < n; k++) plus_raw[k] = outbuf[slow_idx[k]];
 
-                for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
-                icbuf[jf] = x0[j] - h;
-                pss_state_set_ic(map, icbuf);
-                err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation -)", 0, 1);
-                if (err) {
-                    fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
-                            "run for state %s (-h) did not complete at "
-                            "Newton iteration %d (ngspice error %d).\n",
-                            stage_label, map->refs[jf].name, iter, err);
-                    result = 0;
-                    goto newton_done;
+                if (!err_plus) {
+                    err_minus = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
+                                                     x0[j], -1.0, h,
+                                                     "PSS shoot (monodromy perturbation -)",
+                                                     outbuf, &h_minus);
+                } else {
+                    err_minus = 0;   /* -h not even attempted; err_plus alone triggers fallback below */
                 }
-                pss_state_get(map, ckt, outbuf);
-                for (k = 0; k < n; k++)
-                    M[k * n + j] = (M[k * n + j] - outbuf[slow_idx[k]]) / (2.0 * h);
+
+                if (err_plus || err_minus) {
+                    /* card #498: the "reuse the previous column" rescue is
+                     * gated the same way as the retry itself -- see
+                     * pss_ckt_has_switch()'s header comment. A switch-free
+                     * deck's column either succeeds on its one attempt
+                     * (retry_max==1 above) or falls straight to the
+                     * original "no previous column, abort" branch below,
+                     * byte-for-byte the pre-card-#498 behaviour. */
+                    if (m_has_prior && g_pss_has_switch) {
+                        fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
+                                "column for state %s did not complete even "
+                                "after shrinking h (ngspice error +h=%d -h=%d) "
+                                "at Newton iteration %d -- reusing the "
+                                "previous iteration's column for this state "
+                                "only (card #498 guarded fallback).\n",
+                                stage_label, map->refs[jf].name, err_plus,
+                                err_minus, iter);
+                        /* M[*, j] already holds the previous (Broyden-carried
+                         * or seeded) estimate for this column -- leave it
+                         * untouched rather than overwrite with a partial or
+                         * failed computation. */
+                    } else {
+                        fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
+                                "run for state %s did not complete (ngspice "
+                                "error +h=%d -h=%d) at Newton iteration %d%s.\n",
+                                stage_label, map->refs[jf].name, err_plus,
+                                err_minus, iter,
+                                g_pss_has_switch ?
+                                    (m_has_prior ? "" : ", and no previous "
+                                     "column exists yet to fall back on") :
+                                    " (no switch device in this circuit -- "
+                                    "card #498's guarded fallback stays "
+                                    "inactive)");
+                        result = 0;
+                        goto newton_done;
+                    }
+                } else {
+                    for (k = 0; k < n; k++)
+                        M[k * n + j] = (plus_raw[k] - outbuf[slow_idx[k]]) / (h_plus + h_minus);
+                }
             }
             if (getenv("PSS_SHOOT_DEBUG"))
                 for (k = 0; k < n * n; k++)
                     fprintf(stderr, "DEBUG FD Phi[%d]=%.8g\n", k, M[k]);
             since_recompute = 0;
+            m_has_prior = 1;   /* card #498: this sweep (fresh, possibly with
+                                 * some columns falling back) is now a valid
+                                 * fallback source for a LATER iteration. */
             /* M is the RAW monodromy estimate here (no -I baked in) --
              * kept that way throughout (Broyden update below preserves
              * it) so Phi_out is always a true Phi, and the -I is
@@ -2508,7 +2732,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                  * gated by PSS_SHOOT_NO_FORCE (existing debug/isolation
                  * switch, pss_run_period_ex()'s own comment) for anyone
                  * who needs to reproduce the old unforced behaviour. */
-                err = pss_run_period_ex(ckt, T, "PSS shoot (damped-step trial)", 0, 1);
+                err = pss_run_period_ex_safe(ckt, T, "PSS shoot (damped-step trial)", 0, 1);
                 if (!err) {
                     double newresidual = 0.0;
                     pss_state_get(map, ckt, outbuf);   /* outbuf: this trial's FULL result, incl. carried states */
@@ -2658,6 +2882,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     if (ripple_full) tfree(ripple_full);
     if (Phi_full) tfree(Phi_full);
     if (is_slow) tfree(is_slow);
+    if (plus_raw) tfree(plus_raw);
     return result;
 }
 
@@ -2759,7 +2984,7 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
 
     for (i = 0; i < n; i++) icbuf[i] = x_full[i];
     pss_state_set_ic(map, icbuf);
-    err = pss_run_period_ex(ckt, T, "PSS shoot (fast-state detection baseline)", 1, 0);
+    err = pss_run_period_ex_safe(ckt, T, "PSS shoot (fast-state detection baseline)", 1, 0);
     if (err) {
         fprintf(stderr, "PSS-SHOOT: fast-state detection baseline period "
                 "did not complete (ngspice error %d); skipping reduction, "
@@ -2774,7 +2999,7 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
         for (i = 0; i < n; i++) icbuf[i] = x_full[i];
         icbuf[j] = x_full[j] + h;
         pss_state_set_ic(map, icbuf);
-        err = pss_run_period_ex(ckt, T, "PSS shoot (fast-state detection perturbation +)", 0, 1);
+        err = pss_run_period_ex_safe(ckt, T, "PSS shoot (fast-state detection perturbation +)", 0, 1);
         if (err) {
             fprintf(stderr, "PSS-SHOOT: fast-state detection perturbation "
                     "run for state %s (+h) did not complete (ngspice error "
@@ -2788,7 +3013,7 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
         for (i = 0; i < n; i++) icbuf[i] = x_full[i];
         icbuf[j] = x_full[j] - h;
         pss_state_set_ic(map, icbuf);
-        err = pss_run_period_ex(ckt, T, "PSS shoot (fast-state detection perturbation -)", 0, 1);
+        err = pss_run_period_ex_safe(ckt, T, "PSS shoot (fast-state detection perturbation -)", 0, 1);
         if (err) {
             fprintf(stderr, "PSS-SHOOT: fast-state detection perturbation "
                     "run for state %s (-h) did not complete (ngspice error "
@@ -2955,6 +3180,15 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     save_reltol  = ckt->CKTreltol;
     save_abstol  = ckt->CKTabstol;
     save_volttol = ckt->CKTvoltTol;
+    /* card #498: the deck's own reltol is the fallback pss_run_period_ex_safe()
+     * retries a failed period run at -- see that function's header comment.
+     * Set once here (this function's only entry point that captures
+     * save_reltol), reset to 0.0/0 (disabled) at shoot_cleanup below.
+     * BOTH card #498 fallbacks are gated on pss_ckt_has_switch() -- see its
+     * own header comment for why (the pss_r4_d55_unstable.cir red-proof
+     * regression an ungated version of this fix caused). */
+    g_pss_has_switch = pss_ckt_has_switch(ckt);
+    g_pss_loose_reltol = g_pss_has_switch ? save_reltol : 0.0;
     memset(&floq, 0, sizeof floq);
 
     x0      = TMALLOC(double, n);
@@ -3474,7 +3708,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
              * unforced -- see the non-analytic branch's root-cause
              * comment below for why an unforced multi-period run is not
              * reliable on its own. */
-            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline, analytic)", 0, 1))
+            if (pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet baseline, analytic)", 0, 1))
                 floquet_ok = 0;
             PSSsensActive = 0;
             if (!Phi_full_fl)
@@ -3536,7 +3770,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * perturbation/trial run in the last Newton iteration, so this
          * is not a new approximation, just applying the existing one
          * consistently to the two call sites that had been missed). */
-        if (floquet_ok && pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline)", 0, 1))
+        if (floquet_ok && pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet baseline)", 0, 1))
             floquet_ok = 0;
 
         for (j = 0; floquet_ok && j < n_slow; j++) {
@@ -3547,7 +3781,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
             icbuf_fl[jf] = x0[jf] + h;
             pss_state_set_ic(&map, icbuf_fl);
-            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet perturbation +)", 0, 1)) {
+            if (pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet perturbation +)", 0, 1)) {
                 floquet_ok = 0;
                 break;
             }
@@ -3558,7 +3792,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
             icbuf_fl[jf] = x0[jf] - h;
             pss_state_set_ic(&map, icbuf_fl);
-            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet perturbation -)", 0, 1)) {
+            if (pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet perturbation -)", 0, 1)) {
                 floquet_ok = 0;
                 break;
             }
@@ -3636,7 +3870,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * overwritten by a record=1 call, and every record=1 call left in
      * this file by this fix runs before this point). */
     pss_state_set_ic(&map, x0);
-    err = pss_run_period_ex(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
+    err = pss_run_period_ex_safe(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
     if (err) {
         fprintf(stderr, "PSS-SHOOT: WARNING -- converged, but the final "
                 "trajectory output run failed (ngspice error %d); the "
@@ -3666,6 +3900,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     ckt->CKTreltol  = save_reltol;
     ckt->CKTabstol  = save_abstol;
     ckt->CKTvoltTol = save_volttol;
+    g_pss_loose_reltol = 0.0;   /* card #498: disable the fallback outside this call */
+    g_pss_has_switch = 0;
     PSSbreakRecordActive = PSSbreakInstallActive = 0;
     pss_break_free();
     PSSsensActive = 0;
