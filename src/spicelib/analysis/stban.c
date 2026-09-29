@@ -844,7 +844,12 @@ endsweep:
                 double fc = interp_logf(f0, f1, m0, m1, 0.0);
                 double t2 = (0.0 - m0) / (m1 - m0);
                 double ph = p0 + t2 * (p1 - p0);
-                pmx = push_crossing(pmx, &npm, &capm, fc, 180.0 + ph, 0.0);
+                /* card #464: aux carries the crossing direction, mirroring
+                 * tools/stbcore.margins' "falling" flag -- 1.0 when |T| is
+                 * decreasing through this crossing (the usual stability-margin
+                 * crossing), 0.0 when it is rising (PM here, even < 180 deg, is
+                 * not the textbook margin -- see the printed warning below). */
+                pmx = push_crossing(pmx, &npm, &capm, fc, 180.0 + ph, m1 < m0 ? 1.0 : 0.0);
             }
             lo = p0 < p1 ? p0 : p1;
             hi = p0 < p1 ? p1 : p0;
@@ -866,14 +871,24 @@ endsweep:
     {
         int pmi = -1, gmi = -1;
         double pmbest = 0.0, gmbest = 0.0;
+        /* card #464: Re(T) < 0 at the lowest swept frequency means the loop
+         * has not settled to the positive-real DC value a negative-feedback
+         * loop should have -- it is unstable there if |T|>1, and any PM/GM
+         * read off the sweep is not a real stability margin. Mirrors
+         * tools/stbcore.margins' "low_f_positive_feedback" / "note" exactly
+         * (found on the pre-fix refs/r1c_fully_diff.cir, 2026-09-29: this
+         * printed "phase margin 274/186 deg" for a loop that was actually
+         * unstable at DC). freqs[] is ascending (DECADE/OCTAVE/LINEAR sweeps
+         * only), so index 0 is always the lowest frequency swept. */
+        int low_f_posfb = (npts > 0) && (Tarr[0].re < 0.0);
         for (i = 0; i < npm; i++)
             if (pmi < 0 || pmx[i].value < pmbest) { pmi = i; pmbest = pmx[i].value; }
         for (i = 0; i < ngm; i++)
             if (gmi < 0 || gmx[i].value < gmbest) { gmi = i; gmbest = gmx[i].value; }
 
         {
-            IFuid uids[4];
-            double outv[4];
+            IFuid uids[6];
+            double outv[6];
             runDesc *mplot = NULL;
             double nan = strtod("NaN", NULL);
 
@@ -881,18 +896,25 @@ endsweep:
             SPfrontEnd->IFnewUid(ckt, &uids[1], NULL, "phaseMarginFreq", UID_OTHER, NULL);
             SPfrontEnd->IFnewUid(ckt, &uids[2], NULL, "gainMargin", UID_OTHER, NULL);
             SPfrontEnd->IFnewUid(ckt, &uids[3], NULL, "gainMarginFreq", UID_OTHER, NULL);
+            /* card #464: lowFPositiveFeedback (1/0) and phaseMarginFalling
+             * (1.0 = usual falling |T| crossing, 0.0 = rising, NaN = no PM
+             * crossing at all) -- the scalar/flag mechanism the warning uses. */
+            SPfrontEnd->IFnewUid(ckt, &uids[4], NULL, "lowFPositiveFeedback", UID_OTHER, NULL);
+            SPfrontEnd->IFnewUid(ckt, &uids[5], NULL, "phaseMarginFalling", UID_OTHER, NULL);
 
             outv[0] = pmi >= 0 ? pmx[pmi].value : nan;
             outv[1] = pmi >= 0 ? pmx[pmi].freq : nan;
             outv[2] = gmi >= 0 ? gmx[gmi].value : nan;
             outv[3] = gmi >= 0 ? gmx[gmi].freq : nan;
+            outv[4] = low_f_posfb ? 1.0 : 0.0;
+            outv[5] = pmi >= 0 ? pmx[pmi].aux : nan;
 
             error = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob,
-                (IFuid) "STB Margins", NULL, 0, 4, uids, IF_REAL, &mplot);
+                (IFuid) "STB Margins", NULL, 0, 6, uids, IF_REAL, &mplot);
             if (!error) {
                 IFvalue refval, outdata;
                 refval.rValue = 0;
-                outdata.v.numValue = 4;
+                outdata.v.numValue = 6;
                 outdata.v.vec.rVec = outv;
                 SPfrontEnd->OUTpData(mplot, &refval, &outdata);
                 SPfrontEnd->OUTendPlot(mplot);
@@ -900,10 +922,15 @@ endsweep:
         }
 
         printf("stb%s%s: ", job->JOBname ? " " : "", job->JOBname ? (char *) job->JOBname : "");
-        if (pmi >= 0)
-            printf("phase margin %.4g deg at %.6g Hz", pmx[pmi].value, pmx[pmi].freq);
-        else
+        if (pmi >= 0) {
+            printf("phase margin %.4g deg at %.6g Hz (%s 0 dB crossing)",
+                pmx[pmi].value, pmx[pmi].freq, pmx[pmi].aux != 0.0 ? "falling" : "rising");
+            if (pmx[pmi].aux == 0.0)
+                printf(" -- RISING |T| crossing, not the usual falling-crossing stability margin%s",
+                    pmx[pmi].value > 180.0 ? " (a value over 180 deg here is not a real margin)" : "");
+        } else {
             printf("phase margin: no 0 dB crossing of T");
+        }
         if (npm > 1)
             printf(" (%d crossings found; the lowest margin is reported)", npm);
         printf("\n");
@@ -916,6 +943,12 @@ endsweep:
         if (ngm > 1)
             printf(" (%d crossings found; the lowest margin is reported)", ngm);
         printf("\n");
+
+        if (low_f_posfb) {
+            printf("stb%s%s: WARNING: positive feedback at low frequency: loop is unstable "
+                "if |T|>1 there; phase/gain margins are not meaningful\n",
+                job->JOBname ? " " : "", job->JOBname ? (char *) job->JOBname : "");
+        }
     }
 
     if (freqs) tfree(freqs);
