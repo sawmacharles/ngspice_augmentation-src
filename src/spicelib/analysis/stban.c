@@ -1574,6 +1574,8 @@ endsweep:
                 if (gmi >= 0) {
                     int idx = gmx[gmi].idx;
                     double t2v = gmx[gmi].t2;
+                    double f0 = freqs[idx], f1 = freqs[idx + 1];
+                    double x0 = log(f0), x1 = log(f1);
                     STBcplx Tc, dTc;
                     double Tcmag2;
 
@@ -1583,10 +1585,36 @@ endsweep:
                     dTc.im = dTdp_im[kk][idx] + t2v * (dTdp_im[kk][idx + 1] - dTdp_im[kk][idx]);
                     Tcmag2 = Tc.re * Tc.re + Tc.im * Tc.im;
 
-                    if (Tcmag2 > 0.0) {
-                        /* GM = -20*log10|T|  =>  dGM/dp = -20/ln(10) * Re(dT/dp/T) */
-                        double dGdp = (dTc.re * Tc.re + dTc.im * Tc.im) / Tcmag2;
-                        sout[3 * kk + 2] = -20.0 / log(10.0) * dGdp;
+                    /* card #475 bugfix (found validating vs central FD:
+                     * dGM/dp was wrong by O(1), far worse than dPM/dp's
+                     * plain bracket-discretisation error): GM is read at
+                     * the -180 deg phase crossing, and that crossing's
+                     * OWN frequency shifts with p too -- same implicit-
+                     * differentiation structure as fc above, just through
+                     * the phase=-180 constraint instead of |T|=1. Missing
+                     * this (the original version below only had the
+                     * "evaluated at a FIXED f" partial term) is exactly
+                     * "dropping half the chain rule", not a rounding
+                     * artifact -- this file's own red-proof recipe
+                     * (docs/sens.md) uses a REVERT of this exact fix as
+                     * one of its two required red-proofs.
+                     *   d(phase)/dp + d(phase)/df * df_gm/dp = 0
+                     *   => df_gm/dp = -(d(phase)/dp) / (d(phase)/df)
+                     *   dGM/dp = dGM/dp|_fixed_f + dGM/df|_fixed_f * df_gm/dp */
+                    if (Tcmag2 > 0.0 && x1 != x0) {
+                        double dGdp = (dTc.re * Tc.re + dTc.im * Tc.im) / Tcmag2;       /* d ln|T|/dp */
+                        double m0log = log(stb_cmag(Tarr[idx]));
+                        double m1log = log(stb_cmag(Tarr[idx + 1]));
+                        double dGdx = (m1log - m0log) / (x1 - x0);                      /* d ln|T|/dx */
+                        double dphidp_deg = (180.0 / M_PI) * (dTc.im * Tc.re - dTc.re * Tc.im) / Tcmag2;
+                        double dphidx_deg = (phs[idx + 1] - phs[idx]) / (x1 - x0);
+                        double fgm = gmx[gmi].freq;
+                        double dGM_dp_fixed_f = -20.0 / log(10.0) * dGdp;
+                        double dGM_df_fixed_f = -20.0 / log(10.0) * dGdx / fgm;
+                        if (dphidx_deg != 0.0) {
+                            double dfgm_dp = -dphidp_deg * fgm / dphidx_deg;
+                            sout[3 * kk + 2] = dGM_dp_fixed_f + dGM_df_fixed_f * dfgm_dp;
+                        }
                     }
                 }
             }
