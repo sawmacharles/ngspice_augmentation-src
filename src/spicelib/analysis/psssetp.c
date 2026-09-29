@@ -7,6 +7,7 @@ Author: 2010-05 Stefano Perticaroli ``spertica''
 #include "ngspice/iferrmsg.h"
 #include "ngspice/cktdefs.h"
 #include "ngspice/pssdefs.h"
+#include "ngspice/stringutil.h"
 #include <string.h>
 
 #include "analysis.h"
@@ -103,6 +104,19 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->PxOutNode = value->nValue;
         break;
 
+    /* card #499: sources=all | sources=<Vname|Iname> (repeatable -- see
+     * pssdefs.h's PxfSourcesAll/PxfSourceNames comment). Same
+     * "all short-circuits" convention as STBan's sens=all. */
+    case PXF_SOURCES:
+        if (value->uValue && cieq((char *) value->uValue, "all")) {
+            job->PxfSourcesAll = 1;
+        } else {
+            job->PxfSourceNames = TREALLOC(IFuid, job->PxfSourceNames, job->PxfSourceCount + 1);
+            job->PxfSourceNames[job->PxfSourceCount] = value->uValue;
+            job->PxfSourceCount++;
+        }
+        break;
+
     /* Enhancement-126: cyclostationary-noise flag */
     case PNOISE_CYCLO:
         job->PSSpnCyclo = value->iValue;
@@ -192,6 +206,7 @@ static IFparm PSSparms[] = {
     { "pnoise_insrc", PNOISE_INSRC,	IF_SET|IF_STRING,	"pnoise input source (for the input-referred spectrum)" },
     { "pxf",          PXF_DO,		IF_SET|IF_INTEGER,	"run a periodic transfer-function sweep after PSS" },
     { "pxf_out",      PXF_OUT,		IF_SET|IF_STRING,	"pxf output node" },
+    { "sources",      PXF_SOURCES,	IF_SET|IF_INSTANCE,	"card #499: pxf source(s) -- sources=all (default) or sources=<Vname|Iname> (repeatable, time-domain solver=td only)" },
     { "pnoise_cyclo", PNOISE_CYCLO,	IF_SET|IF_INTEGER,	"pnoise cyclostationary mode (per-sample bias, period average)" },
     { "psp",          PSP_DOPSP,	IF_SET|IF_INTEGER,	"run a periodic S-parameter sweep after PSS (needs RF ports)" },
     { "solver",       PAC_SOLVER,	IF_SET|IF_STRING,	"PAC solver: fd (default, frequency-domain) or td (card #465, time-domain shooting-based)" },

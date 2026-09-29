@@ -129,7 +129,12 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
     here: 1-2 on R2, ~7 on R3/R4).
   - No sidebands other than 0 (PACmaxSideband is a frequency-domain-.pac-
     only field; this engine reports the same-frequency response only).
-  - No PXF/adjoint, no pnoise on this engine.
+  - No pnoise on this engine. PXF (card #499, `.pxf ... method="shoot"
+    solver="td"`, `pac_td_pxf()` below) IS implemented, as a batched
+    forward per-source sweep reusing pac_engine_run() below unchanged --
+    NOT the from-scratch backward-adjoint engine that name might suggest;
+    see pac_td_pxf()'s own "SHIPPED DESIGN" comment for the alternative
+    considered and why.
   - No device-based (gain-nulling) PSTB probe, no probe=inst:terminal
     auto-insert for PSTB (probe=<Vname>, an existing 0V V-source, only).
   - GEAR integration is refused (same TRAPEZOIDAL-orders-1-2-only scope as
@@ -148,6 +153,8 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 
 #include "cap/capdefs.h"
 #include "ind/inddefs.h"
+#include "vsrc/vsrcdefs.h"
+#include "isrc/isrcdefs.h"
 
 #include <math.h>
 #include <string.h>
@@ -1048,6 +1055,109 @@ pac_capture_b0(CKTcircuit *ckt, double *br, double *bi, int neq)
 }
 
 /* ------------------------------------------------------------------ */
+/* card #499 (plan T5.4): `.pxf ... method="shoot" solver="td"` -- one
+ * time-domain shooting-based transfer function PER independent V/I source,
+ * to a single fixed output, reusing pac_engine_run() (and therefore every
+ * already-validated per-step recursion/boundary-solve/demodulation line in
+ * this file) completely UNCHANGED -- see this file's own "SHIPPED DESIGN"
+ * note above pac_td_pxf() below for why a batched-forward-column sweep was
+ * chosen over a from-scratch backward/adjoint sweep of the per-step
+ * recursion (the literal reading of "one adjoint solve").
+ *
+ * pac_build_src_list() walks every native Vsource/Isource instance in the
+ * circuit (independent of whether the netlist itself gave it an AC value --
+ * .pxf's whole point, confirmed against Spectre's own pxf semantics, is
+ * NOT needing a deck's own AC tags) and returns a pointer to each one's OWN
+ * VSRCacReal/VSRCacImag (or ISRCacReal/ISRCacImag) pair -- the field
+ * VSRCacLoad()/ISRCacLoad() actually stamp into the RHS (computed from
+ * VSRCacMag/VSRCacPhase at VSRCtemp()/ISRCtemp() time, card #499 found;
+ * poking ACmag/ACphase directly would need a fresh temp pass to take
+ * effect, poking *Real/*Imag directly does not). */
+typedef struct {
+    GENinstance *inst;
+    double *preal, *pimag;
+    IFuid name;
+} PACsrcRef;
+
+static int
+pac_build_src_list(CKTcircuit *ckt, PACsrcRef **out)
+{
+    int vtype = CKTtypelook("Vsource");
+    int itype = CKTtypelook("Isource");
+    int n = 0, cap = 0;
+    PACsrcRef *list = NULL;
+    VSRCmodel *vm; VSRCinstance *vi;
+    ISRCmodel *im; ISRCinstance *ii;
+
+    if (vtype >= 0)
+        for (vm = (VSRCmodel *) ckt->CKThead[vtype]; vm; vm = VSRCnextModel(vm))
+            for (vi = VSRCinstances(vm); vi; vi = VSRCnextInstance(vi)) {
+                if (n >= cap) { cap = cap ? cap * 2 : 8; list = TREALLOC(PACsrcRef, list, cap); }
+                list[n].inst = (GENinstance *) vi;
+                list[n].preal = &vi->VSRCacReal;
+                list[n].pimag = &vi->VSRCacImag;
+                list[n].name = vi->VSRCname;
+                n++;
+            }
+    if (itype >= 0)
+        for (im = (ISRCmodel *) ckt->CKThead[itype]; im; im = ISRCnextModel(im))
+            for (ii = ISRCinstances(im); ii; ii = ISRCnextInstance(ii)) {
+                if (n >= cap) { cap = cap ? cap * 2 : 8; list = TREALLOC(PACsrcRef, list, cap); }
+                list[n].inst = (GENinstance *) ii;
+                list[n].preal = &ii->ISRCacReal;
+                list[n].pimag = &ii->ISRCacImag;
+                list[n].name = ii->ISRCname;
+                n++;
+            }
+    *out = list;
+    return n;
+}
+
+/* Isolate ONE source (list[idx]) as if it alone had "AC 1" in the deck --
+ * zero every OTHER source's *Real/*Imag first (so a deck with its own
+ * unrelated AC-flagged source, or the "lgprobe hidden AC 1" trap
+ * docs/pss-pac.md documents for .pac, cannot leak into a .pxf per-source
+ * reading), restore all of them (regardless of what pac_capture_b0()
+ * itself did/didn't touch) on the way out. Reuses pac_capture_b0()'s own
+ * CKTload(DCOP|INITSMSIG)+CKTacLoad(w=1) idiom verbatim -- guarantees
+ * byte-identical stamping to what an ordinary `.pac`/`AC 1` run against
+ * the SAME single source would produce (the done-when this card's report
+ * validates against). */
+static int
+pac_capture_source_b0(CKTcircuit *ckt, PACsrcRef *list, int nsrc, int idx,
+                       double *br, double *bi, int neq)
+{
+    double *saveR, *saveI;
+    int i, err;
+
+    if (idx < 0 || idx >= nsrc)
+        return 1;
+    saveR = TMALLOC(double, nsrc);
+    saveI = TMALLOC(double, nsrc);
+    if (!saveR || !saveI) {
+        if (saveR) tfree(saveR);
+        if (saveI) tfree(saveI);
+        return 1;
+    }
+    for (i = 0; i < nsrc; i++) {
+        saveR[i] = *list[i].preal;
+        saveI[i] = *list[i].pimag;
+        *list[i].preal = (i == idx) ? 1.0 : 0.0;
+        *list[i].pimag = 0.0;
+    }
+
+    err = pac_capture_b0(ckt, br, bi, neq);
+
+    for (i = 0; i < nsrc; i++) {
+        *list[i].preal = saveR[i];
+        *list[i].pimag = saveI[i];
+    }
+    tfree(saveR);
+    tfree(saveI);
+    return err;
+}
+
+/* ------------------------------------------------------------------ */
 /* Frequency-sweep enumeration (SAME stepType convention as the existing
  * .pac card: 0=LIN total points, 1=DEC, 2=OCT points-per-decade/octave). */
 static int
@@ -1794,6 +1904,242 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
 }
 
 /* ------------------------------------------------------------------ */
+/* `.pxf ... method="shoot" solver="td"` (card #499): sideband-0 transfer
+ * function from EVERY requested independent V/I source to ONE fixed
+ * output, on the shooting PSS orbit.
+ *
+ * SHIPPED DESIGN (option chosen, and why -- see the card #499 report for
+ * the full derivation of the alternative): the card's own brief frames
+ * this as "one adjoint (transposed) solve of the time-domain PAC system
+ * instead of one .pac per source", by direct analogy with docs/sens.md's
+ * (card #475) two-transposed-solves-per-frequency adjoint. A genuine
+ * from-scratch analogue of that here would need a BACKWARD sweep of this
+ * file's own per-step recursion (transposed per-step solves against the
+ * SAME J_k this file's forward recursion already reuses, via a new
+ * SMPtSolve-style wrapper around Sparse's spSolveTransposed -- confirmed
+ * available, TRANSPOSE=YES in this build -- composed with the transpose
+ * of the per-step "history" operator H_k, which the ORDER-2 trapezoidal
+ * companion model complicates: it is a 2-term recursion in y AND the
+ * companion "T" array (PSSpacRecordStep()'s own g_pac_Tprev/Tnew), not a
+ * simple 1-step Markov map) plus a REBUILD of every J_k on demand (this
+ * file's own G(x)/C(x) is state-dependent -- pac_refactor_at_accepted()
+ * already does exactly this rebuild, but only ever forward, at the
+ * point the forward recursion is AT; a backward sweep needs it at
+ * arbitrary points, out of order, which needs the whole state
+ * trajectory x_k stored first). Each of those pieces is individually
+ * tractable (the full derivation is in the card #499 report) but
+ * NONE of it has any precedent or validation anywhere in this codebase,
+ * and this project's OWN saltation work (docs/pss-pac.md's saltation
+ * section) is a direct, sobering demonstration of what an under-derived
+ * transposed/adjoint correction costs here: several passes, a real,
+ * reproducible ~2.2x scaling discrepancy never root-caused, "a guessed
+ * edit... would not have been trustworthy". Given that precedent, this
+ * pass ships the LOWER-RISK, EQUALLY CORRECT option instead: reuse
+ * pac_engine_run() (this file's own already-validated forward boundary-
+ * value engine, the SAME one `.pac solver=td` uses -- ZERO changes to its
+ * per-step recursion, boundary solve, or demodulation) once PER REQUESTED
+ * SOURCE, each call supplying that ONE source's own isolated unit
+ * stamp (pac_capture_source_b0() above) as the forcing pattern and the
+ * SAME single output row as its only requested output (nout=1). This
+ * still eliminates the dominant real cost "one .pac per source" would
+ * pay -- a full separate PSS shooting-Newton RECONVERGENCE per source,
+ * confirmed by docs/pss-pac.md's own timing note ("PSS Newton
+ * convergence... was the entire cost, not this engine's own sweep") --
+ * since PSS converges exactly ONCE for the whole .pxf job (same as
+ * .pac/.pstb today) and only the cheap per-source forced-column sweep
+ * (O(2 period reruns) each, independent of sweep length, same big-O this
+ * file's header already gives .pac) repeats, K times for K sources. What
+ * this does NOT do: share the Phi/monodromy computation (source-
+ * independent) across sources -- each call recomputes it, a real but
+ * modest cost (K x 2 period reruns instead of the theoretical 1+K) not
+ * worth the extra pac_engine_run() surgery this pass chose not to risk.
+ * A true backward-adjoint engine (amortising ALL sources behind one
+ * extra sweep, no per-source period rerun at all) remains a valid, well-
+ * scoped FUTURE improvement if the source count ever makes this pass's
+ * O(K) cost the bottleneck -- not attempted this pass; see "what was
+ * skipped" in the card #499 report. */
+static int
+pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
+           const double *fT, int trig_node_num)
+{
+    PACstateMap map;
+    int neq = SMPmatSize(ckt->CKTmatrix);
+    int nfreq, outrow, err, trig_idx;
+    double *freqs;
+    PACsrcRef *srclist = NULL;
+    int nsrc_total, *use_idx = NULL, nsrc_use, s;
+    PACc *Y0;
+    IFuid freqUid, *nameList = NULL;
+    runDesc *pxfPlot = NULL;
+    double t0, t1;
+
+    if (!job->PxOutNode) {
+        fprintf(stderr, "PXF-TD: no output node given -- skipped\n");
+        return E_PARMVAL;
+    }
+    outrow = job->PxOutNode->number;
+    if (outrow <= 0) {
+        fprintf(stderr, "PXF-TD: output node '%s' is not in the matrix "
+                "(literal ground?) -- skipped\n", job->PxOutNode->name);
+        return E_PARMVAL;
+    }
+    if (job->PACfStart <= 0.0 || job->PACfStop < job->PACfStart || job->PACpoints < 1) {
+        fprintf(stderr, "PXF-TD: bad frequency sweep -- skipped\n");
+        return E_PARMVAL;
+    }
+
+    map.n = n; map.refs = NULL;
+    if (pac_build_map(ckt, &map) || map.n != n) {
+        fprintf(stderr, "PXF-TD: internal state-map mismatch -- skipped\n");
+        if (map.refs) tfree(map.refs);
+        return E_INTERN;
+    }
+    trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    if (trig_node_num >= 0 && trig_idx < 0) {
+        fprintf(stderr, "PXF-TD: REFUSED -- the trigger= node (free-running "
+                "orbit, card #489) is not a native capacitor's own positive "
+                "terminal among this circuit's reduced states, so the "
+                "period-variation terminal projection this engine needs "
+                "(docs/pss-pac.md's free-running section) cannot be formed. "
+                "Not running the fixed-period engine uncorrected on a "
+                "moving-period orbit.\n");
+        tfree(map.refs);
+        return E_UNSUPP;
+    }
+
+    nsrc_total = pac_build_src_list(ckt, &srclist);
+    if (nsrc_total <= 0) {
+        fprintf(stderr, "PXF-TD: no independent V/I source instances found in "
+                "the circuit -- skipped\n");
+        tfree(map.refs);
+        return E_PARMVAL;
+    }
+
+    use_idx = TMALLOC(int, nsrc_total);
+    nsrc_use = 0;
+    if (job->PxfSourcesAll || job->PxfSourceCount == 0) {
+        for (s = 0; s < nsrc_total; s++) use_idx[nsrc_use++] = s;
+    } else {
+        int k;
+        for (k = 0; k < job->PxfSourceCount; k++) {
+            GENinstance *inst = CKTfndDev(ckt, job->PxfSourceNames[k]);
+            int found = -1;
+            if (inst)
+                for (s = 0; s < nsrc_total; s++)
+                    if (srclist[s].inst == inst) { found = s; break; }
+            if (found < 0) {
+                fprintf(stderr, "PXF-TD: WARNING -- sources=\"%s\" is not an "
+                        "independent V/I source instance in this circuit; "
+                        "ignored\n", (char *) job->PxfSourceNames[k]);
+                continue;
+            }
+            use_idx[nsrc_use++] = found;
+        }
+        if (nsrc_use == 0) {
+            fprintf(stderr, "PXF-TD: no requested sources= matched an "
+                    "independent V/I source -- skipped\n");
+            tfree(map.refs); tfree(srclist); tfree(use_idx);
+            return E_PARMVAL;
+        }
+    }
+
+    nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
+    if (nfreq < 1) { tfree(map.refs); tfree(srclist); tfree(use_idx); return E_PARMVAL; }
+    freqs = TMALLOC(double, nfreq);
+    pac_sweep_fill(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop, freqs, nfreq);
+
+    Y0 = TMALLOC(PACc, (size_t) nsrc_use * nfreq);
+    nameList = TMALLOC(IFuid, nsrc_use);
+
+    fprintf(stderr, "PXF-TD: time-domain shooting-based PXF, %d frequency "
+                    "point%s from %.6g to %.6g Hz, n=%d reduced state%s, "
+                    "output node '%s' (row %d), %d source%s\n",
+            nfreq, nfreq == 1 ? "" : "s", job->PACfStart, job->PACfStop, n,
+            n == 1 ? "" : "s", job->PxOutNode->name, outrow,
+            nsrc_use, nsrc_use == 1 ? "" : "s");
+
+    t0 = SPfrontEnd->IFseconds();
+    err = OK;
+    for (s = 0; s < nsrc_use; s++) {
+        double *br = TMALLOC(double, neq + 1);
+        double *bi = TMALLOC(double, neq + 1);
+        int one_out[1];
+        char nm[160];
+
+        one_out[0] = outrow;
+        if (!br || !bi) {
+            if (br) tfree(br);
+            if (bi) tfree(bi);
+            err = 1;
+            break;
+        }
+        memset(br, 0, (size_t) (neq + 1) * sizeof(double));
+        memset(bi, 0, (size_t) (neq + 1) * sizeof(double));
+
+        if (pac_capture_source_b0(ckt, srclist, nsrc_total, use_idx[s], br, bi, neq)) {
+            fprintf(stderr, "PXF-TD: failed to isolate source '%s' -- "
+                    "skipped\n", (char *) srclist[use_idx[s]].name);
+            err = 1;
+        } else {
+            PACc *Ycol = TMALLOC(PACc, nfreq);
+            int e2 = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq,
+                                     one_out, 1, NULL, Ycol, fT, trig_idx);
+            if (e2) {
+                fprintf(stderr, "PXF-TD: engine failed for source '%s'\n",
+                        (char *) srclist[use_idx[s]].name);
+                err = 1;
+            } else {
+                int f;
+                for (f = 0; f < nfreq; f++)
+                    Y0[(size_t) s * nfreq + f] = Ycol[f];
+            }
+            tfree(Ycol);
+        }
+
+        (void) snprintf(nm, sizeof(nm), "pxf_%s", (char *) srclist[use_idx[s]].name);
+        SPfrontEnd->IFnewUid(ckt, &nameList[s], NULL, nm, UID_OTHER, NULL);
+
+        tfree(br); tfree(bi);
+    }
+    t1 = SPfrontEnd->IFseconds();
+    fprintf(stderr, "PXF-TD: %s, wall_time=%.3fs (%.4fs/source)\n",
+            err ? "completed with errors" : "done", t1 - t0,
+            nsrc_use > 0 ? (t1 - t0) / nsrc_use : 0.0);
+
+    SPfrontEnd->IFnewUid(ckt, &freqUid, NULL, "frequency", UID_OTHER, NULL);
+    {
+        int e3 = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob,
+                        "PXF Analysis (time domain, sideband 0)",
+                        freqUid, IF_REAL, nsrc_use, nameList, IF_COMPLEX, &pxfPlot);
+        if (!e3) {
+            int i;
+            if (job->PACstepType != 0)
+                SPfrontEnd->OUTattributes(pxfPlot, NULL, OUT_SCALE_LOG, NULL);
+            for (i = 0; i < nfreq; i++) {
+                IFvalue freqData, valueData;
+                IFcomplex *data = TMALLOC(IFcomplex, nsrc_use);
+                int j;
+                for (j = 0; j < nsrc_use; j++) {
+                    data[j].real = Y0[(size_t) j * nfreq + i].re;
+                    data[j].imag = Y0[(size_t) j * nfreq + i].im;
+                }
+                freqData.rValue = freqs[i];
+                valueData.v.numValue = nsrc_use;
+                valueData.v.vec.cVec = data;
+                SPfrontEnd->OUTpData(pxfPlot, &freqData, &valueData);
+                FREE(data);
+            }
+            SPfrontEnd->OUTendPlot(pxfPlot);
+        } else if (!err) {
+            err = 1;
+        }
+    }
+
+    tfree(map.refs); tfree(srclist); tfree(use_idx); tfree(freqs); tfree(Y0); tfree(nameList);
+    return err ? E_INTERN : OK;
+}
+
+/* ------------------------------------------------------------------ */
 
 int
 pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
@@ -1807,6 +2153,10 @@ pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     }
     if (job->PSSdoPSTB) {
         int e = pac_td_pstb(ckt, job, x0, n, T, fT, trig_node_num);
+        if (e) err = e;
+    }
+    if (job->PSSdoPXF && job->PACsolver == PAC_SOLVER_TD) {
+        int e = pac_td_pxf(ckt, job, x0, n, T, fT, trig_node_num);
         if (e) err = e;
     }
     return err;

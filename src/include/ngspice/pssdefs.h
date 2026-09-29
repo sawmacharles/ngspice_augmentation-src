@@ -99,6 +99,24 @@ typedef struct {
     int      PSSdoPXF;       /* 1 if this job runs a PXF sweep */
     CKTnode *PxOutNode;      /* PXF output node (reference = ground) */
 
+    /* card #499 (plan T5.4): time-domain shooting-based `.pxf ... method=
+     * "shoot" solver="td"` -- the shooting-PAC engine's own per-source
+     * periodic transfer function, in place of the frequency-domain
+     * harmonic-conversion-matrix engine above (which stays completely
+     * unchanged and is still the default -- same additive pattern as
+     * PACsolver/PSTB on top of the existing .pac/.pnoise). One transfer
+     * function per requested independent V/I source, to the SAME
+     * PxOutNode above, emitted as "pxf_<source>" vectors in one plot --
+     * see pacshoot.c's pac_td_pxf(). `sources=` is repeatable (same
+     * reason as STBan's `sens=` -- stbdefs.h/docs/sens.md -- a comma list
+     * risks the tokenizer comma-splitting hazard card #457 already hit);
+     * `sources="all"` (the default, also case-insensitive, ALSO what an
+     * omitted sources= means) short-circuits any prior/later name and
+     * sweeps every independent V/I source instance in the circuit. */
+    int      PxfSourcesAll;   /* 1 = sources="all" (default when unset) */
+    IFuid   *PxfSourceNames;  /* [PxfSourceCount], repeated sources="Vname" */
+    int      PxfSourceCount;
+
     /* Enhancement-132: periodic S-parameters (.psp). Runs PSS, then for each RF
      * port injects a unit current in sideband 0 through the conversion matrix and
      * reads the per-sideband port waves, building the periodic scattering matrix
@@ -195,6 +213,7 @@ enum {
     TRIG_VAL,
     TRIG_DIR,
     PSS_FORCE_DRIVEN,
+    PXF_SOURCES,
 };
 
 #endif

@@ -1782,13 +1782,82 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
     GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
 
-    {   /* optional trailing maxsideband */
-        char *p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p) {
-            parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
-            GCA(INPapName, (ckt, which, foo, "pac_maxsb", parm));
+    /* card #499: optional trailing tokens, in any order --
+     *   maxsideband           (bare integer, existing Enhancement-125 syntax,
+     *                          the frequency-domain adjoint engine's own
+     *                          sideband count -- unused by solver=td, which
+     *                          is sideband-0 only, but still accepted/parsed
+     *                          for an old deck that gave one)
+     *   method shoot|driven   (same keyword/value split as dot_pac's tail --
+     *                          see that function's comment on why INPgetTok()
+     *                          needs two separate tokens for "method=shoot")
+     *   solver td|fd          (card #499: time-domain shooting-based PXF,
+     *                          built on pacshoot.c's PAC engine, in place of
+     *                          the existing frequency-domain adjoint above;
+     *                          td needs method=shoot, same as .pac)
+     *   sources all|<Vname>   (card #499: which independent V/I source(s) to
+     *                          sweep, solver=td only -- repeatable, see
+     *                          pssdefs.h's PxfSourcesAll/PxfSourceNames
+     *                          comment for why not a comma list. Default
+     *                          (sources= omitted entirely) is "all".)
+     *   pacpoints=N           (card #499: same recording-pass grid override
+     *                          as .pac/.pstb's pacpoints=)
+     * A bare integer is accepted only once, and only where the existing
+     * Enhancement-125 maxsideband token could appear -- old decks with just
+     * a trailing maxsideband are completely unaffected. */
+    {
+        int maxsb_seen = 0;
+        while (*line) {
+            char *word;
+            char *save = line;
+            INPgetTok(&line, &word, 1);
+            if (!*word) { tfree(word); break; }
+            if (!maxsb_seen && strcmp(word, "method") != 0 && strcmp(word, "solver") != 0 &&
+                strcmp(word, "sources") != 0 && strcmp(word, "pacpoints") != 0 &&
+                (isdigit((unsigned char) word[0]) ||
+                 ((word[0] == '+' || word[0] == '-') && isdigit((unsigned char) word[1])))) {
+                line = save;
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "pac_maxsb", parm));
+                maxsb_seen = 1;
+            } else if (strcmp(word, "method") == 0) {
+                char *mword;
+                tfree(word);
+                INPgetTok(&line, &mword, 1);
+                ptemp.sValue = mword;
+                GCA(INPapName, (ckt, which, foo, "method", &ptemp));
+            } else if (strcmp(word, "solver") == 0) {
+                char *sword;
+                tfree(word);
+                INPgetTok(&line, &sword, 1);
+                ptemp.sValue = sword;
+                GCA(INPapName, (ckt, which, foo, "solver", &ptemp));
+            } else if (strcmp(word, "pacpoints") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
+            } else if (strcmp(word, "sources") == 0) {
+                /* card #499: sources=all | sources=<Vname|Iname>
+                 * (repeatable). INPgetNetTok (not INPgetTok), same
+                 * comma/sign-splitting-avoidance reason dot_stb's sens=
+                 * already documents: single token only ("all" or one
+                 * source instance name). */
+                char *sname;
+                tfree(word);
+                INPgetNetTok(&line, &sname, 1);
+                if (!*sname) {
+                    LITERR("'.pxf' sources= needs a value (\"all\" or a source instance name)\n");
+                    tfree(sname);
+                    return (0);
+                }
+                INPinsert(&sname, tab);
+                ptemp.uValue = sname;
+                GCA(INPapName, (ckt, which, foo, "sources", &ptemp));
+            } else {
+                fprintf(stderr, "Error: unknown trailing token '%s' on .pxf - ignored\n", word);
+                tfree(word);
+            }
         }
     }
 
