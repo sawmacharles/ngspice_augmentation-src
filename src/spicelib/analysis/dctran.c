@@ -496,6 +496,12 @@ DCtran(CKTcircuit *ckt,
 #ifdef WITH_PSS
     if (PSSbreakRecordActive)
         PSSbreakRecordStep(ckt);
+    /* card #458 fourth pass: analytic sensitivity monodromy propagation,
+       same call site (right after CKTaccept()) -- see pssshoot.h. No-op
+       (single flag test) unless a `.pss method=shoot` analysis has
+       PSS_SHOOT_JACOBIAN=analytic active. */
+    if (PSSsensActive)
+        PSSsensRecordStep(ckt);
 #endif
 
 #ifdef XSPICE

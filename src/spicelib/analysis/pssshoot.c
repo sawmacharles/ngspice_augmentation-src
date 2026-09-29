@@ -406,6 +406,383 @@ pss_solve_dense(double *A, double *b, int n, double *x)
 }
 
 
+/* ------------------------------------------------------------------ */
+/* card #458 FOURTH pass (plan T4.2): ANALYTIC (discretise-then-linearise)
+ * sensitivity monodromy, replacing finite differences for the Jacobian.
+ * Opt-in (PSS_SHOOT_JACOBIAN=analytic; default remains the third pass's FD
+ * + Broyden path, byte-for-byte unchanged below). See the card #458
+ * fourth-pass report for the full derivation; summary:
+ *
+ *   x0 (this file's shooting unknown) is exactly the set of native
+ *   capacitor voltages and inductor branch currents (top-of-file design
+ *   comment). At the UIC restart (t=0), capload.c/indload.c's own cond1
+ *   bypass (MODEUIC && MODEINITTRAN) sets EACH cap's vcap / EACH
+ *   inductor's branch current DIRECTLY from CAPinitCond/INDinitCond --
+ *   i.e. from x0 itself, not from any solved node -- and their
+ *   derivative-history state (CAPccap/INDvolt) is forced to exactly 0 at
+ *   that same instant (niinteg.c's order-1 formula, state1[qcap] having
+ *   just been set equal to state0[qcap] by the SAME cond1 branch, one
+ *   line above). So d(each reactive device's own state)/dx0 = the unit
+ *   row e_d EXACTLY at t=0, and d(ccap/INDvolt)/dx0 = 0 EXACTLY -- an
+ *   exact base case, no approximation.
+ *
+ *   At every later accepted step k, capload.c (lines 74-79) and
+ *   indload.c (lines 117, using NIintegrate's ceq/veq output) stamp the
+ *   trapezoidal/backward-Euler companion history term (ceq for a cap,
+ *   veq for an inductor) into CKTrhs with a FIXED sign pattern
+ *   (CKTrhs[pos]-=ceq, CKTrhs[neg]+=ceq for a cap; CKTrhs[INDbrEq]+=veq
+ *   for an inductor) that depends on x0 ONLY through the PREVIOUS step's
+ *   values (q_{k-1}=C*v_{k-1}, and -- for trapezoidal order 2, once the
+ *   integrator has stepped up from the first step's backward-Euler order
+ *   1 -- the previous step's own CAPccap/INDvolt history state). Since
+ *   the converged Newton fixed point at step k satisfies
+ *   J(x_k)*x_k = RHS(x_k, history(x0)) IDENTICALLY (this is what Newton
+ *   convergence means), and J_k := dG/dx_k at that fixed point is EXACTLY
+ *   the matrix ngspice's own Newton iteration factored (implicit function
+ *   theorem, using that every OTHER device here -- resistors, the B-source
+ *   switches/comparator, the VCCS op-amp -- is memoryless, i.e. carries no
+ *   explicit x0 dependence of its own):
+ *
+ *       J_k * S_k = d(RHS_k)/dx0 |_explicit
+ *
+ *   with S_k := dx_k/dx0 (an [nunk x n] matrix, n = the shooting state
+ *   count) and the RHS built with EXACTLY the SAME stamp pattern as
+ *   ceq/veq themselves (capload.c/indload.c), substituting the SCALAR
+ *   ceq/veq for its OWN row-j sensitivity (also a scalar, one Newton
+ *   shooting-direction j at a time):
+ *
+ *     order 1 (the first step of every period -- niinteg.c's order-1
+ *              case does not reference the previous ccap/INDvolt at all):
+ *       d(ceq_cap)/dx0_j  = -ag0 * C * (S_k-1[pos,j] - S_k-1[neg,j])
+ *       d(veq_ind)/dx0_j  = -ag0 * L * S_k-1[INDbrEq,j]
+ *     order 2 (trapezoidal, niinteg.c's order-2 case):
+ *       d(ceq_cap)/dx0_j  = -ag1*T_k-1[cap,j] - ag0*C*(S_k-1[pos,j]-S_k-1[neg,j])
+ *       d(veq_ind)/dx0_j  = -ag1*T_k-1[ind,j] - ag0*L* S_k-1[INDbrEq,j]
+ *
+ *   (ag0=CKTag[0], ag1=CKTag[1], both read at the SAME accepted step whose
+ *   J_k is used -- see nicomcof.c for their definition per order/method.)
+ *   Solving J_k*S_k[:,j] = b_k[:,j] for j=0..n-1 (n back-substitutions,
+ *   REUSING the one factorization -- SMPsolve(), no refactor per column)
+ *   gives S_k. T_k (the derivative-history state's OWN sensitivity) then
+ *   updates by the SAME recursion niinteg.c itself uses for ccap/INDvolt,
+ *   differentiated:
+ *       order 1: T_k = ag0*C_or_L*(Srow_k - Srow_k-1)
+ *       order 2: T_k = -ag1*T_k-1 + ag0*C_or_L*(Srow_k - Srow_k-1)
+ *   (Srow = the cap's v_pos-v_neg row, or the inductor's branch-current
+ *   row.) Propagated for every accepted step of ONE period run (a hook at
+ *   the exact call site pssshoot.h's breakpoint hooks already use, right
+ *   after CKTaccept()), S_K's rows for the n reactive devices ARE the
+ *   monodromy matrix Phi -- no finite-difference perturbation runs, no
+ *   eps bias, one period integration instead of 2n+1.
+ *
+ *   J_k itself: the LAST factorization NIiter() leaves in ckt->CKTmatrix
+ *   after a step converges was computed from the SECOND-TO-LAST Newton
+ *   iterate (the load that PRODUCED the converged x_k via one more
+ *   solve), not from x_k itself -- close but not exact for a nonlinear
+ *   circuit (the card's own "NIiter may bypass refactoring" caveat).
+ *   PSSsensRecordStep() below forces one extra CKTload()+SMPluFac() at
+ *   the now-fixed, converged ckt->CKTrhsOld before using CKTmatrix, per
+ *   the card's explicit instruction -- cheap (no NR iteration; the real
+ *   circuit unknowns are untouched) and makes J_k exact at x_k.
+ *
+ *   Scope: TRAPEZOIDAL orders 1-2 only (this deck family's default
+ *   integration method, and the only orders niinteg.c's TRAPEZOIDAL case
+ *   has). GEAR (.options method=gear) is NOT implemented -- g_sens_failed
+ *   is set with a clear message if CKTorder/CKTintegrateMethod fall
+ *   outside {TRAPEZOIDAL, order<=2} rather than silently producing a wrong
+ *   answer; the caller (pss_newton_run) then reports this attempt as a
+ *   plain non-convergence, the same honest "did not confirm a steady
+ *   state" signal a failed FD sweep already produces. */
+
+int PSSsensActive = 0;
+
+static PSSstateMap *g_sens_map = NULL;
+static int g_sens_n = 0, g_sens_neq = 0, g_sens_failed = 1;
+static double *g_sens_Sprev = NULL, *g_sens_Snew = NULL;   /* [(neq+1)*n] */
+static double *g_sens_Tprev = NULL, *g_sens_Tnew = NULL;   /* [n*n] */
+static double *g_sens_rhs = NULL, *g_sens_sol = NULL;      /* [neq+1] scratch */
+
+static double
+pss_sens_get(const double *S, int node, int n, int j)
+{
+    if (node <= 0 || !S) return 0.0;
+    return S[(size_t) node * n + j];
+}
+
+static void
+pss_sens_set(double *S, int node, int n, int j, double v)
+{
+    if (node <= 0 || !S) return;
+    S[(size_t) node * n + j] = v;
+}
+
+static void
+pss_sens_free(void)
+{
+    if (g_sens_Sprev) tfree(g_sens_Sprev);
+    if (g_sens_Snew)  tfree(g_sens_Snew);
+    if (g_sens_Tprev) tfree(g_sens_Tprev);
+    if (g_sens_Tnew)  tfree(g_sens_Tnew);
+    if (g_sens_rhs)   tfree(g_sens_rhs);
+    if (g_sens_sol)   tfree(g_sens_sol);
+    g_sens_Sprev = g_sens_Snew = g_sens_Tprev = g_sens_Tnew = NULL;
+    g_sens_rhs = g_sens_sol = NULL;
+    g_sens_map = NULL;
+    g_sens_n = g_sens_neq = 0;
+    g_sens_failed = 1;
+}
+
+/* Called by pssshoot.c itself (not dctran.c) right before a period run
+ * that should have PSSsensActive=1 -- sets the exact t=0 base case
+ * derived above and (re)allocates this run's scratch. map must outlive
+ * the run (it is the caller's own, stack-owned-by-the-Newton-attempt
+ * PSSstateMap). */
+static void
+pss_sens_reset(CKTcircuit *ckt, PSSstateMap *map)
+{
+    int n = map->n, neq, d;
+
+    pss_sens_free();
+
+    neq = SMPmatSize(ckt->CKTmatrix);
+    g_sens_map = map;
+    g_sens_n = n;
+    g_sens_neq = neq;
+
+    g_sens_Sprev = TMALLOC(double, (size_t) (neq + 1) * n);
+    g_sens_Snew  = TMALLOC(double, (size_t) (neq + 1) * n);
+    g_sens_Tprev = TMALLOC(double, (size_t) n * n);
+    g_sens_Tnew  = TMALLOC(double, (size_t) n * n);
+    g_sens_rhs   = TMALLOC(double, (size_t) (neq + 1));
+    g_sens_sol   = TMALLOC(double, (size_t) (neq + 1));
+    if (!g_sens_Sprev || !g_sens_Snew || !g_sens_Tprev || !g_sens_Tnew ||
+        !g_sens_rhs || !g_sens_sol) {
+        pss_sens_free();
+        return;
+    }
+
+    memset(g_sens_Sprev, 0, (size_t) (neq + 1) * n * sizeof(double));
+    memset(g_sens_Tprev, 0, (size_t) n * n * sizeof(double));
+
+    for (d = 0; d < n; d++) {
+        PSSstateRef *ref = &map->refs[d];
+        int row = ref->isCap ? ref->dev.cap->CAPposNode : ref->dev.ind->INDbrEq;
+        pss_sens_set(g_sens_Sprev, row, n, d, 1.0);
+    }
+    g_sens_failed = 0;
+}
+
+/* dctran.c hook, called right after CKTaccept() (same site as
+ * PSSbreakRecordStep) whenever PSSsensActive. See the long design comment
+ * above for the recursion this implements. */
+void
+PSSsensRecordStep(CKTcircuit *ckt)
+{
+    int n, neq, d, j, nd, order;
+    double ag0, ag1;
+
+    if (g_sens_failed || !g_sens_map)
+        return;
+    if (ckt->CKTtime <= 0.0)
+        return;   /* t=0 base case already set by pss_sens_reset() */
+
+    if (ckt->CKTintegrateMethod != TRAPEZOIDAL || ckt->CKTorder < 1 ||
+        ckt->CKTorder > 2) {
+        fprintf(stderr, "PSS-SENS: analytic sensitivity only implements "
+                "TRAPEZOIDAL orders 1-2 (got method=%d order=%d at "
+                "t=%g); abandoning the analytic Jacobian for this period "
+                "run.\n", ckt->CKTintegrateMethod, ckt->CKTorder, ckt->CKTtime);
+        g_sens_failed = 1;
+        return;
+    }
+
+    n   = g_sens_n;
+    neq = g_sens_neq;
+    ag0 = ckt->CKTag[0];
+    ag1 = ckt->CKTag[1];
+
+    /* card #458 fourth pass, found by this pass's own R2 validation (the
+     * exploding-Phi bug): ckt->CKTorder, read here right after
+     * CKTaccept(), is NOT reliably the order whose niinteg.c FORMULA
+     * actually produced the just-accepted step's CAPccap/INDvolt values --
+     * dctran.c's own order/step-size selection (ckttrunc.c, called before
+     * CKTaccept() in dctran.c's control flow) already advances CKTorder to
+     * what the NEXT step will attempt, while ckt->CKTag[] here still holds
+     * the coefficients NIcomCof() computed for the step that was just
+     * accepted (it is not recomputed until the next NIiter() call). The
+     * two can disagree (observed on R2: CKTorder reports 2 on the very
+     * first trapezoidal step after the order-1 opening step, while CKTag[]
+     * still holds order 1's coefficients) -- using CKTorder there fed the
+     * order-2 formula's -ag1*T_{k-1} term (ag1 up to ~1/h, huge) into a
+     * step whose ACTUAL ag1 was order 1's -ag0 (no such term exists),
+     * exploding S_k by many orders of magnitude within a handful of
+     * steps. nicomcof.c's own two formulas are structurally
+     * unmistakable: order 1 gives ag1 = -ag0 EXACTLY (ckt->CKTdelta
+     * cancels); order 2 gives ag1 = CKTxmu/(1-CKTxmu), an O(1) constant
+     * (0.5/0.5=1 for the default xmu) with NO relation to ag0's own scale
+     * (~1/h, which varies over many orders of magnitude step to step). So
+     * the order actually used is inferred from ag1 itself, not trusted
+     * from ckt->CKTorder. */
+    order = (fabs(ag1 + ag0) < 1e-6 * fabs(ag0)) ? 1 : 2;
+
+    /* NOT refactored here -- card #458 fourth-pass finding (both tried;
+     * neither is clean, this one was kept as the shipped default). The
+     * design comment above and the card's own text say to force a fresh
+     * CKTload()+refactor at the accepted point, since NIiter()'s last
+     * factorization was computed from the SECOND-TO-LAST Newton iterate's
+     * load, not x_k itself. That WAS tried here and found to be actively
+     * WRONG on two counts:
+     *  (a) R2's `SW` switch model (swload.c -- current_state/
+     *      old_current_state read from CKTstate0/CKTstate1 depend on CALL
+     *      SEQUENCE within a timestep, not purely on (x_k, history), for
+     *      a hysteretic device): a second, out-of-band CKTload() call
+     *      after CKTaccept() measurably CHANGED the physical trajectory
+     *      (confirmed: the same x0, run once with PSSsensActive so this
+     *      extra load fires every step, gave a visibly different P(x0)
+     *      than a plain period run from the same x0);
+     *  (b) on R3 (7 states, ~200-2000+ accepted steps/period), refactoring
+     *      at EVERY accepted step (CKTload() + a full SMPluFac()) was
+     *      found to make even the small stabtime=0/sc_iter=1 single-
+     *      Jacobian diagnostic deck (tests/fixtures/pss_r3_jaccheck.cir)
+     *      run for minutes rather than the sub-second baseline -- not
+     *      profiled further given the time available this pass, but
+     *      clearly disqualifying for an option meant to be FASTER than
+     *      FD, not slower.
+     * Skipping the refactor avoids both, at the cost of using a J_k that
+     * is the second-to-last Newton iterate's, not exactly x_k's -- found,
+     * on R3's element-wise FD-vs-analytic comparison (card #458 fourth-
+     * pass report), to leave most Phi entries matching FD to 4-5
+     * significant figures, but the columns for states electrically close
+     * to the comparator's high-gain tanh nonlinearity (opout, and C1f
+     * which couples into it) wrong by 1-2 orders of magnitude -- the
+     * stale J_k's small error in that device's steep incremental
+     * conductance is amplified enough by the kc=30 comparator gain to
+     * matter a lot there. This is why R3 Newton does not reliably converge
+     * with PSS_SHOOT_JACOBIAN=analytic this pass (reported honestly as a
+     * known gap, not silently accepted) while R2 (1 state, no such
+     * amplifying path) converges cleanly. Neither refactor option is
+     * clean for every fixture; this is the one shipped as the default
+     * (and only) analytic path, since hanging is worse than an inaccurate
+     * Jacobian that Newton then honestly fails to converge with. */
+
+    memset(g_sens_Snew, 0, (size_t) (neq + 1) * n * sizeof(double));
+
+    for (j = 0; j < n; j++) {
+        memset(g_sens_rhs, 0, (size_t) (neq + 1) * sizeof(double));
+
+        for (d = 0; d < n; d++) {
+            PSSstateRef *ref = &g_sens_map->refs[d];
+            double Tp = g_sens_Tprev[d * n + j];
+            if (ref->isCap) {
+                CAPinstance *ci = ref->dev.cap;
+                int p = ci->CAPposNode, ng = ci->CAPnegNode;
+                double C = ci->CAPcapac;
+                double Sp = pss_sens_get(g_sens_Sprev, p, n, j);
+                double Sn = pss_sens_get(g_sens_Sprev, ng, n, j);
+                double dceq = -ag0 * C * (Sp - Sn);
+                if (order == 2) dceq += -ag1 * Tp;
+                if (p  > 0) g_sens_rhs[p]  -= dceq;
+                if (ng > 0) g_sens_rhs[ng] += dceq;
+            } else {
+                INDinstance *ii = ref->dev.ind;
+                int ibr = ii->INDbrEq;
+                double L = ii->INDinduct;
+                double Si = pss_sens_get(g_sens_Sprev, ibr, n, j);
+                double dveq = -ag0 * L * Si;
+                if (order == 2) dveq += -ag1 * Tp;
+                g_sens_rhs[ibr] += dveq;
+            }
+        }
+
+        /* SMPsolve()'s third argument ("Spare"/"Solution") is a dead
+         * legacy parameter -- spsmp.c's own SMPsolve() does
+         * `NG_IGNORE(Spare); spSolve(Matrix->SPmatrix, RHS, RHS, NULL,
+         * NULL);`, i.e. it solves IN PLACE and overwrites g_sens_rhs
+         * itself with the solution (exactly how niiter.c's own
+         * `SMPsolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsSpare)` call
+         * works -- NIconvTest() and the node-damping code right after it
+         * both read the solution back from ckt->CKTrhs, never
+         * ckt->CKTrhsSpare). Found by this pass's own R2 validation
+         * (g_sens_sol was reading back all-zero, uninitialised scratch;
+         * see the card #458 fourth-pass report). g_sens_sol is kept only
+         * as the (unused) Spare argument SMPsolve's signature requires. */
+        SMPsolve(ckt->CKTmatrix, g_sens_rhs, g_sens_sol);
+        for (nd = 1; nd <= neq; nd++)
+            g_sens_Snew[(size_t) nd * n + j] = g_sens_rhs[nd];
+    }
+
+    for (d = 0; d < n; d++) {
+        PSSstateRef *ref = &g_sens_map->refs[d];
+        for (j = 0; j < n; j++) {
+            double val;
+            if (ref->isCap) {
+                CAPinstance *ci = ref->dev.cap;
+                int p = ci->CAPposNode, ng = ci->CAPnegNode;
+                double C = ci->CAPcapac;
+                double Sp_new = pss_sens_get(g_sens_Snew, p, n, j);
+                double Sn_new = pss_sens_get(g_sens_Snew, ng, n, j);
+                double Sp_old = pss_sens_get(g_sens_Sprev, p, n, j);
+                double Sn_old = pss_sens_get(g_sens_Sprev, ng, n, j);
+                val = ag0 * C * ((Sp_new - Sn_new) - (Sp_old - Sn_old));
+            } else {
+                INDinstance *ii = ref->dev.ind;
+                int ibr = ii->INDbrEq;
+                double L = ii->INDinduct;
+                double Si_new = pss_sens_get(g_sens_Snew, ibr, n, j);
+                double Si_old = pss_sens_get(g_sens_Sprev, ibr, n, j);
+                val = ag0 * L * (Si_new - Si_old);
+            }
+            if (order == 2)
+                val += -ag1 * g_sens_Tprev[d * n + j];
+            g_sens_Tnew[d * n + j] = val;
+        }
+    }
+
+    { double *tmp = g_sens_Sprev; g_sens_Sprev = g_sens_Snew; g_sens_Snew = tmp; }
+    { double *tmp = g_sens_Tprev; g_sens_Tprev = g_sens_Tnew; g_sens_Tnew = tmp; }
+
+    if (getenv("PSS_SENS_TRACE")) {
+        static int calls = 0;
+        if (calls < 40)
+            fprintf(stderr, "SENSTRACE call=%d t=%.6g h=%.4g order=%d ag0=%.6g "
+                    "S(owned,0)=%.10g\n", calls, ckt->CKTtime, ckt->CKTdelta, order, ag0,
+                    pss_sens_get(g_sens_Sprev,
+                        g_sens_map->refs[0].isCap ? g_sens_map->refs[0].dev.cap->CAPposNode
+                                                   : g_sens_map->refs[0].dev.ind->INDbrEq,
+                        n, 0));
+        calls++;
+    }
+}
+
+/* Reads the current (t=T, after a full period's worth of
+ * PSSsensRecordStep() calls) monodromy matrix Phi[n*n] (row-major, RAW,
+ * not Phi-I -- same convention pss_newton_run()'s FD path uses). Returns
+ * 0 on success, 1 if the analytic path failed anywhere this run (a
+ * refactor/solve error, or an order/method outside TRAPEZOIDAL 1-2). */
+static int
+pss_sens_get_phi(PSSstateMap *map, double *Phi)
+{
+    int n = map->n, d, j;
+
+    if (g_sens_failed || !g_sens_Sprev)
+        return 1;
+
+    for (d = 0; d < n; d++) {
+        PSSstateRef *ref = &map->refs[d];
+        for (j = 0; j < n; j++) {
+            if (ref->isCap) {
+                int p = ref->dev.cap->CAPposNode, ng = ref->dev.cap->CAPnegNode;
+                Phi[d * n + j] = pss_sens_get(g_sens_Sprev, p, n, j) -
+                                  pss_sens_get(g_sens_Sprev, ng, n, j);
+            } else {
+                Phi[d * n + j] = pss_sens_get(g_sens_Sprev, ref->dev.ind->INDbrEq, n, j);
+            }
+        }
+    }
+    return 0;
+}
+
+
 /* SUSPECTED CAUSE 1 fix: the former spectral-radius estimator (power
  * iteration) is gone -- it cannot resolve a complex-conjugate dominant
  * multiplier pair, which is exactly what a slow oscillation (the R3 x20
@@ -490,7 +867,8 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
                 double *x0, int maxiter_this, double tol, double eps,
                 double trust_radius, int broyden_enabled, int broyden_period,
                 const char *stage_label,
-                int *iter_out, double *residual_out, double *Phi_out)
+                int *iter_out, double *residual_out, double *Phi_out,
+                int use_analytic)
 {
     int iter = 0, j, k, err;
     double residual = 0.0;
@@ -501,6 +879,19 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
     int recompute = 1;       /* does THIS iteration's Jacobian need a fresh FD sweep? */
     int since_recompute = 0;
     int result = 0;
+
+    /* card #458 FOURTH pass: the analytic Jacobian has no Broyden analogue
+     * in this implementation -- every iteration re-runs ONE period WITH
+     * sensitivity tracking active (see below), which is both this
+     * iteration's baseline P(x0) AND its Jacobian source, so "reuse last
+     * iteration's free P(xtrial)" (what have_baseline=1 normally means at
+     * the bottom of the loop) would skip recomputing Phi. Forcing
+     * broyden_enabled=0 here makes `recompute` stay permanently true
+     * (its own end-of-iteration update, unchanged below, already reduces
+     * to that whenever broyden_enabled is false) with no other code path
+     * changes needed for that part. */
+    if (use_analytic)
+        broyden_enabled = 0;
 
     x1      = TMALLOC(double, n);
     F       = TMALLOC(double, n);
@@ -527,7 +918,23 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
 
         if (!have_baseline) {
             pss_state_set_ic(map, x0);
-            err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
+            if (use_analytic) {
+                /* One period run, sensitivity tracking active: this SAME
+                 * run is both the baseline P(x0) (x1 below) AND the
+                 * analytic Jacobian source (M below) -- no separate FD
+                 * sweep, no separate baseline call. Not forced onto any
+                 * grid (force=0): the analytic recursion uses THIS run's
+                 * own accepted steps directly (via PSSsensRecordStep(),
+                 * hooked at the same dctran.c call site as the
+                 * breakpoint-recording hook), so there is no cross-run
+                 * grid-consistency need the FD path's forcing addressed. */
+                pss_sens_reset(ckt, map);
+                PSSsensActive = 1;
+                err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period, analytic)", 0, 0);
+                PSSsensActive = 0;
+            } else {
+                err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
+            }
             if (err) {
                 fprintf(stderr, "PSS-SHOOT: %s period integration did not "
                         "complete at Newton iteration %d (ngspice error "
@@ -536,6 +943,22 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
                 goto newton_done;
             }
             pss_state_get(map, ckt, x1);
+            if (use_analytic && getenv("PSS_SHOOT_DEBUG")) {
+                double dbgPhi[64];
+                if (!pss_sens_get_phi(map, dbgPhi)) {
+                    for (k = 0; k < n * n; k++)
+                        fprintf(stderr, "DEBUG analytic Phi[%d]=%.8g\n", k, dbgPhi[k]);
+                }
+            }
+            if (use_analytic && pss_sens_get_phi(map, M)) {
+                fprintf(stderr, "PSS-SHOOT: %s analytic sensitivity failed "
+                        "(refactor/solve error, or an integration order "
+                        "outside TRAPEZOIDAL 1-2) at Newton iteration %d; "
+                        "treating as a failed attempt (no FD fallback "
+                        "within one attempt).\n", stage_label, iter);
+                result = 0;
+                goto newton_done;
+            }
 
             /* Scale/floor: unchanged from the second pass -- see that
              * pass's comment (kept verbatim in PSSshootDriven's history;
@@ -614,7 +1037,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
             goto newton_done;   /* out of this attempt's budget */
         }
 
-        if (recompute) {
+        if (recompute && !use_analytic) {
             /* finite-difference monodromy: 2n extra period runs (centred
              * differences, not the cheaper n forward differences the
              * card's "n+1 period runs per Newton step" description allows
@@ -663,6 +1086,9 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
                 for (k = 0; k < n; k++)
                     M[k * n + j] = (M[k * n + j] - pert[k]) / (2.0 * h);
             }
+            if (getenv("PSS_SHOOT_DEBUG"))
+                for (k = 0; k < n * n; k++)
+                    fprintf(stderr, "DEBUG FD Phi[%d]=%.8g\n", k, M[k]);
             since_recompute = 0;
             /* M is the RAW monodromy estimate here (no -I baked in) --
              * kept that way throughout (Broyden update below preserves
@@ -856,7 +1282,13 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
                     if (r > residual) residual = r;
                 }
             }
-            have_baseline = 1;   /* next loop iteration reuses this baseline */
+            /* analytic mode: force a fresh sensitivity-tracked baseline
+             * run next iteration (from the now-updated x0) rather than
+             * reusing this trial's "free" x1trial -- see this function's
+             * header comment (use_analytic branch) for why: the Jacobian
+             * can ONLY come from a run with PSSsensActive set, and this
+             * damped-trial run above did not have it active. */
+            have_baseline = use_analytic ? 0 : 1;
 
             since_recompute++;
             recompute = (!broyden_enabled) ||
@@ -902,6 +1334,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     double tol, eps, residual = 0.0;
     double t_wall_start, t_wall_end;
     int converged_flag = 0;
+    int use_analytic = 0;   /* card #458 fourth pass: PSS_SHOOT_JACOBIAN=analytic (set below) */
     double *x0 = NULL, *x1 = NULL, *F = NULL, *Phi = NULL, *delta_x = NULL,
            *xtrial = NULL, *x1trial = NULL, *scale = NULL, *A = NULL, *b = NULL;
     double save_reltol, save_abstol, save_volttol;
@@ -1067,6 +1500,19 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         if (getenv("PSS_SHOOT_BROYDEN")) broyden_enabled = atoi(getenv("PSS_SHOOT_BROYDEN"));
         if (getenv("PSS_SHOOT_BROYDEN_PERIOD")) broyden_period = atoi(getenv("PSS_SHOOT_BROYDEN_PERIOD"));
 
+        /* card #458 FOURTH pass (plan T4.2): opt-in analytic (discretise-
+         * then-linearise) sensitivity Jacobian, replacing the finite-
+         * difference monodromy above -- see PSSsensRecordStep()'s header
+         * comment for the derivation. Default ("fd", or unset) is
+         * byte-for-byte the third pass's tested FD+Broyden path;
+         * PSS_SHOOT_JACOBIAN=analytic switches every pss_newton_run() call
+         * below (every warm-up stage, not just the final one -- the
+         * analytic path is CHEAPER per iteration than FD, ~1-2 period runs
+         * vs 2n+3, so there is no reason to withhold it from the cheap
+         * probe stages either). */
+        use_analytic = (getenv("PSS_SHOOT_JACOBIAN") &&
+                        strcmp(getenv("PSS_SHOOT_JACOBIAN"), "analytic") == 0);
+
         /* Tightened reltol for Newton's OWN (single-period) runs only --
          * same value (1e-5), same rationale as the second pass. THIRD-PASS
          * CHANGE: no longer set once for the rest of the function. With
@@ -1108,7 +1554,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             converged_flag = pss_newton_run(ckt, &map, T, n, x0, maxiter,
                                              tol, eps, -1.0, broyden_enabled,
                                              broyden_period, "[no warm-up]",
-                                             &iter, &residual, Phi);
+                                             &iter, &residual, Phi, use_analytic);
             ckt->CKTreltol = save_reltol;
         } else {
             double stage_len = warmup_periods * T;
@@ -1163,7 +1609,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                                                  this_maxiter, tol, eps,
                                                  this_trust, broyden_enabled,
                                                  broyden_period, label,
-                                                 &iter, &residual, Phi);
+                                                 &iter, &residual, Phi, use_analytic);
                 ckt->CKTreltol = save_reltol;
                 if (converged_flag || last_stage)
                     break;
@@ -1221,6 +1667,20 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         double *Phi2 = TMALLOC(double, n * n);
         int floquet_ok = (Phi2 != NULL);
 
+        if (floquet_ok && use_analytic) {
+            /* card #458 FOURTH pass: analytic sensitivity, same one-period
+             * source as pss_newton_run()'s own analytic baseline -- no FD
+             * perturbation runs here either. */
+            pss_state_set_ic(&map, x0);
+            pss_sens_reset(ckt, &map);
+            PSSsensActive = 1;
+            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline, analytic)", 0, 0))
+                floquet_ok = 0;
+            PSSsensActive = 0;
+            if (floquet_ok && pss_sens_get_phi(&map, Phi2))
+                floquet_ok = 0;
+        } else {
+
         pss_state_set_ic(&map, x0);
         if (floquet_ok && pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline)", 1, 0))
             floquet_ok = 0;
@@ -1252,6 +1712,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             pss_state_get(&map, ckt, x1trial);
             for (k = 0; k < n; k++)
                 Phi2[k * n + j] = (Phi2[k * n + j] - x1trial[k]) / (2.0 * h);
+        }
         }
 
         {
@@ -1318,6 +1779,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     ckt->CKTvoltTol = save_volttol;
     PSSbreakRecordActive = PSSbreakInstallActive = 0;
     pss_break_free();
+    PSSsensActive = 0;
+    pss_sens_free();   /* g_sens_map points into &map, about to be freed below */
     if (x0) tfree(x0);
     if (x1) tfree(x1);
     if (F) tfree(F);

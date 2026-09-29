@@ -74,4 +74,16 @@ extern int PSSbreakInstallActive;  /* dctran.c: force the recorded times as brea
 void PSSbreakRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept() */
 void PSSbreakInstallHook(CKTcircuit *ckt);  /* called right after the restart-path breaks reset */
 
+/* ---- card #458 FOURTH pass (plan T4.2): analytic (discretise-then-
+ * linearise) sensitivity monodromy, replacing finite differences. See
+ * pssshoot.c's PSSsensRecordStep() header comment for the full S_k/T_k
+ * recursion and its derivation from niinteg.c/capload.c/indload.c. Same
+ * no-op-unless-active pattern as the breakpoint hooks above: PSSsensActive
+ * defaults to 0, so every other analysis (including method=shoot's own
+ * default finite-difference Jacobian) is completely unaffected. ---- */
+
+extern int PSSsensActive;   /* dctran.c: run the per-step sensitivity recursion */
+
+void PSSsensRecordStep(CKTcircuit *ckt);    /* called right after CKTaccept(), same site as PSSbreakRecordStep */
+
 #endif
