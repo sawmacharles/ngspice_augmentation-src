@@ -1152,21 +1152,45 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
             }
             for (i = 0; i < npm; i++) if (pmi < 0 || pmx[i].value < pmbest) { pmi = i; pmbest = pmx[i].value; }
             for (i = 0; i < ngm; i++) if (gmi < 0 || gmx[i].value < gmbest) { gmi = i; gmbest = gmx[i].value; }
+            /* card #465 rebase (2026-09-29): stban.c patch 0013 (card #476) narrowed
+             * its low-frequency positive-feedback check from "Re(T)<0 at the lowest
+             * swept frequency alone" to arg0/mag0 thresholds, after the old form
+             * false-triggered on healthy integrator-type loops. This block is a
+             * verbatim duplicate of stban.c's STBan() tail (see this file's header,
+             * "PSTB" paragraph, and stban.c's own comment at the same check) so it
+             * is kept consistent with that NEW semantics here: freqs[] is always
+             * ascending (pac_sweep_fill, fstart<=fstop enforced), so index 0 is the
+             * lowest swept frequency, same as stban.c's Tarr[0]. NOTE: unlike
+             * stban.c, this file's pmx[].aux is always pushed as a literal 0.0
+             * (PAC's crossing detector never implemented patch 0011's rising/
+             * falling classification), so no phaseMarginFalling vector is added
+             * here -- adding one would just be a constant, misleading 0. */
             {
-                IFuid uids[4]; double outv[4]; runDesc *mplot = NULL; int merr;
+                double arg0 = (nfreq > 0) ? 180.0 / M_PI * pc_ph(Tarr[0]) : 0.0;
+                double mag0 = (nfreq > 0) ? pc_mag(Tarr[0]) : 0.0;
+                int low_f_posfb = (nfreq > 0) && (fabs(arg0) > 150.0) && (mag0 > 1.0);
+                int low_f_posfb_low_gain = (nfreq > 0) && (fabs(arg0) > 150.0) && (mag0 <= 1.0);
+                int low_f_integrator = (nfreq > 0) && (arg0 >= -120.0) && (arg0 <= -60.0);
+                IFuid uids[7]; double outv[7]; runDesc *mplot = NULL; int merr;
                 SPfrontEnd->IFnewUid(ckt, &uids[0], NULL, "phaseMargin", UID_OTHER, NULL);
                 SPfrontEnd->IFnewUid(ckt, &uids[1], NULL, "phaseMarginFreq", UID_OTHER, NULL);
                 SPfrontEnd->IFnewUid(ckt, &uids[2], NULL, "gainMargin", UID_OTHER, NULL);
                 SPfrontEnd->IFnewUid(ckt, &uids[3], NULL, "gainMarginFreq", UID_OTHER, NULL);
+                SPfrontEnd->IFnewUid(ckt, &uids[4], NULL, "lowFPositiveFeedback", UID_OTHER, NULL);
+                SPfrontEnd->IFnewUid(ckt, &uids[5], NULL, "lowFPositiveFeedbackLowGain", UID_OTHER, NULL);
+                SPfrontEnd->IFnewUid(ckt, &uids[6], NULL, "lowFIntegrator", UID_OTHER, NULL);
                 outv[0] = pmi >= 0 ? pmx[pmi].value : nan;
                 outv[1] = pmi >= 0 ? pmx[pmi].freq : nan;
                 outv[2] = gmi >= 0 ? gmx[gmi].value : nan;
                 outv[3] = gmi >= 0 ? gmx[gmi].freq : nan;
-                merr = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob, "PSTB Margins", NULL, 0, 4, uids, IF_REAL, &mplot);
+                outv[4] = low_f_posfb ? 1.0 : 0.0;
+                outv[5] = low_f_posfb_low_gain ? 1.0 : 0.0;
+                outv[6] = low_f_integrator ? 1.0 : 0.0;
+                merr = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob, "PSTB Margins", NULL, 0, 7, uids, IF_REAL, &mplot);
                 if (!merr) {
                     IFvalue refval, outdata;
                     refval.rValue = 0;
-                    outdata.v.numValue = 4;
+                    outdata.v.numValue = 7;
                     outdata.v.vec.rVec = outv;
                     SPfrontEnd->OUTpData(mplot, &refval, &outdata);
                     SPfrontEnd->OUTendPlot(mplot);
@@ -1181,6 +1205,15 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
                 else printf("gain margin: no -180 deg crossing of T");
                 if (ngm > 1) printf(" (%d crossings found; the lowest margin is reported)", ngm);
                 printf("\n");
+                /* card #476's disjoint arg0-range elif chain, mirrored verbatim. */
+                if (low_f_posfb) {
+                    printf("pstb: WARNING: positive feedback at low frequency: loop is unstable "
+                        "if |T|>1 there; phase/gain margins are not meaningful\n");
+                } else if (low_f_posfb_low_gain) {
+                    printf("pstb: note: positive feedback at low frequency, loop gain < 1\n");
+                } else if (low_f_integrator) {
+                    printf("pstb: note: integrator-like low-frequency behaviour\n");
+                }
             }
             if (phs) tfree(phs);
             if (pmx) tfree(pmx);
