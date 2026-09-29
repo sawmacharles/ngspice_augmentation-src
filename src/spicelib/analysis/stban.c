@@ -1201,6 +1201,44 @@ STBan(CKTcircuit *ckt, int restart)
                 stb_sens_setp(sg, ckt, &ovalue);
                 stb_sens_temp(sg, ckt);
 
+                /* card #475 bugfix (found while smoke-testing this card,
+                 * the SECOND real bug this pass found -- see git log for
+                 * the first, the early-break above): DEVsetup(sensDeltaY,
+                 * ...) just above does not merely allocate STRUCTURAL
+                 * positions in sensDeltaY -- for devices that cache
+                 * matrix-element pointers on the INSTANCE itself (e.g. a
+                 * capacitor's own posPosPtr-style fields, written once by
+                 * DEVsetup and read directly by DEVload/DEVacLoad ever
+                 * after, with no further SMPmakeElt call), it REPOINTS
+                 * those cached pointers at sensDeltaY's storage -- a
+                 * PERSISTENT, PER-INSTANCE side effect that survives this
+                 * function restoring ckt->CKTmatrix back to the real Y.
+                 * The very next frequency's ordinary CKTacLoad() then
+                 * silently loads this device's real contribution into the
+                 * now-defunct sensDeltaY instead of the real matrix --
+                 * found empirically: T itself (not just dT/dp) went wrong
+                 * from the SECOND swept frequency once 2+ sens= devices
+                 * with this property were requested (a lone resistor
+                 * alone did not show it -- RESsetup apparently does not
+                 * cache pointers the same way; a lone capacitor did).
+                 * cktsens.c's own DC/AC `.sens` never hits this because it
+                 * calls CKTunsetup()+CKTsetup() fresh before EVERY
+                 * frequency point, which re-runs every device's REAL
+                 * DEVsetup(ckt->CKTmatrix, ...) and so re-fixes the
+                 * pointers before the next real load -- STBan()'s
+                 * existing per-frequency loop does no such reset (by
+                 * design, it is much cheaper: one factor + two solves).
+                 * Fix: immediately re-run this SAME device's DEVsetup
+                 * against the REAL matrix (save_matrix) to restore its
+                 * pointers before moving to the next parameter -- a
+                 * throwaway numStates counter is used (seeded with this
+                 * instance's own already-correct sg->istate) so this
+                 * repair call cannot perturb ckt->CKTnumStates either. */
+                if (setupfn) {
+                    int throwaway_states = sg->istate;
+                    setupfn(save_matrix, sg->model, ckt, &throwaway_states);
+                }
+
                 /* sensDeltaY/sens_dI/sens_dII now hold delta*(dY/dp),
                  * delta*(db/dp) for this ISOLATED device (sgen's own
                  * temporary instance-unlinking keeps DEVsetup/DEVacLoad
