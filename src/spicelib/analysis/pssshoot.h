@@ -134,7 +134,9 @@ typedef struct {
     int posCntrl, negCntrl;     /* switch control terminals (h = v(posCntrl)-v(negCntrl)-vt) */
     double v_switch;            /* V(posNode)-V(negNode) at the accepted point */
     double dG;                  /* conductance jump, g_after - g_before */
-    double h_dot;                /* d(v_ctrl)/dt across this step (finite difference) */
+    double h_dot;                /* d(v_ctrl)/dt across this step (finite difference,
+                                   * denominator = the step's TRUE elapsed accepted time,
+                                   * card #494 fifth pass -- see PSSsaltFindEvents()) */
     double dfdt_pos;             /* (f+-f-) at posNode: -dG*v_switch / C_local(posNode),
                                    * 0 if posNode has no capacitor directly on it (e.g. an
                                    * ideal voltage source's own node -- no state to jump) */
@@ -164,7 +166,35 @@ int PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max);
  * unconditionally returns 0 (real duty-cycle edges land later in the
  * period; this costs one accepted step's worth of non-detection per
  * restart, the "ignore crossings within the first step" filter the
- * card's brief asks for). */
+ * card's brief asks for). Also clears the fifth pass's own h_dot
+ * elapsed-time tracker and post-event L-stable settle window (see
+ * PSSsaltFindEvents()'s header comment) so neither carries state across a
+ * period restart. */
 void PSSsaltReset(void);
+
+/* card #494 FIFTH pass (plan T6.1): the stiffness half of the fix (task
+ * 2 in the card's brief). Node `sw` (and any node like it -- a small
+ * capacitance directly against a large switch/resistor conductance) has
+ * a local RC time constant many orders of magnitude below the accepted
+ * step sizes the surrounding TRAPEZOIDAL recursion normally uses; TRAP is
+ * A-stable but not L-stable, so it rings (amplification -> -1, not 0)
+ * instead of damping the huge post-jump sensitivity spike PSSsaltFindEvents()
+ * injects there, leaking gain into the slow states (see docs/pss-pac.md's
+ * "FOURTH pass" section). PSSsaltFindEvents() estimates that node's own
+ * tau = C_local/G_local (pss_salt_local_cap()/pss_salt_local_cond()) and
+ * opens a settle window (ckt->CKTtime .. event_time + PSS_SALT_SETTLE_TAUS
+ * * tau) every time it reports a real event; PSSsaltForceOrder1() below
+ * is the query PSSsensRecordStep()/PSSpacRecordStep() call, right after
+ * their own ag1-based order inference, to OVERRIDE that order to 1
+ * (backward Euler, L-stable) for every step inside the window -- exactly
+ * the same "force order 1 after a breakpoint" idiom dctran.c's own XSPICE
+ * path already uses for the real trajectory (see dctran.c's `Cut
+ * integration order if first timepoint after breakpoint`), applied here
+ * to this file's SEPARATE sensitivity/phasor recursion instead, since the
+ * real trajectory's own breakpoint/order handling has no knowledge of the
+ * (much larger, saltation-injected) spike living only in that recursion.
+ * A single call, one integer compare; returns 0 (no override) whenever no
+ * event has been seen this run or the window has already closed. */
+int PSSsaltForceOrder1(CKTcircuit *ckt);
 
 #endif

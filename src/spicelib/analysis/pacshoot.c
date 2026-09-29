@@ -735,6 +735,14 @@ PSSpacRecordStep(CKTcircuit *ckt)
     int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
     int i_salt;
 
+    /* card #494 fifth pass (task 2): same L-stable-settle-window override
+     * as PSSsensRecordStep() (pssshoot.c) -- see PSSsaltForceOrder1()'s
+     * header comment in pssshoot.h. Must run after PSSsaltFindEvents()
+     * above and before `order` is used below; no-op for any run that
+     * never saw a real sw event. */
+    if (PSSsaltForceOrder1(ckt))
+        order = 1;
+
     for (m = 0; m < M; m++) {
         memset(g_pac_rhs_re, 0, (size_t) (neq + 1) * sizeof(double));
         memset(g_pac_rhs_im, 0, (size_t) (neq + 1) * sizeof(double));

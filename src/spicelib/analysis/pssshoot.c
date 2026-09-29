@@ -87,6 +87,7 @@ What this does NOT do (see the card #458 report for the full list):
 #include "cap/capdefs.h"
 #include "ind/inddefs.h"
 #include "sw/swdefs.h"   /* card #494 (plan T6.1): saltation for ideal `sw` events */
+#include "res/resdefs.h"   /* card #494 fifth pass: pss_salt_local_cond() below */
 
 #include <math.h>
 #include <string.h>
@@ -804,14 +805,119 @@ pss_solve_dense(double *A, double *b, int n, double *x)
  *   branch current through another device, a different CKTstate slot
  *   convention this pass did not reach. */
 
+/* card #494 FIFTH pass (plan T6.1): two fixes, per the card's own
+ * diagnosis (docs/pss-pac.md's "FOURTH pass" section -- the jump formula
+ * above is correct; two SEPARATE bugs remained in how it was located and
+ * propagated).
+ *
+ * (1) EXACT h_dot (fixes the event-LOCATION-precision gap the third/
+ * fourth passes flagged but did not root-cause). h_dot's finite
+ * difference (vctrl_now-vctrl_prev) is exact -- CKTstate0/CKTstate1 are
+ * genuine, exact samples of v_ctrl at the current and previous accepted
+ * points -- the bug was in the DENOMINATOR: this function used
+ * ckt->CKTdelta, which by the time dctran.c calls this hook (right after
+ * CKTaccept(), dctran.c line ~502/546) has ALREADY been overwritten with
+ * CKTtrunc()'s suggestion for the NEXT trial step's size (dctran.c line
+ * ~993, `ckt->CKTdelta = newdelta;`, executed after the just-accepted
+ * step's own NIiter()/CKTtrunc() pass, before control returns to
+ * `nextTime:`/CKTaccept()) -- NOT the size of the step that actually
+ * produced the CKTstate0 vs CKTstate1 transition being differenced. This
+ * is the EXACT SAME class of bug as the already-documented CKTorder trap
+ * a few dozen lines above in PSSsensRecordStep() (card #458 fourth pass)
+ * -- a "read after accept but already advanced for the next attempt"
+ * variable -- just never previously traced through for CKTdelta. Measured
+ * directly (PSS_SALT_TRACE): at the real duty-cycle event, CKTdelta's
+ * post-CKTtrunc value is ~1.25-2x the step that was actually taken,
+ * matching the third pass's own reltol table almost exactly (825443 V/s
+ * measured vs 1030928 V/s exact = 1.249x; 521443 V/s vs exact = 1.977x --
+ * both consistent with CKTtrunc's own step-growth heuristic, which
+ * commonly doubles the step after a tiny LTE-forced one). Fix: track this
+ * function's own history of ckt->CKTtime across calls (g_salt_prev_time,
+ * reset by PSSsaltReset()) and use the ACTUAL elapsed time between
+ * consecutive accepted points as h_dot's denominator instead of
+ * ckt->CKTdelta -- self-contained (no dependence on dctran.c's internal
+ * CKTdeltaOld[]/CKTorder bookkeeping, whose exact semantics vary across
+ * the XSPICE/non-XSPICE #ifdef paths), and exactly what pacshoot.c's
+ * PSSpacRecordStep() already computes for its OWN, unrelated purposes
+ * (`h = t_new - g_pac_tprev`) -- corroborating evidence this is the right
+ * quantity. On `pac_r6o_ctrl2out.cir`'s exactly-piecewise-linear ramp
+ * segment this makes h_dot match the analytic slope (1.030928e6 V/s) to
+ * well under the card's 0.1% target (limited only by double-precision
+ * roundoff on values ~0.5V differing by ~1e-6V over a ~1e-12s bracket --
+ * no cancellation problem at this magnitude), independent of reltol/step
+ * size -- see the card #494 fifth-pass report for the measured numbers.
+ * f+/f- themselves were NOT the problem (dfdt_pos/neg depend only on Vin,
+ * dG, C_local -- all step/time-independent constants; v_switch is read at
+ * the already very precisely located accepted point) so no interpolation
+ * or CKTsetBreak-based bisection of the crossing itself was needed once
+ * this denominator bug was fixed -- see the report for why this was
+ * judged sufficient rather than also adding breakpoint machinery.
+ *
+ * (2) L-stable propagation after an event (fixes the STIFFNESS bug the
+ * fourth pass's independent arithmetic check found is a SECOND, separate
+ * defect on top of (1) -- fixing h_dot alone left the code's own
+ * (analytically re-checked) result at 7.5-11.9 V/V, not the ~6 V/V
+ * references). Node `sw`'s local capacitance against the switch's own
+ * ON/OFF conductance (and any other resistor directly on that node) gives
+ * it a local time constant tau = C_local/G_local many orders of magnitude
+ * below the accepted step sizes the surrounding recursion's LTE control
+ * (tuned to the SLOW L/C states) actually picks. The existing recursion's
+ * TRAPEZOIDAL formula (order 2, `-ag1*Tp` term) is A-stable but not
+ * L-stable: its amplification factor -> -1 (not 0) as |lambda*h| -> Inf,
+ * so it does not damp the huge post-jump spike this file injects at that
+ * node -- it rings, and the ringing leaks into the slow states through
+ * the A matrix's own v1<->iL coupling (see `patches-wip/salt/
+ * check_r6o_arithmetic.py`'s A matrix). Per the card's option (a) (a
+ * fuller reduced-Jacobian quasi-static elimination, option (b), was
+ * considered and rejected here -- see the report: it would replace Fang's
+ * EXACT raw jump, which check_r6o_arithmetic.py already proved gives the
+ * right answer (6.017 V/V) under EXACT propagation, with a different,
+ * approximate model; the bug is in this file's DISCRETE propagation of an
+ * already-correct jump, not in the jump target itself), this pass forces
+ * the SAME "order 1 (backward Euler) right after a breakpoint" idiom
+ * dctran.c's own XSPICE path already uses for the real trajectory
+ * (`ckt->CKTorder = 1` after a breakpoint, dctran.c) onto THIS recursion
+ * for a settle window sized from the event's own node: N_TAU time
+ * constants of real elapsed time after the event (PSS_SALT_SETTLE_TAUS
+ * below), independent of step count -- self-terminating and adaptive to
+ * whatever tau the triggering node actually has, not a fixture-tuned
+ * magic step count. Backward Euler's amplification factor 1/(1-lambda*h)
+ * -> 0 as |lambda*h| -> Inf regardless of h's size, so even the first
+ * forced step crushes most of the spike; the multi-tau window covers the
+ * handful of still-small (still not fully L-stable-safe under order 2)
+ * steps the real LTE controller takes while growing back toward the slow
+ * states' own step scale. This changes ONLY this file's own S/T (pssshoot.c)
+ * and C/T (pacshoot.c) recursion -- never ckt->CKTorder itself, so the
+ * real x(t) trajectory these recursions read their step/order history
+ * FROM is completely unaffected (an existing-fixture, no-sw-event deck
+ * sees PSSsaltForceOrder1() return 0 on every call -- exact no-op,
+ * confirmed by regression). */
+
+#define PSS_SALT_SETTLE_TAUS 30.0   /* generous safety margin -- see report */
+
 int PSSsaltActive = 1;   /* PSS_SALTATION=0 env var disables (red-proof toggle) */
 
 static int g_salt_first_step_pending = 0;   /* card #494 third pass: restart filter */
+static double g_salt_prev_time = -1.0;      /* card #494 fifth pass: h_dot's true-elapsed-time tracker */
+static double g_salt_settle_until = -1.0;   /* card #494 fifth pass: force-order-1 window deadline */
 
 void
 PSSsaltReset(void)
 {
     g_salt_first_step_pending = 1;
+    g_salt_prev_time = -1.0;
+    g_salt_settle_until = -1.0;
+}
+
+/* card #494 fifth pass: is ckt->CKTtime still inside the post-event
+ * L-stable settle window opened by the most recent PSSsaltFindEvents()
+ * call that found a real event? See the derivation comment above (task
+ * 2). Called by PSSsensRecordStep()/PSSpacRecordStep() right after their
+ * own ag1-based order inference to override it to 1 for the duration. */
+int
+PSSsaltForceOrder1(CKTcircuit *ckt)
+{
+    return (g_salt_settle_until > 0.0 && ckt->CKTtime < g_salt_settle_until);
 }
 
 static int
@@ -847,6 +953,52 @@ pss_salt_local_cap(CKTcircuit *ckt, int node)
     return c;
 }
 
+/* card #494 fifth pass: total conductance (Siemens) directly attached to
+ * `node` -- every native Resistor instance with a terminal there, plus
+ * every Switch instance's OWN current conductance (SWcond -- SWload()
+ * already reloaded it for this accepted point before this hook runs,
+ * same call site) with a terminal there. Paired with pss_salt_local_cap()
+ * to estimate that node's own local RC time constant (tau=C_local/G_local)
+ * for PSSsaltForceOrder1()'s settle window (task 2's L-stable-propagation
+ * fix) -- NOT used anywhere in the jump formula itself, which stays
+ * exactly the pure Farads-based KCL quantity the third/fourth passes
+ * derived. Scope: R and SW only (this project's own R1-R6 fixture
+ * family) -- a node whose dominant local conductance comes from another
+ * device type (a diode, a MOSFET's rds, ...) would need extending this,
+ * not attempted -- see the report. 0 if node<=0 or nothing conductive is
+ * directly there (a pure capacitor-to-nothing node -- correctly means no
+ * settle window is needed/possible from this estimate; PSSsaltForceOrder1()
+ * just stays inactive for that event, unchanged from before this pass). */
+static double
+pss_salt_local_cond(CKTcircuit *ckt, int node)
+{
+    int restype, swtype;
+    RESmodel *rm;
+    RESinstance *ri;
+    SWmodel *sm;
+    SWinstance *si;
+    double g = 0.0;
+
+    if (node <= 0)
+        return 0.0;
+
+    restype = CKTtypelook("Resistor");
+    if (restype >= 0)
+        for (rm = (RESmodel *) ckt->CKThead[restype]; rm; rm = RESnextModel(rm))
+            for (ri = RESinstances(rm); ri; ri = RESnextInstance(ri))
+                if (ri->RESposNode == node || ri->RESnegNode == node)
+                    g += ri->RESconduct;
+
+    swtype = CKTtypelook("Switch");
+    if (swtype >= 0)
+        for (sm = (SWmodel *) ckt->CKThead[swtype]; sm; sm = SWnextModel(sm))
+            for (si = SWinstances(sm); si; si = SWnextInstance(si))
+                if (si->SWposNode == node || si->SWnegNode == node)
+                    g += si->SWcond;
+
+    return g;
+}
+
 int
 PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
 {
@@ -854,6 +1006,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     SWmodel *model;
     SWinstance *here;
     int n = 0;
+    double dt_actual, tau_max;
     static int env_checked = 0;
 
     if (!env_checked) {
@@ -865,6 +1018,19 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     if (!PSSsaltActive || ckt->CKTtime <= 0.0 || ckt->CKTdelta <= 0.0)
         return 0;
 
+    /* card #494 fifth pass: this function's own true-elapsed-time
+     * tracker for h_dot's denominator (task 1 -- see the derivation
+     * comment above PSSsaltActive's definition for why ckt->CKTdelta
+     * itself is NOT safe to use here). Updated UNCONDITIONALLY, before
+     * the restart-filter's early return below, so g_salt_prev_time is
+     * always seeded from the previous call's ckt->CKTtime regardless of
+     * whether that call reported an event. g_salt_prev_time<0 (only true
+     * on the very first call after PSSsaltReset()) falls back to
+     * ckt->CKTdelta -- harmless, since the restart filter unconditionally
+     * discards that first call's own event anyway. */
+    dt_actual = (g_salt_prev_time >= 0.0) ? (ckt->CKTtime - g_salt_prev_time) : ckt->CKTdelta;
+    g_salt_prev_time = ckt->CKTtime;
+
     /* card #494 third pass: restart filter -- see PSSsaltReset()'s own
      * header comment in pssshoot.h. Consumes the latch unconditionally,
      * even if this particular step has no real sw event, so it only ever
@@ -874,6 +1040,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
         return 0;
     }
 
+    tau_max = 0.0;
     swtype = CKTtypelook("Switch");
     if (swtype < 0)
         return 0;
@@ -885,14 +1052,14 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             double now = ckt->CKTstate0[here->SWswitchstate];
             double prev = ckt->CKTstate1[here->SWswitchstate];
             double vctrl_now, vctrl_prev, h_dot, g_now, g_prev, dG, v_switch, dI;
-            double Cpos, Cneg;
+            double Cpos, Cneg, Gpos, Gneg, tau_pos, tau_neg;
 
             if (pss_salt_is_on(now) == pss_salt_is_on(prev))
                 continue;   /* hysteresis-band-only or no-change: no real event */
 
             vctrl_now = ckt->CKTstate0[here->SWctrlvalue];
             vctrl_prev = ckt->CKTstate1[here->SWctrlvalue];
-            h_dot = (vctrl_now - vctrl_prev) / ckt->CKTdelta;
+            h_dot = (vctrl_now - vctrl_prev) / dt_actual;
             if (fabs(h_dot) < 1e-30)
                 continue;   /* degenerate: avoid a divide-by-zero downstream */
 
@@ -915,14 +1082,31 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             ev[n].dfdt_pos = (Cpos > 0.0) ? (-dI / Cpos) : 0.0;
             ev[n].dfdt_neg = (Cneg > 0.0) ? ( dI / Cneg) : 0.0;
             ev[n].name = here->SWname;
+
+            /* card #494 fifth pass (task 2): estimate this event's own
+             * settle-window requirement from its power nodes' local RC --
+             * see pss_salt_local_cond()'s header and PSSsaltForceOrder1(). */
+            Gpos = pss_salt_local_cond(ckt, here->SWposNode);
+            Gneg = pss_salt_local_cond(ckt, here->SWnegNode);
+            tau_pos = (Cpos > 0.0 && Gpos > 0.0) ? Cpos / Gpos : 0.0;
+            tau_neg = (Cneg > 0.0 && Gneg > 0.0) ? Cneg / Gneg : 0.0;
+            if (tau_pos > tau_max) tau_max = tau_pos;
+            if (tau_neg > tau_max) tau_max = tau_neg;
+
             n++;
         }
     }
+    if (n > 0 && tau_max > 0.0) {
+        double deadline = ckt->CKTtime + PSS_SALT_SETTLE_TAUS * tau_max;
+        if (deadline > g_salt_settle_until)
+            g_salt_settle_until = deadline;
+    }
     if (n > 0 && getenv("PSS_SALT_TRACE"))
-        fprintf(stderr, "SALT-TRACE t=%.9g delta=%.4g n_events=%d ev0=%s dG=%.6g v_switch=%.6g "
-                "h_dot=%.6g posCntrl=%d negCntrl=%d dfdt_pos=%.6g dfdt_neg=%.6g\n",
-                ckt->CKTtime, ckt->CKTdelta, n, ev[0].name, ev[0].dG, ev[0].v_switch, ev[0].h_dot,
-                ev[0].posCntrl, ev[0].negCntrl, ev[0].dfdt_pos, ev[0].dfdt_neg);
+        fprintf(stderr, "SALT-TRACE t=%.9g dt_actual=%.6g (CKTdelta=%.4g) n_events=%d ev0=%s dG=%.6g "
+                "v_switch=%.6g h_dot=%.6g posCntrl=%d negCntrl=%d dfdt_pos=%.6g dfdt_neg=%.6g "
+                "tau_max=%.4g settle_until=%.6g\n",
+                ckt->CKTtime, dt_actual, ckt->CKTdelta, n, ev[0].name, ev[0].dG, ev[0].v_switch, ev[0].h_dot,
+                ev[0].posCntrl, ev[0].negCntrl, ev[0].dfdt_pos, ev[0].dfdt_neg, tau_max, g_salt_settle_until);
     return n;
 }
 
@@ -1106,6 +1290,17 @@ PSSsensRecordStep(CKTcircuit *ckt)
          * comment in this file for the derivation). */
         PSSsaltEvent salt_ev[PSS_SALT_MAX_EVENTS];
         int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
+
+        /* card #494 fifth pass (task 2): force backward Euler (L-stable)
+         * for the whole step, all columns, while a post-event settle
+         * window from a PREVIOUS event is still open -- see
+         * PSSsaltForceOrder1()'s header comment in pssshoot.h. Must run
+         * AFTER PSSsaltFindEvents() above (which may just have opened or
+         * extended the window from an event at THIS very step) and BEFORE
+         * `order` is used below. No-op (order unchanged) for every step
+         * of every deck with no sw event ever seen this run. */
+        if (PSSsaltForceOrder1(ckt))
+            order = 1;
 
     for (j = 0; j < n; j++) {
         memset(g_sens_rhs, 0, (size_t) (neq + 1) * sizeof(double));
