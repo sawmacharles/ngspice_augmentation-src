@@ -418,6 +418,479 @@ pss_solve_dense(double *A, double *b, int n, double *x)
  * and the card #458 report). */
 
 
+/* THIRD PASS (card #458, plan T4.1): one Newton attempt from a given
+ * starting point x0, with an iteration budget of its own (maxiter_this) --
+ * used both for a single full-budget attempt (when the deck's whole
+ * stabtime already ran, trust_radius<=0) and for the cheap, short-budget
+ * "probe" attempts the staged warm-up escalation in PSSshootDriven tries
+ * first (see that loop's own header comment for the warm-up side of this
+ * pass's speed work). This function is the OTHER half: two independent
+ * cuts to the ~2n+3-period-run cost of each Newton ITERATION, on top of
+ * whatever warm-up got it here:
+ *
+ *   - the second pass's "post-monodromy baseline re-run" (1 extra period
+ *     run every FD iteration) turns out to be dead weight: nothing
+ *     downstream of it actually needs a fresh x1 except a DEBUG print --
+ *     F[]/scale[] are already correct from the FIRST baseline call, before
+ *     the FD loop's own pss_state_get() calls overwrite x1 as scratch.
+ *     Fixed by giving the FD loop its own scratch buffer (`pert`) instead
+ *     of reusing x1, so the initial baseline survives untouched and that
+ *     re-run is simply not needed -- same F/Phi/x0 dataflow, one fewer
+ *     period run per FD Jacobian.
+ *   - Broyden rank-1 updates of the RAW monodromy estimate (not of
+ *     Phi-I -- the -I term is exact, never approximated) between full
+ *     finite-difference recomputes, the task's "or ... Broyden updates"
+ *     option, chosen over one-sided FD: one-sided differences were already
+ *     tried on this circuit in the second pass and gave no usable descent
+ *     direction (see the centred-difference comment below, kept
+ *     verbatim), so trying that again risked repeating a known failure.
+ *     Broyden carries no equivalent risk because it reuses function values
+ *     the line search was ALREADY computing for its own residual check --
+ *     no new perturbation grid, no new eps, nothing that could shift a
+ *     switch edge. After the first FD Jacobian in an attempt, an accepted
+ *     damped step already gives P(xtrial) for free -- that IS next
+ *     iteration's baseline P(x0), so a Broyden-updated iteration costs
+ *     only its line-search trial run(s) (typically 1, since a good
+ *     direction usually accepts alpha=1 immediately), not 2n+3. The
+ *     Jacobian is refreshed with a full FD sweep every broyden_period
+ *     iterations (default 4) as a safety net, and immediately, mid-
+ *     attempt, if a Broyden-based line search fails to find ANY decreasing
+ *     step or the Broyden matrix goes singular -- only a FRESH FD
+ *     Jacobian's own failure ends the attempt, so Broyden can only make a
+ *     converging case converge faster, never turn a converging case into
+ *     a failing one. The exact converged point is still checked against
+ *     the TRUE nonlinear residual (real P(x0) evaluations, no
+ *     approximation) either way -- Broyden only ever changes the SEARCH
+ *     DIRECTION, never what counts as converged.
+ *   - a trust-region cap on the first line-search trial's alpha (not on
+ *     the Newton direction itself, which is left as the solve produces
+ *     it): when trust_radius>0, the initial trial step is capped so no
+ *     state moves more than trust_radius*scale before backtracking is
+ *     even tried, then ordinary backtracking proceeds from there exactly
+ *     as before. A rougher (short-warm-up) starting point can give a
+ *     poorly-conditioned FD Jacobian, so this keeps a bad direction from
+ *     being taken at full stride before backtracking gets a chance to
+ *     correct it. trust_radius<=0 disables it (unrestricted alpha=1
+ *     start) -- used for the full-budget, full-stabtime attempt, which is
+ *     then byte-for-byte the second pass's own tested behaviour, kept as
+ *     the always-available fallback.
+ *
+ * Returns 1 = converged (x0/iter_out/residual_out hold the converged point;
+ * Phi_out, if non-NULL, holds the RAW monodromy estimate at that point --
+ * same quantity the pre-third-pass code called Phi, NOT Phi-I -- for the
+ * caller's Floquet-fallback path). Returns 0 for EVERY other outcome
+ * (budget exhausted, singular Jacobian, line search failure, or a period
+ * integration that did not complete) -- deliberately not distinguished
+ * further, so the caller's staged warm-up escalation has one uniform
+ * "this attempt did not confirm a steady state" signal to react to; x0 is
+ * left at its last ACCEPTED iterate (never a rejected/failed trial), and
+ * the specific cause was already printed to stderr when it happened. */
+static int
+pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
+                double *x0, int maxiter_this, double tol, double eps,
+                double trust_radius, int broyden_enabled, int broyden_period,
+                const char *stage_label,
+                int *iter_out, double *residual_out, double *Phi_out)
+{
+    int iter = 0, j, k, err;
+    double residual = 0.0;
+    double *x1 = NULL, *F = NULL, *scale = NULL, *delta_x = NULL,
+           *xtrial = NULL, *x1trial = NULL, *A = NULL, *b = NULL,
+           *M = NULL, *pert = NULL, *s = NULL, *y = NULL, *Ms = NULL;
+    int have_baseline = 0;   /* do x0/x1/F already hold a valid, just-run point? */
+    int recompute = 1;       /* does THIS iteration's Jacobian need a fresh FD sweep? */
+    int since_recompute = 0;
+    int result = 0;
+
+    x1      = TMALLOC(double, n);
+    F       = TMALLOC(double, n);
+    scale   = TMALLOC(double, n);
+    delta_x = TMALLOC(double, n);
+    xtrial  = TMALLOC(double, n);
+    x1trial = TMALLOC(double, n);
+    A       = TMALLOC(double, n * n);
+    b       = TMALLOC(double, n);
+    M       = TMALLOC(double, n * n);
+    pert    = TMALLOC(double, n);
+    s       = TMALLOC(double, n);
+    y       = TMALLOC(double, n);
+    Ms      = TMALLOC(double, n);
+    if (!x1 || !F || !scale || !delta_x || !xtrial || !x1trial || !A || !b ||
+        !M || !pert || !s || !y || !Ms) {
+        fprintf(stderr, "PSS-SHOOT: %s out of memory allocating Newton "
+                "scratch space.\n", stage_label);
+        result = 0;
+        goto newton_done;
+    }
+
+    for (iter = 0; ; iter++) {
+
+        if (!have_baseline) {
+            pss_state_set_ic(map, x0);
+            err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
+            if (err) {
+                fprintf(stderr, "PSS-SHOOT: %s period integration did not "
+                        "complete at Newton iteration %d (ngspice error "
+                        "%d); this is NOT a steady state.\n", stage_label, iter, err);
+                result = 0;
+                goto newton_done;
+            }
+            pss_state_get(map, ckt, x1);
+
+            /* Scale/floor: unchanged from the second pass -- see that
+             * pass's comment (kept verbatim in PSSshootDriven's history;
+             * not repeated here) for why a 1 mV floor, not near-zero. */
+            residual = 0.0;
+            for (k = 0; k < n; k++) {
+                double rng = fabs(x1[k]) > fabs(x0[k]) ? fabs(x1[k]) : fabs(x0[k]);
+                const double ABSTOL_FLOOR = 1e-3;
+                scale[k] = (rng > ABSTOL_FLOOR) ? rng : ABSTOL_FLOOR;
+                F[k] = x1[k] - x0[k];
+                {
+                    double r = fabs(F[k]) / scale[k];
+                    if (r > residual) residual = r;
+                }
+            }
+            have_baseline = 1;
+        }
+
+        fprintf(stdout, "PSS-SHOOT: %s iter=%d residual=%.6e%s\n", stage_label,
+                iter, residual, recompute ? "" : " (broyden)");
+        fflush(stdout);
+        if (getenv("PSS_SHOOT_DEBUG")) {
+            for (k = 0; k < n; k++)
+                fprintf(stderr, "DEBUG %s iter=%d k=%d %s x0=%.8g x1=%.8g "
+                        "F=%.4e scale=%.6g r=%.4e\n", stage_label,
+                        iter, k, map->refs[k].name, x0[k], x1[k], F[k],
+                        scale[k], fabs(F[k]) / scale[k]);
+        }
+
+        if (residual <= tol) {
+            /* THIRD-PASS GUARD, added after this pass's OWN testing found
+             * it necessary: reject a "converged" point where EVERY state
+             * is still at (or under) the ABSTOL_FLOOR scale floor -- the
+             * degenerate all-off fixed point this file's top-of-function
+             * comment already warns about (a converter sitting powered
+             * off is itself a self-consistent, non-switching P(0)=0
+             * solution). The original design relied ENTIRELY on the
+             * pre-Newton warm-up already being far from 0 to avoid this;
+             * that is no longer a safe assumption with a SHORT probe
+             * warm-up and a generous iteration budget -- found exactly
+             * this way on the R3 fixture: PSS_SHOOT_WARMUP_MAXITER=10
+             * from a 20-period probe converged (residual 1.1e-10, a
+             * seemingly excellent fit) onto vout~1.2e-7 V, not ~3.3V, a
+             * numerically real but physically wrong answer (and a
+             * telltale near-singular Phi~=I / Floquet dominant
+             * multiplier exactly 1+0i went with it). A real switching
+             * converter's TRUE orbit should not have every single state
+             * sitting at/under a millivolt/milliamp-scale floor at once,
+             * so this is a general, circuit-agnostic check, not a magic
+             * number tuned to R3 -- and it is applied at every stage,
+             * including a full-budget/full-stabtime one, since nothing
+             * before this pass actually proved the old code was immune
+             * to the same trap, only that it never happened to trigger
+             * it. A rejection here is treated exactly like any other
+             * "this attempt did not confirm a steady state" outcome:
+             * the staged caller extends the warm-up (or, on the final
+             * stage, reports the honest FAILED verdict) rather than
+             * silently accepting a wrong answer. */
+            int all_at_floor = 1;
+            for (k = 0; k < n; k++)
+                if (scale[k] > 1e-3 * (1.0 + 1e-9)) { all_at_floor = 0; break; }
+            if (all_at_floor) {
+                fprintf(stderr, "PSS-SHOOT: %s converged (residual=%.3e) "
+                        "but EVERY state is at/under the 1e-3 scale floor "
+                        "-- rejecting this as the degenerate all-off fixed "
+                        "point, not a trustworthy orbit.\n", stage_label,
+                        residual);
+                result = 0;
+                goto newton_done;
+            }
+            result = 1;
+            goto newton_done;
+        }
+        if (iter >= maxiter_this) {
+            result = 0;
+            goto newton_done;   /* out of this attempt's budget */
+        }
+
+        if (recompute) {
+            /* finite-difference monodromy: 2n extra period runs (centred
+             * differences, not the cheaper n forward differences the
+             * card's "n+1 period runs per Newton step" description allows
+             * -- found on the R3 fixture, second pass: one-sided
+             * differences gave a Newton direction whose backtrack line
+             * search approached the baseline residual from above for 24
+             * straight halvings without ever dipping below it, i.e.
+             * essentially no usable descent direction; centred
+             * differences cancel the O(h) bias one-sided differences
+             * carry and fixed it. `pert`, not x1, is the scratch buffer
+             * here (see this function's header comment) so the clean
+             * baseline x1/F/scale survive for the residual check above on
+             * every iteration, recompute or not. */
+            for (j = 0; j < n; j++) {
+                double h = fabs(x0[j]) * eps;
+                if (h < 1e-6) h = 1e-6;
+
+                for (k = 0; k < n; k++) xtrial[k] = x0[k];
+                xtrial[j] = x0[j] + h;
+                pss_state_set_ic(map, xtrial);
+                err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation +)", 0, 1);
+                if (err) {
+                    fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
+                            "run for state %s (+h) did not complete at "
+                            "Newton iteration %d (ngspice error %d).\n",
+                            stage_label, map->refs[j].name, iter, err);
+                    result = 0;
+                    goto newton_done;
+                }
+                pss_state_get(map, ckt, pert);
+                for (k = 0; k < n; k++) M[k * n + j] = pert[k];
+
+                for (k = 0; k < n; k++) xtrial[k] = x0[k];
+                xtrial[j] = x0[j] - h;
+                pss_state_set_ic(map, xtrial);
+                err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation -)", 0, 1);
+                if (err) {
+                    fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
+                            "run for state %s (-h) did not complete at "
+                            "Newton iteration %d (ngspice error %d).\n",
+                            stage_label, map->refs[j].name, iter, err);
+                    result = 0;
+                    goto newton_done;
+                }
+                pss_state_get(map, ckt, pert);
+                for (k = 0; k < n; k++)
+                    M[k * n + j] = (M[k * n + j] - pert[k]) / (2.0 * h);
+            }
+            since_recompute = 0;
+            /* M is the RAW monodromy estimate here (no -I baked in) --
+             * kept that way throughout (Broyden update below preserves
+             * it) so Phi_out is always a true Phi, and the -I is
+             * subtracted only into the disposable solve copy A just
+             * below, same as the pre-third-pass code did. */
+        }
+
+        for (k = 0; k < n * n; k++) A[k] = M[k];
+        for (k = 0; k < n; k++) A[k * n + k] -= 1.0;
+        for (k = 0; k < n; k++) b[k] = -F[k];
+
+        if (pss_solve_dense(A, b, n, delta_x)) {
+            if (!recompute) {
+                /* a stale Broyden estimate went singular -- not this
+                 * attempt's honest answer yet: force a fresh FD sweep and
+                 * retry from the SAME x0 (have_baseline is still valid,
+                 * so this costs only the 2n FD runs, not another
+                 * baseline) before giving up. */
+                fprintf(stdout, "PSS-SHOOT: %s iter=%d Broyden estimate "
+                        "went singular; forcing a fresh Jacobian.\n",
+                        stage_label, iter);
+                recompute = 1;
+                iter--;   /* this attempt does not count against the budget */
+                continue;
+            }
+            fprintf(stderr, "PSS-SHOOT: %s the monodromy matrix (Phi - I) "
+                    "is singular at Newton iteration %d; Newton cannot "
+                    "proceed this attempt.\n", stage_label, iter);
+            result = 0;
+            goto newton_done;
+        }
+
+        {
+            double maxratio = 0.0, alpha;
+            int bt, accepted = 0;
+            /* THIRD-PASS GUARD (added after this pass's own testing found
+             * it necessary, alongside the near-zero-floor guard above):
+             * an absolute sanity ceiling on trial state magnitudes, NOT
+             * scale-relative. The scale-relative trust-region cap above
+             * failed to prevent a real divergence found on the R3 fixture
+             * (PSS_SHOOT_WARMUP_MAXITER=10 from a 20-period probe): a
+             * compensator integrator state (C:coa/C:c1f/C:c2f) railed to
+             * ~1e5 V while the power-stage states (vout, i(L1), ...) sat
+             * near 0, and Newton found an exact (residual~1e-10)
+             * mathematical fixed point of THAT combination -- because
+             * scale[] is itself derived from the current (already-
+             * diverging) x0/x1, a trust region measured relative to scale
+             * cannot catch a state that is diverging together with its
+             * own yardstick. An absolute ceiling has no such blind spot:
+             * no state in any of this project's reference circuits
+             * (volts, amps, duty-cycle-scaled internal nodes) belongs
+             * anywhere near 1e4 of its own native unit, so a trial that
+             * crosses it is rejected outright -- treated exactly like a
+             * failed integration (skip the period run, just halve alpha
+             * again), never accepted, and never even charged a period
+             * run. PSS_SHOOT_MAX_STATE overrides (debug env var, no
+             * effect unless set, same pattern as the others). */
+            double max_state = getenv("PSS_SHOOT_MAX_STATE") ?
+                                atof(getenv("PSS_SHOOT_MAX_STATE")) : 1e4;
+
+            for (k = 0; k < n; k++) {
+                double r = fabs(delta_x[k]) / scale[k];
+                if (r > maxratio) maxratio = r;
+            }
+            alpha = 1.0;
+            if (trust_radius > 0.0 && maxratio > trust_radius)
+                alpha = trust_radius / maxratio;
+
+            /* 24, not 8: see the second-pass comment (kept verbatim in
+             * this function's git history) on why a fast/stiff coordinate
+             * can need quite a few halvings before the trial residual
+             * actually dips below the baseline. */
+            for (bt = 0; bt < 24; bt++) {
+                int sane = 1;
+                for (k = 0; k < n; k++) {
+                    xtrial[k] = x0[k] + alpha * delta_x[k];
+                    if (fabs(xtrial[k]) > max_state) sane = 0;
+                }
+                if (!sane) {
+                    if (getenv("PSS_SHOOT_DEBUG"))
+                        fprintf(stderr, "DEBUG %s iter=%d bt=%d alpha=%g "
+                                "trial exceeds the %.3g sanity ceiling -- "
+                                "rejected without running it.\n",
+                                stage_label, iter, bt, alpha, max_state);
+                    alpha *= 0.5;
+                    continue;
+                }
+
+                pss_state_set_ic(map, xtrial);
+                /* NOT forced -- see the second-pass comment (kept
+                 * verbatim in this function's git history): a damped
+                 * trial point can be a full Newton step away from x0, so
+                 * it wants its own natural adaptive grid. */
+                err = pss_run_period_ex(ckt, T, "PSS shoot (damped-step trial)", 0, 0);
+                if (!err) {
+                    double newresidual = 0.0;
+                    pss_state_get(map, ckt, x1trial);
+                    for (k = 0; k < n; k++) {
+                        double r = fabs(x1trial[k] - xtrial[k]) / scale[k];
+                        if (r > newresidual) newresidual = r;
+                    }
+                    if (getenv("PSS_SHOOT_DEBUG"))
+                        fprintf(stderr, "DEBUG %s iter=%d bt=%d alpha=%g "
+                                "newresidual=%.6e\n", stage_label, iter, bt,
+                                alpha, newresidual);
+                    if (newresidual < residual) {
+                        accepted = 1;
+                        break;
+                    }
+                }
+                alpha *= 0.5;
+            }
+            if (!accepted) {
+                if (!recompute) {
+                    /* Broyden's approximate direction did not help --
+                     * not this attempt's honest answer yet: force a
+                     * fresh FD sweep from the SAME x0 and retry, mirroring
+                     * the singular-matrix retry above. */
+                    fprintf(stdout, "PSS-SHOOT: %s iter=%d Broyden step did "
+                            "not reduce the residual; forcing a fresh "
+                            "Jacobian.\n", stage_label, iter);
+                    recompute = 1;
+                    iter--;
+                    continue;
+                }
+                fprintf(stderr, "PSS-SHOOT: %s the damped Newton step did "
+                        "not reduce the orbit residual at iteration %d "
+                        "this attempt.\n", stage_label, iter);
+                result = 0;
+                goto newton_done;
+            }
+
+            /* Broyden bookkeeping on the RAW monodromy estimate M (see
+             * this function's header comment for why not on Phi-I): the
+             * secant target for the CHANGE IN P (not in F) is
+             * dP = P(xtrial)-P(x0) = (F(xtrial)-F(x0)) + s, since
+             * F(x)=P(x)-x exactly. x1trial (= P(xtrial), already run
+             * above for the line search) becomes next iteration's
+             * baseline P(x0) for free -- no extra period run needed for a
+             * Broyden-updated iteration. */
+            for (k = 0; k < n; k++) {
+                s[k] = xtrial[k] - x0[k];
+                y[k] = (x1trial[k] - xtrial[k]) - F[k];   /* y = F(xtrial)-F(x0) */
+            }
+            if (broyden_enabled) {
+                double sTs = 0.0;
+                for (k = 0; k < n; k++) sTs += s[k] * s[k];
+                if (sTs > 1e-300) {
+                    for (k = 0; k < n; k++) {
+                        double rowsum = 0.0;
+                        for (j = 0; j < n; j++) rowsum += M[k * n + j] * s[j];
+                        Ms[k] = rowsum;
+                    }
+                    for (k = 0; k < n; k++) {
+                        double dP_k = y[k] + s[k];   /* dP = y_F + s */
+                        double coef = (dP_k - Ms[k]) / sTs;
+                        for (j = 0; j < n; j++)
+                            M[k * n + j] += coef * s[j];
+                    }
+                }
+            }
+
+            /* x1trial/xtrial are next iteration's baseline P(x0)/x0 for
+             * free (no extra period run) -- but residual/scale must still
+             * be RECOMPUTED from them (pure arithmetic, no run) exactly as
+             * the top-of-loop baseline block would: the original,
+             * pre-third-pass code recomputed scale fresh from the CURRENT
+             * x0/x1 every iteration (only holding it fixed WITHIN one
+             * iteration's own backtracking trials, per the comment above),
+             * so reusing free P(xtrial) data without also refreshing
+             * residual/scale here would silently freeze both at their
+             * iteration-0 values -- found exactly this way on the R2
+             * fixture (n=1) during this pass's own testing: the debug F/r
+             * printed correctly shrinking every iteration while the
+             * convergence check kept comparing a STALE, never-updated
+             * residual and looped for the full 25-iteration budget
+             * without ever seeing it drop below tol. */
+            for (k = 0; k < n; k++) {
+                x0[k] = xtrial[k];
+                x1[k] = x1trial[k];
+                F[k]  = x1trial[k] - xtrial[k];
+            }
+            residual = 0.0;
+            for (k = 0; k < n; k++) {
+                double rng = fabs(x1[k]) > fabs(x0[k]) ? fabs(x1[k]) : fabs(x0[k]);
+                const double ABSTOL_FLOOR = 1e-3;
+                scale[k] = (rng > ABSTOL_FLOOR) ? rng : ABSTOL_FLOOR;
+                {
+                    double r = fabs(F[k]) / scale[k];
+                    if (r > residual) residual = r;
+                }
+            }
+            have_baseline = 1;   /* next loop iteration reuses this baseline */
+
+            since_recompute++;
+            recompute = (!broyden_enabled) ||
+                        (broyden_period > 0 && since_recompute >= broyden_period);
+        }
+    }
+
+ newton_done:
+    if (result) {
+        *iter_out = iter;
+        *residual_out = residual;
+    } else {
+        *iter_out = iter;
+        *residual_out = residual;
+    }
+    if (Phi_out && M)
+        for (k = 0; k < n * n; k++) Phi_out[k] = M[k];
+    if (x1) tfree(x1);
+    if (F) tfree(F);
+    if (scale) tfree(scale);
+    if (delta_x) tfree(delta_x);
+    if (xtrial) tfree(xtrial);
+    if (x1trial) tfree(x1trial);
+    if (A) tfree(A);
+    if (b) tfree(b);
+    if (M) tfree(M);
+    if (pert) tfree(pert);
+    if (s) tfree(s);
+    if (y) tfree(y);
+    if (Ms) tfree(Ms);
+    return result;
+}
+
+
 /* ------------------------------------------------------------------ */
 
 int
@@ -506,300 +979,214 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         goto shoot_cleanup;
     }
 
-    /* Newton's starting guess. The deck's raw IC=/.ic values (usually all
-     * zero on the reactive states) are very often themselves an exact,
-     * degenerate fixed point of the one-period map -- a converter sitting
-     * powered-off with its compensator/comparator at whatever CKTop finds
-     * from a cold start is self-consistent and non-switching, so P(0)=0
-     * and Newton "converges" to that in a couple of iterations without
-     * ever seeing the real orbit (found running the first R3 smoke test
-     * this way: it reported CONVERGED with v(vout)~1e-7, not ~3.3V). A
-     * plain `.tran` from the same cold start does NOT get stuck there,
-     * because its comparator/ramp/op-amp dynamics carry continuous history
-     * across many periods; a single one-period Newton evaluation has none
-     * of that. So: reuse the existing `stabtime` PSS parameter (already
-     * parsed from the .pss card, previously only meaningful to the old
-     * algorithm's own STABILIZATION phase) to run one ordinary transient
-     * first and seed x0 from wherever THAT lands -- close enough to the
-     * true orbit for Newton to find it instead of the degenerate one. */
-    if (ckt->CKTstabTime > 0.0) {
-        fprintf(stdout, "\nPSS-SHOOT: pre-stabilizing with a %.6g s "
-                "transient (stabtime, ~%.0f periods) before the first "
-                "Newton guess...\n", ckt->CKTstabTime, ckt->CKTstabTime / T);
+    /* THIRD PASS (card #458, plan T4.1): staged warm-up escalation,
+     * replacing the second pass's single "always burn the whole stabtime"
+     * pre-stabilization transient below. Why a warm-up is needed at all
+     * (kept from the second pass): the deck's raw IC=/.ic values (usually
+     * all zero on the reactive states) are very often themselves an
+     * exact, degenerate fixed point of the one-period map -- a converter
+     * sitting powered-off with its compensator/comparator at whatever
+     * CKTop finds from a cold start is self-consistent and non-switching,
+     * so P(0)=0 and Newton "converges" to that in a couple of iterations
+     * without ever seeing the real orbit (found running the first R3
+     * smoke test this way: it reported CONVERGED with v(vout)~1e-7, not
+     * ~3.3V). A plain `.tran` from the same cold start does NOT get stuck
+     * there, because its comparator/ramp/op-amp dynamics carry continuous
+     * history across many periods; a single one-period Newton evaluation
+     * has none of that.
+     *
+     * Why STAGE it (this pass's own change, task 1 -- speed): `stabtime`
+     * is a `.pss` card parameter the deck authors calibrated to how long
+     * a PLAIN `.tran` needs to fully settle the orbit's amplitude AND
+     * phase (refs/r3_vm_buck.cir etc. reuse it for exactly that, unrelated
+     * to this shooter). That is a far more conservative warm-up than
+     * Newton actually needs: once the state is INSIDE Newton's basin of
+     * attraction -- not necessarily fully settled -- quadratic convergence
+     * covers the remaining distance in a handful of iterations, which is
+     * exactly what the second pass's own report already showed (R3: 4
+     * iterations, R4: 5) once it got a working starting point. So: try a
+     * SHORT warm-up first (tens of periods, not hundreds), and only pay
+     * for more if that probe was not enough -- bounded above by the
+     * deck's own stabtime, i.e. never worse than the second pass's
+     * approach in the worst case (a circuit that genuinely needs the
+     * whole stabtime, or genuinely never converges at all -- the D~0.55/
+     * x20 red-proof decks -- ends up running it anyway, in stages, before
+     * reporting the same honest verdict).
+     *
+     * Every stage is an INTEGER number of clock periods (kept that way
+     * below), so a fresh DCtran() restarting at t=0 for the next, longer
+     * stage reproduces the same instant in the clock-referenced waveforms
+     * (Vramp et al.) that truly continuing the trajectory would -- not an
+     * approximation, since every reactive state that carries memory
+     * across periods is already in x (this file's top-of-file design
+     * comment); the only "state" a restart loses is the phase of periodic
+     * sources synchronised to the deck's own t=0, which an integer-period
+     * stage boundary preserves exactly (a period-periodic source is back
+     * in phase with its own t=0 after any whole number of periods).
+     *
+     * A non-final stage's own Newton attempt gets a SHORT iteration
+     * budget (a fast "is this warm-up already enough" probe,
+     * PSS_SHOOT_WARMUP_MAXITER, default 6) and a trust-region cap on its
+     * first line-search trial (PSS_SHOOT_TRUST_RADIUS, default 5
+     * scale-units -- see pss_newton_run()'s header comment for why). The
+     * FINAL stage (cumulative warm-up == the deck's own stabtime) gets
+     * the deck's full Newton budget and NO trust-region cap -- i.e. is
+     * byte-for-byte the second pass's own single attempt, kept as the
+     * always-available fallback so a circuit that genuinely needs the
+     * full stabtime sees exactly the second pass's tested behaviour, and
+     * the red-proof decks see exactly the second pass's tested (correct)
+     * non-convergence verdict, just possibly after some cheaper stages
+     * were tried and correctly judged insufficient first.
+     *
+     * A stage that neither converges nor is final reverts x0 to the
+     * WARM-UP TRANSIENT's own endpoint (discarding that stage's failed
+     * Newton wandering, not building on it) before extending the warm-up
+     * -- so a bad probe never contaminates the next, longer one.
+     *
+     * See the card #458 (third pass) report for the speed measured this
+     * way on R2/R3/R4 against the settled-.tran definition (plan item 1),
+     * and PSS_SHOOT_WARMUP_PERIODS/_MAXITER/_GROWTH, PSS_SHOOT_TRUST_RADIUS,
+     * PSS_SHOOT_BROYDEN/_PERIOD for the sweep this pass's defaults were
+     * chosen from (all debug env vars, no effect unless set, same
+     * pattern as the existing PSS_SHOOT_EPS/_RELTOL/_NO_FORCE/_DEBUG). */
+    {
+        double warmup_periods  = 20.0;
+        int    warmup_maxiter  = 6;
+        double trust_radius    = 5.0;
+        double warmup_growth   = 2.0;
+        int    broyden_enabled = 1;
+        int    broyden_period  = 4;
+
+        if (getenv("PSS_SHOOT_WARMUP_PERIODS")) warmup_periods = atof(getenv("PSS_SHOOT_WARMUP_PERIODS"));
+        if (warmup_periods < 1.0) warmup_periods = 1.0;
+        if (getenv("PSS_SHOOT_WARMUP_MAXITER")) warmup_maxiter = atoi(getenv("PSS_SHOOT_WARMUP_MAXITER"));
+        if (warmup_maxiter < 1) warmup_maxiter = 1;
+        if (getenv("PSS_SHOOT_TRUST_RADIUS")) trust_radius = atof(getenv("PSS_SHOOT_TRUST_RADIUS"));
+        if (getenv("PSS_SHOOT_WARMUP_GROWTH")) warmup_growth = atof(getenv("PSS_SHOOT_WARMUP_GROWTH"));
+        if (warmup_growth < 1.01) warmup_growth = 1.01;
+        if (getenv("PSS_SHOOT_BROYDEN")) broyden_enabled = atoi(getenv("PSS_SHOOT_BROYDEN"));
+        if (getenv("PSS_SHOOT_BROYDEN_PERIOD")) broyden_period = atoi(getenv("PSS_SHOOT_BROYDEN_PERIOD"));
+
+        /* Tightened reltol for Newton's OWN (single-period) runs only --
+         * same value (1e-5), same rationale as the second pass. THIRD-PASS
+         * CHANGE: no longer set once for the rest of the function. With
+         * staged warm-up, a "rest of the function" tightening would also
+         * apply to every warm-up TRANSIENT stage after the first -- and a
+         * multi-period warm-up transient at this tighter tolerance fails
+         * outright on R3 ("Timestep too small" at the pwm switch node,
+         * found running this pass's own first build: a 20-period probe
+         * stage that never even reached Newton). So the tightening is now
+         * bracketed tightly around each pss_newton_run() call below (set
+         * just before, restored to save_reltol just after) -- every
+         * warm-up transient, including stage 2+, runs at the deck's own
+         * (looser) tolerance, exactly like the second pass's single
+         * pre-stabilization transient did. PSS_SHOOT_RELTOL still
+         * overrides; never reaches abstol/voltTol. */
+        double tight_reltol = getenv("PSS_SHOOT_RELTOL") ? atof(getenv("PSS_SHOOT_RELTOL")) : 1e-5;
+        if (tight_reltol > save_reltol || tight_reltol <= 0.0) tight_reltol = save_reltol;
+
+        maxiter = (job->sc_iter > 0) ? job->sc_iter : 20;
+        tol     = (job->steady_coeff > 0.0) ? job->steady_coeff : 1e-6;
+        /* Finite-difference perturbation size for the monodromy columns --
+         * unchanged from the second pass (see that pass's comment, kept
+         * in this file's git history, for the eps/reltol sweep this value
+         * came from). PSS_SHOOT_EPS still overrides. */
+        eps     = 1e-5;
+        if (getenv("PSS_SHOOT_EPS"))
+            eps = atof(getenv("PSS_SHOOT_EPS"));
+
+        fprintf(stdout, "\nPSS-SHOOT: shooting-Newton PSS, period T=%g s "
+                "(f=%g Hz), %d state(s):", T, ckt->CKTguessedFreq, n);
+        for (k = 0; k < n; k++)
+            fprintf(stdout, " %s", map.refs[k].name);
+        fprintf(stdout, "; max %d Newton iterations, tol %g\n", maxiter, tol);
         fflush(stdout);
-        err = pss_run_period(ckt, ckt->CKTstabTime,
-                              "PSS shoot (pre-stabilization transient)");
-        if (err) {
-            fprintf(stderr, "PSS-SHOOT: FAILED -- the pre-stabilization "
-                    "transient (stabtime=%g) did not complete (ngspice "
-                    "error %d).\n", ckt->CKTstabTime, err);
-            goto shoot_cleanup;
-        }
-        pss_state_get(&map, ckt, x0);
-    } else {
-        pss_state_get_ic(&map, x0);
-    }
 
-    /* Tighten reltol to 1e-5 for the Newton loop's own (single-period)
-     * runs -- a middle ground found empirically on the R3 fixture on this
-     * card: the default (1e-3) leaves enough per-step solve noise that
-     * finite-difference Newton plateaus around residual ~1e-4 and never
-     * reaches tol; 1e-6 (tried first) pushes R3's steep tanh switch-node
-     * transition past what CKTdelmin can resolve ("Timestep too small").
-     * 1e-5 converges R3 cleanly (see the card #458 report for the
-     * eps/reltol sweep). Only ever applied AFTER pre-stabilization (see
-     * save_reltol's capture above) -- the long multi-period warm-up
-     * transient is left at the deck's own tolerance. PSS_SHOOT_RELTOL
-     * overrides for debugging. */
-    ckt->CKTreltol = getenv("PSS_SHOOT_RELTOL") ? atof(getenv("PSS_SHOOT_RELTOL")) : 1e-5;
-    if (ckt->CKTreltol > save_reltol) ckt->CKTreltol = save_reltol;
-    if (ckt->CKTreltol <= 0.0) ckt->CKTreltol = save_reltol;
+        if (ckt->CKTstabTime <= 0.0) {
+            pss_state_get_ic(&map, x0);
+            ckt->CKTreltol = tight_reltol;
+            converged_flag = pss_newton_run(ckt, &map, T, n, x0, maxiter,
+                                             tol, eps, -1.0, broyden_enabled,
+                                             broyden_period, "[no warm-up]",
+                                             &iter, &residual, Phi);
+            ckt->CKTreltol = save_reltol;
+        } else {
+            double stage_len = warmup_periods * T;
+            double cumulative = 0.0;
+            double *x0_stage_start = TMALLOC(double, n);
+            int stage = 0;
 
-    maxiter = (job->sc_iter > 0) ? job->sc_iter : 20;
-    tol     = (job->steady_coeff > 0.0) ? job->steady_coeff : 1e-6;
-    /* Finite-difference perturbation size for the monodromy columns.
-     * SUSPECTED CAUSE 2 second-pass fix: pss_run_period_ex(..., force=1)
-     * below forces the +-h perturbation runs onto the SAME accepted time
-     * grid as the baseline (see pssshoot.h), which removes the adaptive-
-     * step-sequence noise the first pass's eps=1e-2 had to sit above.
-     * With that noise source gone (and reltol tightened just above), eps
-     * can shrink a lot: found on the R3 fixture that eps=1e-2 now
-     * actively HURTS (the FD perturbation itself becomes large enough to
-     * shift the switch edge, and forcing the unperturbed grid onto that
-     * shifted trajectory biases the estimate -- Newton stalled/failed at
-     * iteration 1-2), while eps=1e-5 converges R3 in 4 iterations
-     * (residual 2.9e-7) instead of the first pass's 52. */
-    eps     = 1e-5;
-    if (getenv("PSS_SHOOT_EPS"))
-        eps = atof(getenv("PSS_SHOOT_EPS"));
-
-    fprintf(stdout, "\nPSS-SHOOT: shooting-Newton PSS, period T=%g s "
-            "(f=%g Hz), %d state(s):", T, ckt->CKTguessedFreq, n);
-    for (k = 0; k < n; k++)
-        fprintf(stdout, " %s", map.refs[k].name);
-    fprintf(stdout, "; max %d Newton iterations, tol %g\n", maxiter, tol);
-    fflush(stdout);
-
-    for (iter = 0; ; iter++) {
-
-        pss_state_set_ic(&map, x0);
-        err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
-        if (err) {
-            fprintf(stderr, "PSS-SHOOT: FAILED -- period integration did "
-                    "not complete at Newton iteration %d (ngspice error "
-                    "%d); this is NOT a steady state.\n", iter, err);
-            goto shoot_fail;
-        }
-        pss_state_get(&map, ckt, x1);
-
-        /* Scale: max(|x0|,|x1|), floored at ABSTOL_FLOOR -- not the
-         * near-zero floor (1e-12) tried first. Found on the R3 fixture:
-         * a compensator summing-node voltage (C3in) sits at ~0.9 mV in the
-         * true orbit, so a purely relative scale amplifies its few-tens-
-         * of-microvolt error into a ~0.057 "residual", swamping every
-         * other (properly O(volts)) state and making the max-norm
-         * residual both numerically noisy (small absolute noise -> huge
-         * relative swings near zero) and a bad line-search metric --
-         * backtracking could not find ANY step, at any alpha down to
-         * 1e-7, that reduced this dominated-by-noise max. A 1 mV floor
-         * (chosen against this circuit's ripple scales -- vout's ripple
-         * is ~5 mV per refs/README.md, so this floor is smaller than a
-         * physically meaningful ripple and only suppresses the near-zero
-         * node's blow-up) fixed it outright. */
-        residual = 0.0;
-        for (k = 0; k < n; k++) {
-            double rng = fabs(x1[k]) > fabs(x0[k]) ? fabs(x1[k]) : fabs(x0[k]);
-            const double ABSTOL_FLOOR = 1e-3;
-            scale[k] = (rng > ABSTOL_FLOOR) ? rng : ABSTOL_FLOOR;
-            F[k] = x1[k] - x0[k];
-            {
-                double r = fabs(F[k]) / scale[k];
-                if (r > residual) residual = r;
+            if (!x0_stage_start) {
+                err = E_NOMEM;
+                goto shoot_cleanup;
             }
-        }
-        fprintf(stdout, "PSS-SHOOT: iter=%d residual=%.6e\n", iter, residual);
-        fflush(stdout);
-        if (getenv("PSS_SHOOT_DEBUG")) {
-            for (k = 0; k < n; k++)
-                fprintf(stderr, "DEBUG iter=%d k=%d %s x0=%.8g x1=%.8g "
-                        "F=%.4e scale=%.6g r=%.4e\n",
-                        iter, k, map.refs[k].name, x0[k], x1[k], F[k],
-                        scale[k], fabs(F[k]) / scale[k]);
-        }
+            pss_state_get_ic(&map, x0);
 
-        if (residual <= tol) {
-            converged_flag = 1;
-            break;
-        }
-        if (iter >= maxiter)
-            break;   /* out of iterations -- reported as FAILED below */
+            for (;;) {
+                int last_stage, this_maxiter;
+                double this_trust;
+                char label[64];
 
-        /* finite-difference monodromy: 2n extra period runs (centred
-         * differences, not the cheaper n forward differences the card's
-         * "n+1 period runs per Newton step" description allows -- found on
-         * the R3 fixture that one-sided differences gave a Newton
-         * direction whose backtrack line search approached the baseline
-         * residual from above for 24 straight halvings without ever
-         * dipping below it, i.e. essentially no usable descent direction;
-         * centred differences cancel the O(h) bias one-sided differences
-         * carry and fixed it. Costs 2n period runs instead of n+1 per
-         * Newton step -- still cheap at this n. */
-        for (j = 0; j < n; j++) {
-            double h = fabs(x0[j]) * eps;
-            if (h < 1e-6)
-                h = 1e-6;
+                stage++;
+                if (stage_len > ckt->CKTstabTime - cumulative)
+                    stage_len = ckt->CKTstabTime - cumulative;
+                cumulative += stage_len;
+                last_stage = (cumulative >= ckt->CKTstabTime - 1e-15 * ckt->CKTstabTime);
 
-            for (k = 0; k < n; k++)
-                xtrial[k] = x0[k];
-            xtrial[j] = x0[j] + h;
-            pss_state_set_ic(&map, xtrial);
-            err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation +)", 0, 1);
-            if (err) {
-                fprintf(stderr, "PSS-SHOOT: FAILED -- monodromy "
-                        "perturbation run for state %s (+h) did not "
-                        "complete at Newton iteration %d (ngspice error "
-                        "%d).\n", map.refs[j].name, iter, err);
-                goto shoot_fail;
-            }
-            pss_state_get(&map, ckt, x1trial);
-            for (k = 0; k < n; k++)
-                Phi[k * n + j] = x1trial[k];   /* stash P(x0+h e_j), col j */
+                fprintf(stdout, "\nPSS-SHOOT: pre-stabilizing (stage %d%s) "
+                        "with a %.6g s transient (~%.0f periods, %.6g s "
+                        "cumulative of %.6g s stabtime)...\n", stage,
+                        last_stage ? ", final" : ", probe", stage_len,
+                        stage_len / T, cumulative, ckt->CKTstabTime);
+                fflush(stdout);
 
-            for (k = 0; k < n; k++)
-                xtrial[k] = x0[k];
-            xtrial[j] = x0[j] - h;
-            pss_state_set_ic(&map, xtrial);
-            err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation -)", 0, 1);
-            if (err) {
-                fprintf(stderr, "PSS-SHOOT: FAILED -- monodromy "
-                        "perturbation run for state %s (-h) did not "
-                        "complete at Newton iteration %d (ngspice error "
-                        "%d).\n", map.refs[j].name, iter, err);
-                goto shoot_fail;
-            }
-            pss_state_get(&map, ckt, x1);   /* reuse x1 as scratch for P(x0-h e_j) */
-            for (k = 0; k < n; k++)
-                Phi[k * n + j] = (Phi[k * n + j] - x1[k]) / (2.0 * h);
-        }
-
-        /* x1 was overwritten as perturbation scratch above -- recompute the
-         * true baseline P(x0) once more for the F(x0) used below (cheap:
-         * one extra period run, traded for centred-difference accuracy). */
-        pss_state_set_ic(&map, x0);
-        /* Not forced: this replays x0 itself (the same point the very
-         * first call in this iteration already ran under record=1), so it
-         * is deterministic either way -- forcing adds no benefit here. */
-        err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline, post-monodromy)", 0, 0);
-        if (err) {
-            fprintf(stderr, "PSS-SHOOT: FAILED -- baseline period "
-                    "integration did not complete after the monodromy "
-                    "sweep at Newton iteration %d (ngspice error %d).\n",
-                    iter, err);
-            goto shoot_fail;
-        }
-        pss_state_get(&map, ckt, x1);
-
-        for (k = 0; k < n * n; k++) A[k] = Phi[k];
-        for (k = 0; k < n; k++) A[k * n + k] -= 1.0;
-        for (k = 0; k < n; k++) b[k] = -F[k];
-
-        if (pss_solve_dense(A, b, n, delta_x)) {
-            fprintf(stderr, "PSS-SHOOT: FAILED -- the monodromy matrix "
-                    "(Phi - I) is singular at Newton iteration %d; Newton "
-                    "cannot proceed.\n", iter);
-            goto shoot_fail;
-        }
-        if (getenv("PSS_SHOOT_DEBUG")) {
-            fprintf(stderr, "DEBUG iter=%d x0:", iter);
-            for (k = 0; k < n; k++) fprintf(stderr, " %.6g", x0[k]);
-            fprintf(stderr, "\nDEBUG iter=%d x1:", iter);
-            for (k = 0; k < n; k++) fprintf(stderr, " %.6g", x1[k]);
-            fprintf(stderr, "\nDEBUG iter=%d F:", iter);
-            for (k = 0; k < n; k++) fprintf(stderr, " %.6g", F[k]);
-            fprintf(stderr, "\nDEBUG iter=%d delta_x:", iter);
-            for (k = 0; k < n; k++) fprintf(stderr, " %.6g", delta_x[k]);
-            fprintf(stderr, "\nDEBUG iter=%d Phi diag:", iter);
-            for (k = 0; k < n; k++) fprintf(stderr, " %.6g", Phi[k*n+k]);
-            fprintf(stderr, "\n");
-        }
-
-        {
-            double alpha = 1.0;
-            int bt, accepted = 0;
-            /* 24, not 8: found on the R3 fixture that a Newton direction
-             * dominated by a fast/stiff coordinate (Phi diagonal ~1e-7 for
-             * the switch-node capacitor, i.e. it forgets its own initial
-             * value almost completely every period, but couples strongly
-             * to the other columns) can need quite a few halvings before
-             * the trial residual actually dips below the baseline -- the
-             * backtrack sequence was still monotonically approaching (not
-             * yet below) the baseline residual at the old limit of 8. */
-            for (bt = 0; bt < 24; bt++) {
-                for (k = 0; k < n; k++)
-                    xtrial[k] = x0[k] + alpha * delta_x[k];
-
-                pss_state_set_ic(&map, xtrial);
-                /* NOT forced (unlike the FD monodromy columns above): a
-                 * damped trial point x0+alpha*delta_x can be a full Newton
-                 * step away from x0, not an infinitesimal perturbation, so
-                 * there is no reason its true trajectory should retrace
-                 * x0's own accepted grid near a switch edge -- found on
-                 * the R3 fixture that forcing it anyway made the residual
-                 * oscillate for 20+ iterations instead of converging
-                 * (the forced grid was measuring the trial point's
-                 * residual at the WRONG place relative to its own,
-                 * shifted switching edge, corrupting the line search this
-                 * block is trying to do). This call evaluates the actual
-                 * nonlinear residual F(xtrial), not a finite difference,
-                 * so it wants its own natural adaptive grid, same as
-                 * before this card. */
-                err = pss_run_period_ex(ckt, T, "PSS shoot (damped-step trial)", 0, 0);
-                if (!err) {
-                    double newresidual = 0.0;
-                    pss_state_get(&map, ckt, x1trial);
-                    /* Reuse the SAME scale[] the baseline residual above was
-                     * measured with (not a fresh max(|xtrial|,|x1trial|) per
-                     * trial) -- a per-trial rescale let the metric drift
-                     * along with the trial point itself and was part of why
-                     * the line search on the R3 fixture could not find a
-                     * usable step (compounding the near-zero-state scaling
-                     * bug fixed above). A fixed reference scale for the
-                     * whole Newton iteration is the standard, well-behaved
-                     * choice. */
-                    for (k = 0; k < n; k++) {
-                        double r = fabs(x1trial[k] - xtrial[k]) / scale[k];
-                        if (r > newresidual) newresidual = r;
-                    }
-                    if (getenv("PSS_SHOOT_DEBUG"))
-                        fprintf(stderr, "DEBUG iter=%d bt=%d alpha=%g "
-                                "newresidual=%.6e\n", iter, bt, alpha, newresidual);
-                    /* Strict decrease only -- an earlier version also
-                     * force-accepted once alpha got small regardless of
-                     * whether the step helped, which let Newton "wander"
-                     * at a roughly constant residual for many iterations
-                     * instead of either converging or failing cleanly
-                     * (found on the R3 fixture: residual oscillated
-                     * around 0.02-0.06 for 25 iterations without ever
-                     * reaching tol). Failing here is the honest outcome
-                     * when even a tiny step does not help. */
-                    if (newresidual < residual) {
-                        accepted = 1;
-                        break;
-                    }
+                pss_state_set_ic(&map, x0);
+                err = pss_run_period(ckt, stage_len,
+                                      "PSS shoot (pre-stabilization transient)");
+                if (err) {
+                    fprintf(stderr, "PSS-SHOOT: FAILED -- the pre-"
+                            "stabilization transient (stage %d, %.6g s) did "
+                            "not complete (ngspice error %d).\n", stage,
+                            stage_len, err);
+                    tfree(x0_stage_start);
+                    goto shoot_cleanup;
                 }
-                alpha *= 0.5;
+                pss_state_get(&map, ckt, x0);
+                for (k = 0; k < n; k++) x0_stage_start[k] = x0[k];
+
+                this_maxiter = last_stage ? maxiter : warmup_maxiter;
+                this_trust   = last_stage ? -1.0 : trust_radius;
+                snprintf(label, sizeof label, "[stage %d/%s]", stage,
+                         last_stage ? "final" : "probe");
+                ckt->CKTreltol = tight_reltol;
+                converged_flag = pss_newton_run(ckt, &map, T, n, x0,
+                                                 this_maxiter, tol, eps,
+                                                 this_trust, broyden_enabled,
+                                                 broyden_period, label,
+                                                 &iter, &residual, Phi);
+                ckt->CKTreltol = save_reltol;
+                if (converged_flag || last_stage)
+                    break;
+
+                for (k = 0; k < n; k++) x0[k] = x0_stage_start[k];
+                fprintf(stdout, "PSS-SHOOT: stage %d (%.6g s, ~%.0f "
+                        "periods) was not enough; extending the warm-up.\n",
+                        stage, stage_len, stage_len / T);
+                fflush(stdout);
+                stage_len *= warmup_growth;
             }
-            if (!accepted) {
-                fprintf(stderr, "PSS-SHOOT: FAILED -- the damped Newton "
-                        "step did not reduce the orbit residual at "
-                        "iteration %d; no plain-transient fallback is "
-                        "implemented (card #458, what was not done).\n",
-                        iter);
-                goto shoot_fail;
-            }
-            for (k = 0; k < n; k++)
-                x0[k] = xtrial[k];
+            tfree(x0_stage_start);
         }
+
+        /* Re-tighten for the Floquet re-evaluation and the final
+         * trajectory-output run below, same as the second pass (which
+         * left reltol tightened from before its own single Newton loop
+         * all the way through both of those) -- the per-call bracketing
+         * above only needed to keep the WARM-UP TRANSIENT stages loose;
+         * once staging is done, tight_reltol is what the rest of this
+         * function should run at. Restored to save_reltol only at
+         * shoot_cleanup, as before. */
+        ckt->CKTreltol = tight_reltol;
     }
 
     if (!converged_flag) {
