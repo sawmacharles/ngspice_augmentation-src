@@ -554,6 +554,7 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
     }
     g_pac_exact_jac = getenv("PAC_EXACT_JACOBIAN") != NULL;
     g_pac_failed = 0;
+    PSSsaltReset();   /* card #494 third pass: fresh run -- filter the first step's event */
     return 0;
 }
 
@@ -775,31 +776,49 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
 
-        /* card #494: saltation correction, one term per event found at
-         * this accepted step. coeff uses g_pac_Cprev (THIS column m's
-         * propagated response from the END of the PREVIOUS accepted step
-         * -- delta_x(t_e-)/y(t_e-), exactly what Fang's formula calls
-         * for), NOT g_pac_rhs_re/im (this step's still-being-built
-         * result). dG*v_switch is real, so the injected RHS is just
-         * coeff scaled by that real number. */
-        for (i_salt = 0; i_salt < n_salt; i_salt++) {
-            PSSsaltEvent *e = &salt_ev[i_salt];
-            PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m);
-            PACc Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
-            PACc diff = pc_sub(Sp, Sn);
-            PACc coeff = pc_scale(diff, 1.0 / e->h_dot);
-            /* ag0 converts Coulombs to companion-model Amps -- see
-             * pssshoot.c's PSSsensRecordStep()'s identical comment. */
-            PACc dI = pc_scale(coeff, ag0 * e->dG * e->v_switch);
-            if (e->posNode > 0) { g_pac_rhs_re[e->posNode] -= dI.re; g_pac_rhs_im[e->posNode] -= dI.im; }
-            if (e->negNode > 0) { g_pac_rhs_re[e->negNode] += dI.re; g_pac_rhs_im[e->negNode] += dI.im; }
-        }
-
         SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
         SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
         for (row = 1; row <= neq; row++) {
             PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
             pac_set(g_pac_Cnew, row, M, m, v);
+        }
+    }
+
+    /* card #494 THIRD pass (rewrite -- see pssshoot.c's PSSsaltFindEvents()
+     * derivation comment): apply the saltation correction as a DIRECT VALUE
+     * JUMP added onto g_pac_Cnew, AFTER this step's own smooth dceq/dveq
+     * solve above, NOT routed through it. Routing the jump through this
+     * step's own SMPsolve (tried earlier this pass, before this rewrite)
+     * measurably attenuated it whenever the just-flipped switch's own new
+     * conductance is comparable to ag0*C_local at that node (exactly the
+     * ~9x-not-negligible case the SECOND pass's report already flagged) --
+     * the matrix divides the jump by (ag0*C + G_new + ...) instead of
+     * leaving it as the pure state discontinuity Fang's formula calls for.
+     * Adding it directly to the already-solved g_pac_Cnew avoids that
+     * entirely. coeff uses g_pac_Cprev (the UNMODIFIED value from the END
+     * of the PREVIOUS accepted step -- delta_x(t_e-), exactly what the
+     * formula calls for) for every event, so simultaneous events (e.g. two
+     * complementary switches) never see a partially-applied correction. */
+    if (n_salt > 0) {
+        for (m = 0; m < M; m++) {
+            PACc djump[PSS_SALT_MAX_EVENTS][2];   /* [i_salt][0]=posNode, [1]=negNode */
+            for (i_salt = 0; i_salt < n_salt; i_salt++) {
+                PSSsaltEvent *e = &salt_ev[i_salt];
+                PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m);
+                PACc Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
+                PACc coeff = pc_scale(pc_sub(Sp, Sn), 1.0 / e->h_dot);
+                djump[i_salt][0] = pc_scale(coeff, e->dfdt_pos);
+                djump[i_salt][1] = pc_scale(coeff, e->dfdt_neg);
+            }
+            for (i_salt = 0; i_salt < n_salt; i_salt++) {
+                PSSsaltEvent *e = &salt_ev[i_salt];
+                if (e->posNode > 0)
+                    pac_set(g_pac_Cnew, e->posNode, M, m,
+                            pc_add(pac_get(g_pac_Cnew, e->posNode, M, m), djump[i_salt][0]));
+                if (e->negNode > 0)
+                    pac_set(g_pac_Cnew, e->negNode, M, m,
+                            pc_add(pac_get(g_pac_Cnew, e->negNode, M, m), djump[i_salt][1]));
+            }
         }
     }
     }   /* card #494: closes the salt_ev/n_salt scope opened above */

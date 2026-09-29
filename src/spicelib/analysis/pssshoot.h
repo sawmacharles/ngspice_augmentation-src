@@ -108,22 +108,37 @@ void PSStrigRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), sa
 /* ---- card #494 (plan T6.1): saltation (event) correction for ideal `sw`
  * voltage-controlled switches, shared by pssshoot.c's PSSsensRecordStep()
  * (real monodromy Phi) and pacshoot.c's PSSpacRecordStep() (complex forced
- * response). See pssshoot.c's pss_salt_find_events() header comment for
- * the derivation (Fang's saltation matrix, S = I + (f+-f-) grad(h)^T /
- * (grad(h).f- + dh/dt), specialised to ngspice's per-step companion-model
- * recursion: the correction becomes one extra current-injection RHS term
- * at the switch's own power terminals, solved through the SAME per-step
- * factorization every other history term already uses -- no state-space
- * f+/f- vector needed explicitly). One event per SW instance that changed
- * state (CKTstate0[SWswitchstate] != CKTstate1[SWswitchstate]) at the
- * CURRENT accepted step. ---- */
+ * response). See pssshoot.c's PSSsaltFindEvents() header comment for the
+ * derivation (Fang's saltation matrix, delta_x+ = delta_x- - (f+-f-)*dt_e,
+ * dt_e = -(grad(h).delta_x-)/h_dot).
+ *
+ * THIRD pass (card #494) rewrite: the first two passes routed the
+ * correction through an ag0-scaled companion-model CURRENT injected into
+ * the event step's own linear solve -- step-size dependent by
+ * construction (ag0 ~ 1/h_step), and the leading suspect for the 2.2x
+ * error both prior passes measured and could not resolve. This pass
+ * instead precomputes (f+-f-) at the switch's own power nodes directly
+ * from the LOCAL capacitance physically tied to each node (dfdt_pos/neg
+ * below, in state-units/second, no ag0, no dependence on the step size
+ * the event happens to land on -- see PSSsaltFindEvents()'s own comment),
+ * and the caller applies it as a direct VALUE jump to the propagated
+ * sensitivity/phasor state at the event (delta_x(t_e-) -> delta_x(t_e+)),
+ * not as an RHS current routed through that step's own G+ag0*C solve.
+ *
+ * One event per SW instance that changed state
+ * (CKTstate0[SWswitchstate] != CKTstate1[SWswitchstate]) at the CURRENT
+ * accepted step. ---- */
 
 typedef struct {
-    int posNode, negNode;       /* switch power terminals (the RHS rows to inject at) */
+    int posNode, negNode;       /* switch power terminals (where the state jump applies) */
     int posCntrl, negCntrl;     /* switch control terminals (h = v(posCntrl)-v(negCntrl)-vt) */
     double v_switch;            /* V(posNode)-V(negNode) at the accepted point */
     double dG;                  /* conductance jump, g_after - g_before */
-    double h_dot;               /* d(v_ctrl)/dt across this step (finite difference) */
+    double h_dot;                /* d(v_ctrl)/dt across this step (finite difference) */
+    double dfdt_pos;             /* (f+-f-) at posNode: -dG*v_switch / C_local(posNode),
+                                   * 0 if posNode has no capacitor directly on it (e.g. an
+                                   * ideal voltage source's own node -- no state to jump) */
+    double dfdt_neg;             /* (f+-f-) at negNode: +dG*v_switch / C_local(negNode) */
     const char *name;           /* instance name, for diagnostics */
 } PSSsaltEvent;
 
@@ -138,5 +153,18 @@ extern int PSSsaltActive;   /* env-var gated (PSS_SALTATION, default on); see ps
  * switch, or whose switches didn't change state this step). Cheap unless
  * PSSsaltActive. */
 int PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max);
+
+/* card #494 third pass: call once at the START of every fresh
+ * period/recording run (pss_sens_reset()/pac_reset(), both files) so
+ * PSSsaltFindEvents() can filter the spurious ~1e-10s "event" both prior
+ * passes found and did not fix -- CKTstate1 on the FIRST accepted step
+ * after a shooting-engine period restart does not carry the converged
+ * orbit's own wrap-around history, which fabricated a huge, bogus h_dot
+ * every restart. The next PSSsaltFindEvents() call after PSSsaltReset()
+ * unconditionally returns 0 (real duty-cycle edges land later in the
+ * period; this costs one accepted step's worth of non-detection per
+ * restart, the "ignore crossings within the first step" filter the
+ * card's brief asks for). */
+void PSSsaltReset(void);
 
 #endif
