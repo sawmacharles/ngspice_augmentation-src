@@ -268,11 +268,48 @@ pac_state_row(const PACstateRef *ref)
 }
 
 /* ------------------------------------------------------------------ */
-/* One-period re-run, restricted stack-local TRANan trick -- duplicated
- * from pssshoot.c's (file-static) pss_run_period() rather than exposing
- * it, for the same "don't change that file's visibility for this card"
- * reason as PACstateMap above. Caller must have already written x0 via
- * pac_state_set_ic(). */
+/* card #465 SECOND pass (plan T5.3, task 3 "speed"): PAC_RECORD_POINTS
+ * decouples the grid resolution of pacshoot.c's OWN two recording-period
+ * reruns (pac_engine_run's "pass 1"/"pass 2", the ONLY place this file
+ * calls pac_run_period) from job->PSSpoints, the grid pssshoot.c's
+ * shooting-Newton convergence phase (fast-state detection, the Newton
+ * iterations themselves, and the Floquet FD monodromy) ALSO uses via the
+ * SAME ckt->CKTmaxStep/CKTstep.
+ *
+ * PROFILING FINDING (this pass): on pac_lti.cir (task 2's LTI accuracy
+ * check, Points=200000 to reach the 1e-6 pac_sb0(a) target), of the
+ * reported 113.4s total wall time, PSS-SHOOT's OWN "CONVERGED ...
+ * wall_time=" line accounts for 112.4s (99%) and PAC-TD's OWN "done,
+ * wall_time=" line for 1.2s (1%) -- see the card #465 report. The task's
+ * "~110s for 31 frequency points" is therefore NOT this file's frequency
+ * sweep (which is already O(2 period reruns) total, independent of the
+ * number of frequencies, per this file's header design) -- it is
+ * pssshoot.c's own ~10-12 period reruns (fast-state detection's FD
+ * monodromy, the Newton iteration(s), the Floquet FD monodromy) each
+ * paying the SAME Points=200000 resolution that only PAC's OWN
+ * demodulation quadrature (task 2) actually needs. pssshoot.c is another
+ * card's file (not edited here); it is not obviously safe or in scope to
+ * make ITS OWN convergence phase run at a coarser grid than the deck's
+ * Points= asks for.
+ *
+ * FIX (in scope: this file only): when PAC_RECORD_POINTS is set (a
+ * positive integer, same convention as pssshoot.c's PSS_SHOOT_* debug env
+ * vars), pac_run_period() OVERRIDES ckt->CKTmaxStep/CKTstep/CKTdelmin to
+ * T/PAC_RECORD_POINTS for JUST this one recording-period call, restoring
+ * the PSS-converged values immediately after. This is safe: (1) BOTH of
+ * pac_engine_run's two recording passes for a given (br,bi,freqs) sweep
+ * use the SAME override consistently, so their step grids still match
+ * each other exactly (the property PSSpacRecordStep's per-step recursion
+ * needs -- see this file's header -- is "pass 1 and pass 2 use the same
+ * grid as EACH OTHER", not "the same grid PSS's Newton phase used"); (2)
+ * x0 (the converged orbit) and T (the converged period) are UNCHANGED --
+ * only the recording reruns' internal step density changes; (3) default
+ * (env var unset) is BYTE-IDENTICAL to the first pass's behaviour --
+ * zero risk to any existing passing check. Lets a deck ask PSS for a
+ * COARSE, fast-converging Points= (job->PSSpoints drives only the
+ * Newton/Floquet reruns) while PAC_RECORD_POINTS independently asks for
+ * the fine grid task 2's demodulation accuracy needs -- see the card
+ * #465 report for the measured before/after on pac_lti.cir. */
 static int
 pac_run_period(CKTcircuit *ckt, double T, const char *jobname)
 {
@@ -280,12 +317,23 @@ pac_run_period(CKTcircuit *ckt, double T, const char *jobname)
     TRANan localjob;
     char namebuf[128];
     int err;
+    double saveMaxStep = ckt->CKTmaxStep, saveStep = ckt->CKTstep,
+           saveDelmin = ckt->CKTdelmin;
+    const char *rpEnv = getenv("PAC_RECORD_POINTS");
+    long recPoints = rpEnv ? atol(rpEnv) : 0;
+    int overriding = (recPoints > 0);
 
     memset(&localjob, 0, sizeof localjob);
     strncpy(namebuf, jobname, sizeof namebuf - 1);
     namebuf[sizeof namebuf - 1] = '\0';
     localjob.JOBtype = saveJob->JOBtype;
     localjob.JOBname = namebuf;
+
+    if (overriding) {
+        ckt->CKTmaxStep = T / (double) recPoints;
+        ckt->CKTstep    = ckt->CKTmaxStep;
+        ckt->CKTdelmin  = 1e-9 * ckt->CKTmaxStep;
+    }
 
     ckt->CKTcurJob   = (JOB *) &localjob;
     ckt->CKTfinalTime = T;
@@ -299,6 +347,11 @@ pac_run_period(CKTcircuit *ckt, double T, const char *jobname)
         SPfrontEnd->OUTendPlot(localjob.TRANplot);
 
     ckt->CKTcurJob = saveJob;
+    if (overriding) {
+        ckt->CKTmaxStep = saveMaxStep;
+        ckt->CKTstep    = saveStep;
+        ckt->CKTdelmin  = saveDelmin;
+    }
     return err;
 }
 
