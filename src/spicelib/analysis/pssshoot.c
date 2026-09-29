@@ -1352,8 +1352,8 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
     if (!g_salt_ind_warned) {
         g_salt_ind_warned = 1;
         fprintf(stderr, "PAC-TD: WARNING -- saltation via inductor-routed jump at node %s "
-                "(no capacitor at the switch node): validated only to ~4 dB/3 deg vs an "
-                "independent reference (card #510); cross-check with tools/pac_perturbed.py "
+                "(no capacitor at the switch node): validated to 0.5 dB/3 deg vs an "
+                "independent reference on ONE fixture only (card #510); cross-check with tools/pac_perturbed.py "
                 "-- see docs/pss-pac.md's card #510 section.\n",
                 NODENAME(ckt, node));
     }
