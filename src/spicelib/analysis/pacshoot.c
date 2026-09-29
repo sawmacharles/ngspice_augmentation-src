@@ -407,7 +407,9 @@ pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
     ckt->CKTtime      = 0.0;
     ckt->CKTmode     |= MODEUIC;
 
+    PSSeventLocateActive = PSSswLagActive = PSSshootLagEnabled();
     err = DCtran(ckt, 1);
+    PSSeventLocateActive = PSSswLagActive = 0;
 
     if (localjob.TRANplot)
         SPfrontEnd->OUTendPlot(localjob.TRANplot);

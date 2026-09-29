@@ -74,7 +74,8 @@ extern int PSSbreakInstallActive;  /* dctran.c: force the recorded times as brea
 void PSSbreakRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept() */
 void PSSbreakInstallHook(CKTcircuit *ckt);
 extern int PSSeventLocateActive, PSSeventLocateRestart, PSSswLagActive, PSSeventLocateCrossed;   /* card #498 2nd pass: exact sw event location */
-int PSSeventLocate(CKTcircuit *ckt, double *newdelta);  /* called right after the restart-path breaks reset */
+int PSSeventLocate(CKTcircuit *ckt, double *newdelta);
+int PSSshootLagEnabled(void);   /* card #498: PAC/PSTB recording passes follow the PSS orbit's sw treatment */  /* called right after the restart-path breaks reset */
 
 /* ---- card #458 FOURTH pass (plan T4.2): analytic (discretise-then-
  * linearise) sensitivity monodromy, replacing finite differences. See

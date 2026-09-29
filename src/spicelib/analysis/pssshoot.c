@@ -336,6 +336,7 @@ pss_ripple_free(void)
  * path only; the analytic (saltation) Jacobian keeps the stock sw decision so
  * baseline and trial runs stay mutually consistent. */
 static int g_pss_lag_enabled = 1;
+int PSSshootLagEnabled(void) { return g_pss_lag_enabled && getenv("PSS_NO_EVENT_LOCATE") == NULL; }
 
 static int
 pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
