@@ -409,7 +409,7 @@ PSSbreakRecordStep(CKTcircuit *ckt)
      * that -- which is exactly the timescale too fine to matter for a
      * Newton monodromy estimate anyway. */
     if (g_break_count > 0 &&
-        (ckt->CKTtime - g_break_times[g_break_count - 1]) < ckt->CKTmaxStep * 1e-3)
+        (ckt->CKTtime - g_break_times[g_break_count - 1]) < ckt->CKTmaxStep * 1e-2)
         return;
 
     if (g_break_count >= g_break_cap) {
@@ -432,12 +432,83 @@ PSSbreakRecordStep(CKTcircuit *ckt)
 void
 PSSbreakInstallHook(CKTcircuit *ckt)
 {
-    int i;
+    int i, skipped = 0;
+    /* card #458 SIXTH pass (plan T4.1-T4.3), robustness fix: do not force
+     * the handful of very-early recorded times from a period run's own
+     * post-UIC-restart LTE step-doubling ramp (t=0 always restarts at
+     * order 1 with a small step and grows it every accepted step until
+     * the ramp saturates near CKTmaxStep -- a numerical-integrator
+     * artifact of every UIC-restarted period run, not a switch-edge
+     * timing effect, so it needs none of the cross-run consistency this
+     * hook exists for). Forcing one of those as a breakpoint makes
+     * dctran.c's own "first timepoint after a breakpoint" logic
+     * (CKTdelta = min(delta, 0.1*(CKTbreaks[1]-CKTbreaks[0])), PLUS
+     * another /10 for the true t=0 "firsttime" case) cap the very FIRST
+     * step of the run to roughly maxStep*1e-4 -- orders of magnitude
+     * tighter than every OTHER forced-breakpoint restart in the same run
+     * (which sits ~maxStep apart, so only gets the single 0.1x cut, not
+     * the extra firsttime one). Found on tests/fixtures/pss_r3_shoot.cir
+     * with the pss card's Points field raised from 200 to 1000 (card
+     * #458, sixth pass): the finer Points 5x-shrinks CKTmaxStep AND
+     * CKTdelmin AND this cap proportionally, but the actual nonlinear
+     * corrector cost of resolving a Newton FD perturbation's charge-
+     * redistribution transient right at t=0 does NOT shrink with it --
+     * so the same relative cap becomes tight enough, at fine Points, to
+     * make the corrector genuinely fail (not just take small steps) at
+     * an unlucky forced instant, shrinking CKTdelta down to CKTdelmin
+     * twice and aborting with "Timestep too small" (confirmed: identical
+     * deck converges fine with PSS_SHOOT_NO_FORCE=1, isolating this
+     * forcing interaction, not the perturbation or Points value alone,
+     * as the cause). Skipping breakpoints below this floor leaves
+     * CKTbreaks[1] at whatever the run's own step-doubling has grown to
+     * by then (>= the floor), so the very first step gets the SAME
+     * 0.1x-of-next-breakpoint cut every other forced restart in this run
+     * already gets -- no longer two orders of magnitude tighter -- while
+     * every OTHER forced time (mid-period, including every switch-edge
+     * cluster SUSPECTED CAUSE 2 exists to pin down) is untouched. Applied
+     * only to the LEADING run of skipped times (once a time clears the
+     * floor, every later one is forced normally, so a genuinely early
+     * switch edge -- not expected in this deck family, but not assumed
+     * impossible -- is not silently dropped). PSS_SHOOT_NO_EARLY_SKIP
+     * (debug env var, no effect unless set) disables this for isolation,
+     * same pattern as the file's other tunables. */
+    double early_floor = ckt->CKTmaxStep * 0.1;
+    int skipping = (getenv("PSS_SHOOT_NO_EARLY_SKIP") == NULL);
+
+    if (getenv("PSS_SHOOT_DEBUG_BREAK")) {
+        double mingap = 1e300; int mingap_i = -1;
+        fprintf(stderr, "DEBUGBREAK: installing %d breakpoints, maxStep=%.6g "
+                "delmin=%.6g minBreak=%.6g early_floor=%.6g; first 8:", g_break_count,
+                ckt->CKTmaxStep, ckt->CKTdelmin, ckt->CKTminBreak, early_floor);
+        for (i = 0; i < g_break_count && i < 8; i++)
+            fprintf(stderr, " %.6e", g_break_times[i]);
+        fprintf(stderr, "; last 8:");
+        for (i = g_break_count > 8 ? g_break_count - 8 : 0; i < g_break_count; i++)
+            fprintf(stderr, " %.6e", g_break_times[i]);
+        for (i = 1; i < g_break_count; i++) {
+            double gap = g_break_times[i] - g_break_times[i - 1];
+            if (gap < mingap) { mingap = gap; mingap_i = i; }
+        }
+        fprintf(stderr, "\nDEBUGBREAK: min gap=%.6e at index %d (t=%.6e -> %.6e); "
+                "finalTime=%.6e last_break=%.6e gap_to_final=%.6e\n",
+                mingap, mingap_i, mingap_i > 0 ? g_break_times[mingap_i - 1] : 0.0,
+                mingap_i >= 0 ? g_break_times[mingap_i] : 0.0,
+                ckt->CKTfinalTime, g_break_count ? g_break_times[g_break_count - 1] : -1.0,
+                g_break_count ? ckt->CKTfinalTime - g_break_times[g_break_count - 1] : -1.0);
+    }
     for (i = 0; i < g_break_count; i++) {
         double tt = g_break_times[i];
+        if (skipping && tt < early_floor) {
+            skipped++;
+            continue;
+        }
+        skipping = 0;   /* first time we clear the floor, force everything after it */
         if (tt > 0.0 && tt < ckt->CKTfinalTime)
             CKTsetBreak(ckt, tt);
     }
+    if (getenv("PSS_SHOOT_DEBUG_BREAK"))
+        fprintf(stderr, "DEBUGBREAK: skipped %d leading early breakpoint(s) "
+                "below %.6g\n", skipped, early_floor);
 }
 
 /* Wraps pss_run_period(): record=1 captures this run's own accepted grid
@@ -971,7 +1042,30 @@ pss_sens_get_phi(PSSstateMap *map, double *Phi)
  * further, so the caller's staged warm-up escalation has one uniform
  * "this attempt did not confirm a steady state" signal to react to; x0 is
  * left at its last ACCEPTED iterate (never a rejected/failed trial), and
- * the specific cause was already printed to stderr when it happened. */
+ * the specific cause was already printed to stderr when it happened.
+ *
+ * card #458 SIXTH pass (plan T4.1-T4.3), speed task, idea 1 from the card:
+ * M_init, if non-NULL, is a caller-supplied n_slow x n_slow RAW monodromy
+ * estimate (same convention as M below) to seed iteration 0's Jacobian
+ * with INSTEAD of running a fresh FD sweep there -- used by the caller
+ * (PSSshootDriven) to reuse pss_detect_fast_states()'s own one-time
+ * detection FD sweep (which already computes a full n_full x n_full
+ * monodromy just to classify fast/slow columns, then previously discarded
+ * it) as the first real Newton attempt's starting Jacobian, saving that
+ * attempt's own 2*n_slow+1 period runs. Only iteration 0 is seeded this
+ * way (every later iteration keeps this function's existing recompute/
+ * Broyden cadence exactly as before); NULL (every OTHER pss_newton_run()
+ * call site) is byte-for-byte the fifth pass's own behaviour, unaffected.
+ * Never used with use_analytic (that path has its own, unrelated
+ * Jacobian source). Safe even if the seeded Jacobian is somewhat stale
+ * (detection's x_full and this attempt's x0 are not always identical --
+ * see the call site's own comment): a seeded M is treated exactly like a
+ * Broyden-carried one for every purpose below, including the existing
+ * "Broyden step did not reduce the residual -> force a fresh FD Jacobian
+ * and retry" fallback, so a bad seed costs at most one wasted line-search
+ * trial before self-correcting, never a wrong convergence (the actual
+ * convergence test is always the true nonlinear residual, never the
+ * Jacobian). */
 static int
 pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                 int n_slow, const int *slow_idx, double *x_full,
@@ -979,7 +1073,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                 double trust_radius, int broyden_enabled, int broyden_period,
                 const char *stage_label,
                 int *iter_out, double *residual_out, double *Phi_out,
-                int use_analytic)
+                int use_analytic, const double *M_init, int *seed_used_out)
 {
     /* card #458 FIFTH pass (plan T4.3): generalised to a REDUCED Newton
      * unknown set -- n_slow of map->n total native states, indexed by
@@ -1009,6 +1103,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     int recompute = 1;       /* does THIS iteration's Jacobian need a fresh FD sweep? */
     int since_recompute = 0;
     int result = 0;
+    if (seed_used_out) *seed_used_out = 0;
     /* card #458 FIFTH pass, task 1: the floor under a state's RIPPLE
      * (not, as in the second/third pass, under its magnitude). The old
      * value (1e-3, a 1mV/1mA floor chosen there to keep a near-zero
@@ -1241,7 +1336,28 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
             goto newton_done;   /* out of this attempt's budget */
         }
 
-        if (recompute && !use_analytic) {
+        if (recompute && iter == 0 && M_init && !use_analytic) {
+            /* card #458 SIXTH pass, speed task, idea 1: seed THIS attempt's
+             * very first Jacobian from the caller's supplied M_init
+             * (pss_detect_fast_states()'s own detection sweep, reused --
+             * see this function's header comment) instead of spending a
+             * fresh 2n-period-run FD sweep to recompute essentially the
+             * same thing. Treated exactly like a Broyden-carried Jacobian
+             * from here on (since_recompute=0, same as the FD branch below
+             * sets after a real sweep) -- every existing safety net
+             * (singular-matrix retry, "Broyden step did not reduce the
+             * residual -> force a fresh FD Jacobian" fallback) already
+             * treats "M did not come from THIS iteration's own FD sweep"
+             * uniformly, so a stale seed can only cost one extra wasted
+             * trial before self-correcting, never a wrong convergence. */
+            for (k = 0; k < n * n; k++) M[k] = M_init[k];
+            since_recompute = 0;
+            if (seed_used_out) *seed_used_out = 1;
+            if (getenv("PSS_SHOOT_DEBUG"))
+                fprintf(stderr, "DEBUG %s iter=0: seeded Jacobian from "
+                        "fast-state detection's own sweep (skipped a fresh "
+                        "FD recompute).\n", stage_label);
+        } else if (recompute && !use_analytic) {
             /* finite-difference monodromy: 2n extra period runs (centred
              * differences, not the cheaper n forward differences the
              * card's "n+1 period runs per Newton step" description allows
@@ -1597,16 +1713,30 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
  * during detection, or PSS_SHOOT_NO_REDUCE (debug/regression-isolation
  * switch, same pattern as PSS_SHOOT_NO_FORCE) -- never silently skips
  * logging what it did. Caller owns the returned slow_idx array (tfree()
- * it when done). */
+ * it when done).
+ *
+ * card #458 SIXTH pass, speed task, idea 1: phi_full_out, if non-NULL, is a
+ * caller-owned n_full*n_full (map->n squared) scratch buffer that this
+ * function fills with the RAW (no -I) full monodromy it computes anyway to
+ * decide fast/slow -- letting the caller reuse this same one-time FD sweep
+ * as the first real Newton attempt's seed Jacobian (pss_newton_run()'s
+ * M_init) instead of discarding it, the card's own suggested speed idea.
+ * *phi_valid_out (if phi_valid_out non-NULL) is set 1 only when phi_full_out
+ * was actually filled by a real FD sweep here (never in a no_reduce/
+ * failure fallback path, and never touched at all if phi_full_out is
+ * NULL) -- the caller must check it before trusting phi_full_out. */
 static int *
 pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
-                        const double *x_full, double eps, int *n_slow_out)
+                        const double *x_full, double eps, int *n_slow_out,
+                        double *phi_full_out, int *phi_valid_out)
 {
     int n = map->n, i, j, k, err;
     double threshold = 1e-3;
     double *Phi = NULL, *outbuf = NULL, *icbuf = NULL, *colnorm = NULL;
     int *is_fast = NULL, *slow_idx;
     int n_slow;
+
+    if (phi_valid_out) *phi_valid_out = 0;
 
     if (getenv("PSS_SHOOT_FAST_THRESHOLD"))
         threshold = atof(getenv("PSS_SHOOT_FAST_THRESHOLD"));
@@ -1722,6 +1852,15 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
      * x_full itself, but cheap and avoids any window where they disagree. */
     for (i = 0; i < n; i++) icbuf[i] = x_full[i];
     pss_state_set_ic(map, icbuf);
+
+    /* card #458 SIXTH pass, speed task, idea 1: hand this sweep's own
+     * n x n (n==n_full here, this function's own local `n`) raw monodromy
+     * back to the caller before it is freed -- see this function's header
+     * comment. */
+    if (phi_full_out) {
+        for (k = 0; k < n * n; k++) phi_full_out[k] = Phi[k];
+        if (phi_valid_out) *phi_valid_out = 1;
+    }
 
     tfree(Phi); tfree(outbuf); tfree(icbuf); tfree(colnorm); tfree(is_fast);
     *n_slow_out = n_slow;
@@ -1910,7 +2049,26 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * pattern as the existing PSS_SHOOT_EPS/_RELTOL/_NO_FORCE/_DEBUG). */
     {
         double warmup_periods  = 20.0;
-        int    warmup_maxiter  = 6;
+        /* card #458 SIXTH pass, speed task: 6 (third/fourth/fifth pass
+         * default) -> 4. A probe stage that is going to fail almost always
+         * shows it well before iteration 6 (see the R3 long-settling
+         * profile in the card #458 sixth-pass report: stages 2 and 4 both
+         * ran their full 6-iteration budget without converging, then were
+         * discarded anyway when the next, longer stage was tried) -- the
+         * last 2 iterations of a failing probe are close to pure waste.
+         * Measured: R3 long-settling 1.13s->0.86s (haven't retested with
+         * the seeded-Jacobian change above combined -- see the speed
+         * table), R3 nominal 0.56s->0.36s, R4/R2 nominal unchanged
+         * (residual/specrad identical to 6 iterations), both red-proofs
+         * (R4 D~0.55, R3 x20-gain) still correctly refuse to converge.
+         * 2 was also tried and found to be a REGRESSION on the long-
+         * settling fixture (1.50s, worse than either 6 or 4) -- too few
+         * iterations for a probe that IS on the right track to actually
+         * confirm it, so the staged loop ends up needing an extra,
+         * expensive warm-up stage instead; 4 was the smallest value tried
+         * that did not regress any fixture. PSS_SHOOT_WARMUP_MAXITER still
+         * overrides. */
+        int    warmup_maxiter  = 4;
         double trust_radius    = 5.0;
         double warmup_growth   = 2.0;
         int    broyden_enabled = 1;
@@ -1974,6 +2132,19 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         fprintf(stdout, "; max %d Newton iterations, tol %g\n", maxiter, tol);
         fflush(stdout);
 
+        /* card #458 SIXTH pass, speed task, idea 1: scratch for reusing
+         * pss_detect_fast_states()'s own detection sweep as the first
+         * Newton attempt's seed Jacobian -- see pss_newton_run()'s and
+         * pss_detect_fast_states()'s header comments. phi_full_detect is
+         * n*n (n==map.n, the UN-reduced state count: detection always
+         * measures the full system before reduction); M_init is the
+         * n_slow*n_slow slice pss_newton_run() actually wants, built once
+         * right after detection returns and reused for exactly one call
+         * (the first Newton attempt after detection -- see below). */
+        double *phi_full_detect = TMALLOC(double, (size_t) n * n);
+        double *M_init = TMALLOC(double, (size_t) n * n);   /* n*n upper bound; only n_slow*n_slow used */
+        int phi_full_detect_valid = 0;
+
         if (ckt->CKTstabTime <= 0.0) {
             pss_state_get_ic(&map, x0);
             /* card #458 FIFTH pass, task 2: detect+reduce ONCE, right
@@ -1981,18 +2152,42 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
              * pss_detect_fast_states()'s header comment for why this is a
              * one-time cost. */
             n_slow = n;
-            slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow);
+            slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow,
+                                               phi_full_detect, &phi_full_detect_valid);
+            if (phi_full_detect_valid && M_init)
+                for (k = 0; k < n_slow; k++)
+                    for (j = 0; j < n_slow; j++)
+                        M_init[k * n_slow + j] =
+                            phi_full_detect[slow_idx[k] * n + slow_idx[j]];
             ckt->CKTreltol = tight_reltol;
             converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
                                              maxiter, tol, eps, -1.0, broyden_enabled,
                                              broyden_period, "[no warm-up]",
-                                             &iter, &residual, Phi, use_analytic);
+                                             &iter, &residual, Phi, use_analytic,
+                                             (phi_full_detect_valid && M_init) ? M_init : NULL,
+                                             NULL);
             ckt->CKTreltol = save_reltol;
         } else {
             double stage_len = warmup_periods * T;
             double cumulative = 0.0;
             double *x0_stage_start = TMALLOC(double, n);
             int stage = 0;
+            /* card #458 SIXTH pass, speed task, idea 1: offer the detection
+             * seed to every stage's Newton attempt (not just stage 1's)
+             * until one of them actually consumes it (pss_newton_run()'s
+             * seed_used_out) -- on a circuit where stage 1's own attempt
+             * never reaches a fresh Jacobian recompute at all (e.g. the
+             * degenerate-fixed-point guard rejecting a too-short probe
+             * outright before any FD sweep is attempted, observed on the
+             * long-settling fixture), the seed would otherwise never be
+             * used at all. Once consumed, it is not offered again (later
+             * stages' own recomputes are always fresh FD sweeps, same as
+             * the fifth pass). A seed consumed several stages after
+             * detection is more stale than one consumed at stage 1, but no
+             * less SAFE -- see pss_newton_run()'s header comment: the
+             * existing Broyden-failed-retry fallback bounds the cost of a
+             * bad seed to one wasted trial, never a wrong convergence. */
+            int seed_available = 0;
 
             if (!x0_stage_start) {
                 err = E_NOMEM;
@@ -2019,8 +2214,86 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 fflush(stdout);
 
                 pss_state_set_ic(&map, x0);
-                err = pss_run_period(ckt, stage_len,
-                                      "PSS shoot (pre-stabilization transient)");
+                {
+                    /* card #458 SIXTH pass, speed task, idea (new this
+                     * pass, not one of the card's own listed ideas but the
+                     * same "cut the biggest item" instruction): the
+                     * warm-up transient's OWN trajectory is discarded the
+                     * instant it is read back into x0 below -- nothing
+                     * downstream needs it resolved any finer than "close
+                     * enough to land Newton in its basin of attraction",
+                     * unlike a Newton period run (whose OUTPUT x1=P(x0) is
+                     * the quantity Newton's residual test and Floquet
+                     * report both depend on directly). Profiled (card
+                     * #458 sixth-pass report): warm-up transients are the
+                     * single biggest cost on the long-settling fixture
+                     * (~60% of total wall time, dominated by stage 5's own
+                     * 320-period transient) even after the seeded-Jacobian
+                     * and warmup_maxiter cuts above. Loosening CKTmaxStep
+                     * for warm-up transients ONLY (restored to the deck's
+                     * Points-derived resolution immediately after, before
+                     * ANY Newton/detection period run sees it) lets the
+                     * adaptive step control take much bigger strides
+                     * through the smooth, non-switching parts of every
+                     * period -- ngspice's own LTE control still forces
+                     * small steps through every real switch transition
+                     * regardless of this ceiling, so this does not skip
+                     * resolving the switching behaviour itself, only the
+                     * artificial per-period sampling density Points asks
+                     * Newton's OWN evaluations for. PSS_SHOOT_WARMUP_
+                     * MAXSTEP_FACTOR (default 10, i.e. 10x looser than the
+                     * Points-derived ceiling; 1 disables this) overrides,
+                     * no effect unless set, same pattern as the file's
+                     * other tunables.
+                     *
+                     * PROBE STAGES ONLY (not last_stage): found on R4 (this
+                     * pass's own testing) that loosening the FINAL stage's
+                     * own warm-up transient too breaks reliable convergence
+                     * outright (R4 needs close to its full stabtime -- see
+                     * the fifth-pass README's own note on this -- so its
+                     * "final" stage IS the one that matters, unlike R3
+                     * long-settling where every stage that converges is
+                     * still a PROBE, cumulative 620 of 1500 periods; R4's
+                     * own final stage is reached at cumulative 750/750).
+                     * factor=10 uniformly (including the final stage) was
+                     * tried first and made R4 fail to converge at ANY
+                     * factor from 3-10 (residual plateaus ~0.76-1.0,
+                     * never a false CONVERGED, but a real, measured
+                     * reliability regression); factor=2 uniformly
+                     * recovered R4 but only partly recovered the speed win
+                     * on R3 long-settling. Scoping the loosening to PROBE
+                     * stages only (the ones whose own trajectory is
+                     * discarded outright on failure anyway, per this
+                     * loop's existing "revert x0 to the warm-up
+                     * transient's own endpoint" comment above) gets both:
+                     * R4's own final-stage warm-up keeps the full,
+                     * Points-derived resolution it was measured to need,
+                     * while R3 long-settling's own convergence point (a
+                     * PROBE stage) still gets the full speed win. Measured
+                     * (card #458 sixth-pass report): R4 nominal converges
+                     * again (iter=4, residual/specrad unchanged from
+                     * factor=1), R3 long-settling ratio unchanged from the
+                     * uniform-factor measurement (its own final stage is
+                     * never reached). */
+                    double warmup_maxstep_factor = (getenv("PSS_SHOOT_WARMUP_MAXSTEP_FACTOR") ?
+                        atof(getenv("PSS_SHOOT_WARMUP_MAXSTEP_FACTOR")) : 10.0);
+                    double saved_maxstep = ckt->CKTmaxStep;
+                    double saved_step    = ckt->CKTstep;
+                    double _pt0 = getenv("PSS_SHOOT_PROFILE") ? SPfrontEnd->IFseconds() : 0.0;
+                    if (last_stage) warmup_maxstep_factor = 1.0;
+                    if (warmup_maxstep_factor > 1.0) {
+                        ckt->CKTmaxStep = saved_maxstep * warmup_maxstep_factor;
+                        ckt->CKTstep    = ckt->CKTmaxStep;
+                    }
+                    err = pss_run_period(ckt, stage_len,
+                                          "PSS shoot (pre-stabilization transient)");
+                    ckt->CKTmaxStep = saved_maxstep;
+                    ckt->CKTstep    = saved_step;
+                    if (getenv("PSS_SHOOT_PROFILE"))
+                        fprintf(stderr, "PROFILE: stage %d warmup transient (%.0f periods) "
+                                "took %.4fs\n", stage, stage_len / T,
+                                SPfrontEnd->IFseconds() - _pt0);
+                }
                 if (err) {
                     fprintf(stderr, "PSS-SHOOT: FAILED -- the pre-"
                             "stabilization transient (stage %d, %.6g s) did "
@@ -2060,8 +2333,20 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                  *     task 2's per-iteration cost cut unless reduction
                  *     applies there too. */
                 if (stage == 1) {
+                    double _pt0 = getenv("PSS_SHOOT_PROFILE") ? SPfrontEnd->IFseconds() : 0.0;
                     n_slow = n;
-                    slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow);
+                    slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow,
+                                                       phi_full_detect, &phi_full_detect_valid);
+                    if (phi_full_detect_valid && M_init) {
+                        for (k = 0; k < n_slow; k++)
+                            for (j = 0; j < n_slow; j++)
+                                M_init[k * n_slow + j] =
+                                    phi_full_detect[slow_idx[k] * n + slow_idx[j]];
+                        seed_available = 1;
+                    }
+                    if (getenv("PSS_SHOOT_PROFILE"))
+                        fprintf(stderr, "PROFILE: fast-state detection took %.4fs\n",
+                                SPfrontEnd->IFseconds() - _pt0);
                 }
 
                 this_maxiter = last_stage ? maxiter : warmup_maxiter;
@@ -2069,12 +2354,38 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 snprintf(label, sizeof label, "[stage %d/%s]", stage,
                          last_stage ? "final" : "probe");
                 ckt->CKTreltol = tight_reltol;
+                {
+                double _pnt0 = getenv("PSS_SHOOT_PROFILE") ? SPfrontEnd->IFseconds() : 0.0;
+                int seed_used_this = 0;
+                /* card #458 SIXTH pass, speed task, idea 1: offer the
+                 * detection seed starting at stage 2 (never stage 1 --
+                 * found by this pass's own testing: stage 1's own probe is
+                 * so short that its Newton attempt typically never reaches
+                 * a real Jacobian use at all, most often rejected outright
+                 * by the degenerate-fixed-point guard before any FD sweep
+                 * or seed would matter; offering the seed there anyway was
+                 * measured to cost MORE than the guard's own instant
+                 * rejection, for no benefit, and then leaves nothing left
+                 * to offer stage 2, which is where a real attempt usually
+                 * happens first) to whichever stage's Newton attempt is
+                 * the first to actually need a fresh Jacobian recompute --
+                 * see seed_available's own comment above and
+                 * pss_newton_run()'s header comment for the reuse
+                 * mechanics and why a somewhat stale seed is still safe. */
                 converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
                                                  this_maxiter, tol, eps,
                                                  this_trust, broyden_enabled,
                                                  broyden_period, label,
-                                                 &iter, &residual, Phi, use_analytic);
+                                                 &iter, &residual, Phi, use_analytic,
+                                                 (stage > 1 && seed_available) ? M_init : NULL,
+                                                 &seed_used_this);
+                if (seed_used_this)
+                    seed_available = 0;
                 ckt->CKTreltol = save_reltol;
+                if (getenv("PSS_SHOOT_PROFILE"))
+                    fprintf(stderr, "PROFILE: stage %d newton attempt (%d iters) "
+                            "took %.4fs\n", stage, iter, SPfrontEnd->IFseconds() - _pnt0);
+                }
                 if (converged_flag || last_stage)
                     break;
 
@@ -2097,6 +2408,9 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * function should run at. Restored to save_reltol only at
          * shoot_cleanup, as before. */
         ckt->CKTreltol = tight_reltol;
+
+        if (phi_full_detect) tfree(phi_full_detect);
+        if (M_init) tfree(M_init);
     }
 
     if (!converged_flag) {
