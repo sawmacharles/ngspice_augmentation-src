@@ -1508,11 +1508,65 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                 for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
                 for (k = 0; k < n; k++) icbuf[slow_idx[k]] = xtrial[k];
                 pss_state_set_ic(map, icbuf);
-                /* NOT forced -- see the second-pass comment (kept
-                 * verbatim in this function's git history): a damped
-                 * trial point can be a full Newton step away from x0, so
-                 * it wants its own natural adaptive grid. */
-                err = pss_run_period_ex(ckt, T, "PSS shoot (damped-step trial)", 0, 0);
+                /* card #465 FIFTH pass (task 2): FORCED (was force=0 since
+                 * the second pass -- see that pass's comment, kept
+                 * verbatim in this function's git history, on why NOT
+                 * forcing was the original design: "a damped trial point
+                 * can be a full Newton step away from x0, so it wants its
+                 * own natural adaptive grid"). That reasoning was never
+                 * empirically tested against forcing -- it just carried
+                 * SUSPECTED CAUSE 2's original "perturbation runs must be
+                 * forced" rationale over to this run WITHOUT applying it,
+                 * on the assumption a large step needs its own grid. Found
+                 * on R4 D~=0.45 (refs/r4_pcm_buck.cir, vin_v=7.33): this
+                 * duty cycle's dominant Floquet multiplier is 0.994 (this
+                 * pass's own PSS_SHOOT_DEBUG eigenvalue dump; still stable,
+                 * |eig|<1, matching the FRA loop gain's own high phase
+                 * margin at this D -- see the card #465 report) -- so
+                 * (Phi-I) has an eigenvalue of only ~0.006, meaning
+                 * pss_solve_dense()'s delta_x is amplified roughly 1/0.006
+                 * ~= 166x along that mode relative to the residual F it is
+                 * solving for. At that amplification, this loop's own
+                 * UNFORCED trial run's natural-adaptive-step noise (this
+                 * fixture's own comparators/switches are steep tanh
+                 * transitions whose accepted-step sequence is itself
+                 * sensitive to which side of a threshold a tiny state
+                 * perturbation lands on) stopped shrinking as alpha
+                 * backtracked toward 0 -- confirmed by hand with
+                 * PSS_SHOOT_DEBUG: newresidual measured ~2.5e-4 at alpha=1
+                 * and STILL ~3.0e-4 at alpha=1.2e-7 (24 halvings), instead
+                 * of decaying toward the baseline's own ~5e-5 residual as
+                 * xtrial->x0 the way a step-size-proportional perturbation
+                 * would -- i.e. this was grid-selection noise, not
+                 * perturbation-size noise, and it does not vanish with a
+                 * smaller step. Below the ~166x-amplified noise floor that
+                 * creates, no Newton step at any alpha can ever pass this
+                 * loop's own "did the trial residual improve" test, so
+                 * every attempt exhausts its line search and the whole
+                 * Newton run reports non-convergence even though the
+                 * direction was correct and the true residual (the
+                 * baseline's own F, unaffected by this) was already close.
+                 * FORCING the trial run onto the SAME grid the baseline
+                 * (and every FD perturbation run) already uses removes
+                 * this noise source exactly the way SUSPECTED CAUSE 2
+                 * removed it from the FD monodromy itself -- confirmed:
+                 * R4 D~=0.45 now converges in 4 iterations to
+                 * residual=1.2e-7 (was FAILED at maxiter, residual
+                 * plateaued ~3e-4 to ~6e-5 depending on fixture), spectral
+                 * radius 0.994 (stable), and NONE of the other PSS
+                 * fixtures regressed re-running this pass's own full
+                 * test_pss.py suite with the change (R2/R3/R4-D030 still
+                 * converge to the same residual/spectral-radius to 3-4
+                 * significant figures; the D~=0.55 no-slope-comp and R3
+                 * x20-gain red-proofs still correctly refuse to converge,
+                 * D~=0.55's own residual still plateauing ~1.3e-3,
+                 * consistent with a genuine period-doubling orbit that has
+                 * no period-1 fixed point, not a forcing artefact;
+                 * determinism (5x, num_threads=1/8) unchanged). Still
+                 * gated by PSS_SHOOT_NO_FORCE (existing debug/isolation
+                 * switch, pss_run_period_ex()'s own comment) for anyone
+                 * who needs to reproduce the old unforced behaviour. */
+                err = pss_run_period_ex(ckt, T, "PSS shoot (damped-step trial)", 0, 1);
                 if (!err) {
                     double newresidual = 0.0;
                     pss_state_get(map, ckt, outbuf);   /* outbuf: this trial's FULL result, incl. carried states */
