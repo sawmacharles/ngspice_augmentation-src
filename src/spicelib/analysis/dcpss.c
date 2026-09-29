@@ -3498,6 +3498,18 @@ DCpss(CKTcircuit *ckt,
                 for (ii = ISRCinstances (im) ; ii ; ii = ISRCnextInstance (ii))
                     if (ii->ISRCfuncTGiven) { pss_driven = 1 ; break ; }
         }
+        /* card #494: `driven=1` override -- see pssdefs.h's
+         * PSSforceDriven comment. Applied AFTER the native scan so a deck
+         * that already has a detected V/I clock is unaffected either way;
+         * this only matters for the XSPICE-clocked case where the scan
+         * above found nothing. */
+        if (!pss_driven && job->PSSforceDriven) {
+            pss_driven = 1;
+            fprintf(stderr, "PSS: driven=1 given -- treating as a driven "
+                    "circuit at fguess (%g Hz) despite no native V/I "
+                    "source time function found (XSPICE-clocked deck).\n",
+                    ckt->CKTguessedFreq);
+        }
         if (pss_driven) {
             /* Match the shooting-phase integration resolution to the sampling
              * resolution the user asked for (psspoints samples per period).

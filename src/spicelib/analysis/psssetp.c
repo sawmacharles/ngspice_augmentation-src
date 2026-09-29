@@ -158,6 +158,12 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         }
         break;
 
+    /* card #494: `.pss ... driven=1` -- see pssdefs.h's PSSforceDriven
+     * comment. */
+    case PSS_FORCE_DRIVEN:
+        job->PSSforceDriven = value->iValue;
+        break;
+
     default:
         return(E_BADPARM);
     }
@@ -194,7 +200,8 @@ static IFparm PSSparms[] = {
     { "pacpoints",    PAC_RECPOINTS,	IF_SET|IF_INTEGER,	"card #465: PAC/PSTB recording-pass time points per period (0/unset = deprecated PAC_RECORD_POINTS env var, else PSS's own points=)" },
     { "trigger",      TRIG_NODE,	IF_SET|IF_STRING,	"card #489: free-running shooting Poincare-section trigger node (given = selects PSSshootFreerun)" },
     { "trigval",      TRIG_VAL,	IF_SET|IF_REAL,		"card #489: trigger threshold voltage (default 0.5)" },
-    { "trigdir",      TRIG_DIR,	IF_SET|IF_STRING,	"card #489: trigger crossing direction, rise (default) or fall" }
+    { "trigdir",      TRIG_DIR,	IF_SET|IF_STRING,	"card #489: trigger crossing direction, rise (default) or fall" },
+    { "driven",       PSS_FORCE_DRIVEN, IF_SET|IF_INTEGER,	"card #494: force driven-mode shooting at fguess even if no native V/I source has a time function (XSPICE-clocked decks, e.g. d_pwm)" }
 };
 
 SPICEanalysis PSSinfo  = {

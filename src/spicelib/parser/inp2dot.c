@@ -1209,6 +1209,12 @@ dot_pss(char *line, void *ckt, INPtables *tab, struct card *current,
             INPgetTok(&line, &dword, 1);
             ptemp.sValue = dword;
             GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+        } else if (strcmp(word, "driven") == 0) {
+            /* card #494: `driven=1` -- see pssdefs.h's PSSforceDriven
+             * comment. Token-split note: same as method=/trigger= above,
+             * "driven=1" and "driven 1" both come back as two tokens. */
+            parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+            GCA(INPapName, (ckt, which, foo, "driven", parm));
         } else {
             fprintf(stderr,"Error: unknown parameter %s on .pss - ignored\n", word);
         }
@@ -1363,6 +1369,11 @@ dot_pac(char *line, void *ckt, INPtables *tab, struct card *current,
                 INPgetTok(&line, &dword, 1);
                 ptemp.sValue = dword;
                 GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+            } else if (strcmp(word, "driven") == 0) {
+                /* card #494: see dot_pss()'s identical branch. */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "driven", parm));
             } else {
                 fprintf(stderr, "Error: unknown trailing token '%s' on .pac - ignored\n", word);
                 tfree(word);
@@ -1512,6 +1523,11 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
             INPgetTok(&line, &dword, 1);
             ptemp.sValue = dword;
             GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+        } else if (strcmp(word, "driven") == 0) {
+            /* card #494: see dot_pss()'s identical branch. */
+            tfree(word);
+            parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+            GCA(INPapName, (ckt, which, foo, "driven", parm));
         } else {
             fprintf(stderr, "Error: unknown trailing token '%s' on .pstb - ignored\n", word);
             tfree(word);

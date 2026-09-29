@@ -138,6 +138,20 @@ typedef struct {
     CKTnode *PSStrigNode;    /* NULL = driven/fixed-period (default, unchanged) */
     double   PSStrigVal;     /* threshold the trigger node must cross (default 0.5) */
     int      PSStrigDir;     /* +1 = rise (default), -1 = fall */
+
+    /* card #494 (plan T6.1, saltation): `driven=1` on a `.pss ...
+     * method=shoot` card. Enhancement-176's own driven-mode detection
+     * (dcpss.c) only recognises a native V/I source with a time function
+     * (VSRCfuncTGiven -- a PULSE/SIN/... on a plain V or I source). An
+     * XSPICE code-model clock (e.g. `d_pwm`, refs/r6_vm_buck_ideal.cir) is
+     * an opaque MIF instance outside that scan -- a genuinely driven,
+     * fixed-frequency circuit is otherwise refused with "needs a driven
+     * (clocked) circuit". This is an explicit, opt-in admission that the
+     * deck IS driven at the given fguess (the same honesty stance
+     * `trigger=` already uses for the free-running case): it does not try
+     * to introspect XSPICE code models, and does nothing for a genuinely
+     * autonomous circuit unless the user asserts driven=1 themselves. */
+    int      PSSforceDriven;
 } PSSan;
 
 enum {
@@ -180,6 +194,7 @@ enum {
     TRIG_NODE,
     TRIG_VAL,
     TRIG_DIR,
+    PSS_FORCE_DRIVEN,
 };
 
 #endif
