@@ -192,7 +192,7 @@ CKTsetOpt(CKTcircuit *ckt, JOB *anal, int opt, IFvalue *val)
         task->TSKkluExplicit = 1; /* card #496: an explicit choice always wins over autoklu */
         break;
     case OPT_KLU_MEMGROW_FACTOR:
-        task->TSKkluMemGrowFactor = (val->rValue == 1.2);
+        task->TSKkluMemGrowFactor = val->rValue; /* card #501: was (val->rValue == 1.2), a comparison */
         break;
     case OPT_AUTOKLU:
         /* card #496, round 7: opt-in only, never overrides an explicit
