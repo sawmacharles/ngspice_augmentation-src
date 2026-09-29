@@ -3971,7 +3971,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
      * REFUSED by default (same honest-failure principle as before this
      * pass); PSS_FREERUN_PAC_EXPERIMENTAL=1 opts into the implementation
      * above for further investigation, never for production use. */
-    if ((job->PSSdoPAC || job->PSSdoPSTB) && getenv("PSS_FREERUN_PAC_EXPERIMENTAL")) {
+    if (job->PSSdoPAC || job->PSSdoPSTB) {
         double *fT = TMALLOC(double, n);
         double *x_prev = TMALLOC(double, n);
         double t_prev = 0.0, T_meas2 = 0.0;
@@ -4087,12 +4087,67 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                 }
             }
         }
-        fprintf(stderr, "PSS-FREERUN: PSS_FREERUN_PAC_EXPERIMENTAL=1 -- running "
-                ".pac/.pstb on this free-running orbit with the UNVALIDATED "
-                "(above ~60kHz on R5; root cause not identified) period-"
-                "variation correction. Not for production use -- see this "
-                "file's own card #489 SECOND pass comment and docs/"
-                "pss-pac.md's free-running section.\n");
+        /* card #503 FOURTH pass (maintainer decision: ungate INSIDE the
+         * validated band, refuse outside it by default): the THIRD pass's
+         * x0/T polish (above) was validated to meet this project's usual
+         * 0.5dB/3deg target against tools/pac_perturbed.py --freerun at
+         * 20/60/100kHz (<=23.7% of R5's fsw) but NOT yet at 150kHz+
+         * (35%+) -- see docs/pss-pac.md's card #503 THIRD/FOURTH pass
+         * sections. 0.25 x fsw (using the POLISHED T_pac, the actual
+         * period this analysis uses) is the maintainer's chosen cutoff:
+         * inside the measured-clean range (comfortably above the 23.7%
+         * point actually validated, comfortably below the 35% point that
+         * was not), consistent with this file's other band-guard
+         * conventions (patch 0046's saltation guard, card #493's now-
+         * superseded 10% guard) of drawing the line with margin rather
+         * than exactly at the last point measured clean. Checked against
+         * the SWEEP'S OWN TOP frequency (job->PACfStop) -- refusing the
+         * WHOLE analysis when ANY requested point could be unvalidated,
+         * simpler and no less honest than a per-point skip (a deck that
+         * wants SOME points below the band and some above should split
+         * into two .pac cards, same as any other sweep-range constraint
+         * this project's tools already impose). Never silent either way:
+         * a clear stderr line whichever branch is taken, same "no
+         * silently-unvalidated number" convention as every other guard in
+         * this file. */
+        {
+            double fsw_pac = (T_pac > 0.0) ? 1.0 / T_pac : 0.0;
+            double band_limit = 0.25 * fsw_pac;
+            int experimental = (getenv("PSS_FREERUN_PAC_EXPERIMENTAL") != NULL);
+            int above_band = (fsw_pac <= 0.0) || (job->PACfStop > band_limit);
+
+            if (above_band && !experimental) {
+                fprintf(stderr, "PSS-FREERUN: REFUSED -- the requested .pac/"
+                        ".pstb sweep's top frequency (%.6g Hz) exceeds the "
+                        "VALIDATED BAND for a free-running (trigger=) orbit "
+                        "(0.25 x fsw=%.6g Hz = %.6g Hz, fsw measured from "
+                        "this orbit's own polished period) -- validated to "
+                        "0.5dB/3deg against an independent reference "
+                        "(tools/pac_perturbed.py --freerun) up to ~23.7%% "
+                        "of fsw on R5, not yet above that (card #503 THIRD "
+                        "pass; docs/pss-pac.md). Not running -- this is NOT "
+                        "a silently-unvalidated number. Set "
+                        "PSS_FREERUN_PAC_EXPERIMENTAL=1 to run anyway "
+                        "(unvalidated above the band; not for production "
+                        "use), or lower the sweep's own top frequency to "
+                        "stay inside the band.\n",
+                        job->PACfStop, band_limit, band_limit);
+            } else {
+            if (above_band && experimental)
+                fprintf(stderr, "PSS-FREERUN: PSS_FREERUN_PAC_EXPERIMENTAL=1 -- "
+                        "running .pac/.pstb on this free-running orbit ABOVE "
+                        "the validated 0.25 x fsw=%.6g Hz band (sweep top "
+                        "%.6g Hz) -- UNVALIDATED there (root cause of the "
+                        "150kHz+/35%%+ disagreement not identified; card "
+                        "#503 THIRD pass). Not for production use -- see "
+                        "docs/pss-pac.md's free-running section.\n",
+                        band_limit, job->PACfStop);
+            else
+                fprintf(stderr, "PSS-FREERUN: running .pac/.pstb on this "
+                        "free-running orbit (validated to 0.5dB/3deg "
+                        "against an independent reference up to 0.25 x "
+                        "fsw=%.6g Hz on R5; card #503 THIRD/FOURTH pass, "
+                        "docs/pss-pac.md).\n", band_limit);
         if (fT && x_prev &&
             !pss_run_until_trigger(ckt, &map, x0_pac, node_num, trigval, dir,
                                     max_period, x1trial, &T_meas2,
@@ -4203,6 +4258,8 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                     "the trigger crossing from the converged x0 to estimate "
                     "the period-variation term; .pac/.pstb skipped.\n");
         }
+            }   /* end of "inside the band, or experimental" branch */
+        }   /* end of band-check block */
         if (reltol_tightened)
             ckt->CKTreltol = save_reltol_polish;   /* catch-all: any early-exit
                                                      * branch above that skipped
@@ -4211,20 +4268,6 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         if (fT) tfree(fT);
         if (x_prev) tfree(x_prev);
         if (x0_polished) tfree(x0_polished);
-    } else if (job->PSSdoPAC || job->PSSdoPSTB) {
-        fprintf(stderr, "PSS-FREERUN: WARNING -- .pac/.pstb on a free-"
-                "running (trigger=) orbit is REFUSED by default (card #489 "
-                "SECOND pass): a period-variation correction was derived "
-                "and implemented, but a 3+dB/10deg disagreement against an "
-                "independent reference at higher frequency (validated only "
-                "up to roughly 60kHz on R5's own 422.68kHz switching "
-                "frequency; root cause not identified -- see this file's "
-                "own comment above and docs/pss-pac.md's free-running "
-                "section) means it is not yet trustworthy. Skipping the "
-                ".pac/.pstb post-processing; the PSS-FREERUN orbit/Floquet "
-                "result above is still valid on its own. Set "
-                "PSS_FREERUN_PAC_EXPERIMENTAL=1 to run it anyway for "
-                "further investigation -- NOT for production use.\n");
     }
 
     err = OK;
