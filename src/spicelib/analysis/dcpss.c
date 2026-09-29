@@ -4473,9 +4473,15 @@ shootingexit:
             /* Terminates plot in Frequency Domain and frees the allocated memory */
             SPfrontEnd->OUTendPlot (job->PSSplot_fd) ;
 
-            /* Verify the frequency found */
+            /* Verify the frequency found.  card #502: with harmonics=1 there is
+             * only the DC line (pssResults/pssfreqs hold CKTharms entries), so
+             * there is no fundamental to verify; reading pssResults[msize] and
+             * pssfreqs[1] overflowed the heap.  Keep the guessed frequency. */
+            position = 0 ;
+            if (ckt->CKTharms >= 2) {
             max_freq = pssResults [msize] ;             /* max_freq = pssResults [1 * msize + 0] ; */
             position = 1 ;
+            }
             for (j = 1 ; j < ckt->CKTharms ; j++)
             {
                 for (i = 0 ; i < msize ; i++)
@@ -4488,7 +4494,7 @@ shootingexit:
                 }
             }
 
-            if (!pss_driven && pssfreqs [position] != ckt->CKTguessedFreq)
+            if (!pss_driven && ckt->CKTharms >= 2 && pssfreqs [position] != ckt->CKTguessedFreq)
             {
                 /* autonomous only: for a driven circuit the fundamental IS the
                  * source frequency -- relaunching at the strongest spectral
