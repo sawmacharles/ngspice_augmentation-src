@@ -2758,3 +2758,589 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     err = E_ITERLIM;
     goto shoot_cleanup;
 }
+
+
+/* ==================================================================== */
+/* card #489 (plan T6.2): FREE-RUNNING (autonomous) shooting.
+
+Design (see docs/pss-pac.md's free-running section for the full writeup;
+this comment is the short version kept next to the code):
+
+  - `.pss Fguess StabTime OscNode Points Harmonics SC_iter Steady_coeff
+    [uic] method=shoot trigger=<node> [trigval=<v>] [trigdir=rise|fall]`.
+    OscNode is unused here (same as the driven engine's own comment),
+    Fguess is a rough PERIOD ESTIMATE (not an exact clock -- unlike the
+    driven engine, this circuit's period is an OUTPUT, not an input).
+
+  - The Poincare section is g(x,t) := v(trigger) - trigval = 0, crossed in
+    the given direction (trigdir). x0 is defined as "the shooting state
+    (native capacitor voltages / inductor currents, same state vector the
+    driven engine uses) at the instant of a trigger crossing" -- so x0
+    itself always satisfies g(x0)=0 at the converged fixed point, though
+    intermediate Newton iterates and FD perturbations do not (see below).
+
+  - T is NOT a separate Newton unknown (the task's "or use a bordered
+    Newton with a phase condition if cleaner; justify" alternative was
+    considered and NOT used): instead, exactly as SIMPLIS's POP algorithm
+    does (research/simplis-pop-ac.md Sec.2, Sec.6 Stage 1), T falls out of
+    EVENT LOCATION -- pss_run_until_trigger() below integrates from a
+    given x0 until the FIRST qualifying crossing, however long that takes
+    (up to MAX_PERIOD), and returns both the endpoint state x(T) and the
+    measured T itself. This is simpler to implement correctly on top of
+    this file's existing machinery (SAME period-map/Newton/dense-solve/
+    eigenvalue building blocks the driven engine already uses) than a
+    bordered (n+1)x(n+1) system, and -- see the next paragraph -- it also
+    sidesteps needing the explicit terminal-projection formula.
+
+  - Monodromy: the Newton unknown is x0 (n-dimensional, unconstrained
+    during the search -- see below), and the residual is the ordinary
+    shooting residual F(x0) = x(T(x0)) - x0, exactly the driven engine's
+    own F, just with T now itself a function of x0. The monodromy M used
+    in Newton is the plain central finite difference of this SAME map:
+    M[:,j] = (P(x0+h*e_j) - P(x0-h*e_j)) / (2h), where P(x0) :=
+    x(T(x0)) is the FULL run_until_trigger() round trip (integrate, then
+    locate and land exactly on the NEXT crossing) -- run independently for
+    each perturbed x0, so each perturbed trajectory finds ITS OWN
+    (slightly different) crossing time. This matters: research/simplis-
+    pop-ac.md Sec.6 Stage 1 gives the analytic alternative, a terminal
+    projection M = (I - f(T) grad(g)^T / (grad(g).f(T))) * Psi(T), needed
+    because the RAW variational-equation monodromy Psi(T) (state-to-state
+    sensitivity at a FIXED T) has a spurious unit ("trivial") eigenvalue
+    in the flow direction and must be projected onto the section before
+    Newton/Floquet make sense. This file's FD scheme above needs NO
+    separate projection step: because each perturbed run relocates its
+    OWN crossing (not a fixed T), its output x(T(x0+h*e_j)) is BY
+    CONSTRUCTION always exactly ON the section (g=0) for every column,
+    the same way the baseline's output is -- so the FD difference quotient
+    directly estimates the derivative of the SECTION-TO-SECTION return
+    map, which IS M, mechanically reproducing what the projection formula
+    computes analytically. (The perturbed x0+h*e_j ITSELF is generally
+    slightly OFF the section -- e.g. perturbing along a direction with a
+    component normal to g=0 -- but pss_run_until_trigger() does not
+    require its INPUT to be on the section, only integrates from
+    wherever it is given until the first qualifying crossing, so this is
+    not a problem.) Consequence: M as computed here is RANK n-1, not n --
+    it has exactly one eigenvalue collapsed to (near) ZERO, not one, in
+    the direction the projection removed (see "Floquet" below); this is
+    the expected, correct signature of a working terminal-projected
+    monodromy, not a bug.
+
+  - Saltation: NONE needed (design ruling #447 A, smooth switch models
+    only, same restriction as the driven engine) -- every device in a
+    circuit this engine is asked to run is a continuous function of its
+    inputs, so "discretise-then-linearise is consistent" (research/
+    ngspice-internals-pss-pac.md Sec.4.5) applies here exactly as it does
+    to the driven engine's own FD monodromy: the per-step Jacobians the
+    transient already computes carry the switching instant's dependence
+    on the state, provided the timestep resolves the transition (same
+    Points-driven CKTmaxStep discipline as the driven engine).
+
+  - Floquet: eigenvalues of M (psseigen.c, unchanged). Because M is the
+    ALREADY-PROJECTED monodromy (see above), its trivial multiplier sits
+    near 0 (the direction the projection annihilates), NOT near 1 (where
+    it would sit in the UNprojected Psi(T) -- the textbook "flow
+    direction always has multiplier 1" fact). This engine identifies the
+    trivial direction as whichever eigenvalue has the SMALLEST modulus
+    and reports it separately, labelled "trivial (projected flow
+    direction)"; the other n-1 eigenvalues are the genuine Floquet
+    multipliers, and stability is max|lambda| < 1 over THOSE n-1 only
+    (excluding the trivial one, same convention the task asks for, just
+    relocated from 1 to 0 by this engine's particular way of computing
+    M).
+
+  - Honest failure: pss_run_until_trigger() returning "not found" (no
+    qualifying crossing within MAX_PERIOD) is reported as FAILED, never a
+    steady state -- this is what makes a collapsed-hysteresis-band or
+    stable-DC-point red-proof deck come back "no periodic orbit" instead
+    of silently reporting the (non-oscillating) DC operating point as if
+    it were one. A trigger= node that does not exist, or is not wired to
+    anything live, degrades the same way (its voltage never reaches
+    trigval, or the run itself fails to converge) -- refused the same
+    honest way, with no special-case code needed for it.
+
+  - What this does NOT do (see the card #489 report for the full list):
+    no Broyden/staged-warm-up sophistication (a single StabTime warm-up
+    transient, then plain damped-step FD Newton -- the driven engine's
+    fuller machinery was not ported here given the time available this
+    pass); no analytic (discretise-then-linearise) Jacobian (FD only,
+    same as the driven engine's own default); no fast-state reduction;
+    `.pac`/`.pstb` on the converged free-running orbit are explicitly
+    refused below with a clear message (the existing pacshoot.c engine's
+    LPTV linearisation assumes a FIXED period and has no period-variation
+    term, which a free-running orbit's small-signal response needs -- see
+    docs/pss-pac.md's free-running section for what that term is and why
+    it was not implemented this pass).
+**********/
+
+/* card #489: trigger-crossing detector. Same call-site/no-op-unless-active
+ * pattern as PSSbreakRecordStep/PSSsensRecordStep/PSSrippleRecordStep
+ * above -- see pssshoot.h. Freezes on the FIRST qualifying crossing after
+ * t=0 (subsequent accepted steps are ignored once found), so repeated
+ * calls within one long probe run never overwrite an already-found
+ * bracket. t<=0 is skipped for the same reason the three existing hooks
+ * skip it (ckt->CKTrhsOld is not trustworthy at the exact UIC-restart
+ * instant) -- the practical effect is just that the very first accepted
+ * step establishes "prev" with no crossing test, and testing starts from
+ * the second accepted step on; MAX_PERIOD is many periods long, so this
+ * costs nothing worth avoiding. */
+
+int PSStrigActive = 0;
+
+static PSSstateMap *g_trig_map = NULL;
+static int    g_trig_node_num = -1;
+static double g_trig_val = 0.5;
+static int    g_trig_dir = 1;
+static int    g_trig_found = 0;
+static int    g_trig_have_prev = 0;
+static double g_trig_prev_t = 0.0, g_trig_prev_v = 0.0;
+static double *g_trig_prev_x = NULL;   /* [n] */
+static double g_trig_t_lo = 0.0, g_trig_v_lo = 0.0;
+static double g_trig_t_hi = 0.0, g_trig_v_hi = 0.0;
+static double *g_trig_x_lo = NULL;     /* [n], snapshot at t_lo */
+
+static void
+pss_trig_reset(PSSstateMap *map, int node_num, double val, int dir)
+{
+    g_trig_map = map;
+    g_trig_node_num = node_num;
+    g_trig_val = val;
+    g_trig_dir = dir;
+    g_trig_found = 0;
+    g_trig_have_prev = 0;
+    if (!g_trig_prev_x) g_trig_prev_x = TMALLOC(double, map->n);
+    if (!g_trig_x_lo)   g_trig_x_lo   = TMALLOC(double, map->n);
+}
+
+static void
+pss_trig_free(void)
+{
+    if (g_trig_prev_x) tfree(g_trig_prev_x);
+    if (g_trig_x_lo)   tfree(g_trig_x_lo);
+    g_trig_prev_x = g_trig_x_lo = NULL;
+    g_trig_map = NULL;
+    g_trig_node_num = -1;
+    g_trig_found = g_trig_have_prev = 0;
+}
+
+void
+PSStrigRecordStep(CKTcircuit *ckt)
+{
+    double v;
+    int k;
+
+    if (!g_trig_map || g_trig_node_num < 0 || g_trig_found)
+        return;
+    if (ckt->CKTtime <= 0.0)
+        return;
+
+    v = ckt->CKTrhsOld[g_trig_node_num];
+
+    if (g_trig_have_prev) {
+        int cross = 0;
+        if (g_trig_dir > 0 && g_trig_prev_v < g_trig_val && v >= g_trig_val)
+            cross = 1;
+        else if (g_trig_dir < 0 && g_trig_prev_v > g_trig_val && v <= g_trig_val)
+            cross = 1;
+        if (cross) {
+            g_trig_t_lo = g_trig_prev_t; g_trig_v_lo = g_trig_prev_v;
+            g_trig_t_hi = ckt->CKTtime;  g_trig_v_hi = v;
+            for (k = 0; k < g_trig_map->n; k++)
+                g_trig_x_lo[k] = g_trig_prev_x[k];
+            g_trig_found = 1;
+            return;   /* freeze: first qualifying crossing only */
+        }
+    }
+
+    g_trig_prev_t = ckt->CKTtime;
+    g_trig_prev_v = v;
+    for (k = 0; k < g_trig_map->n; k++)
+        g_trig_prev_x[k] = pss_state_value(&g_trig_map->refs[k], ckt);
+    g_trig_have_prev = 1;
+}
+
+/* The free-running period map: integrate from x0 (written into the device
+ * IC fields, same restart mechanism as pss_run_period()) until the FIRST
+ * qualifying trigger crossing, refine the exact crossing time by regula
+ * falsi/bisection (restarting from the bracket's pre-crossing state each
+ * trial -- cheap, each trial spans at most one of the outer probe run's
+ * own accepted steps), then read back the full shooting-state vector at
+ * that exact instant. Returns 0 and fills x_T/T_measured on success, 1 on
+ * failure (no crossing within max_period, or an integration error) --
+ * failure is the caller's cue to report FAILED/non-convergence, never a
+ * false steady state (see this file's card #489 header comment). */
+static int
+pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
+                       int node_num, double trigval, int dir,
+                       double max_period, double *x_T, double *T_measured)
+{
+    int err, iter;
+    double dt_lo, dt_hi, v_lo, v_hi, dt_mid = 0.0, v_mid = 0.0;
+
+    pss_state_set_ic(map, x0);
+    pss_trig_reset(map, node_num, trigval, dir);
+    PSStrigActive = 1;
+    err = pss_run_period(ckt, max_period, "PSS freerun (trigger probe)");
+    PSStrigActive = 0;
+
+    if (err || !g_trig_found) {
+        pss_trig_free();
+        return 1;
+    }
+
+    dt_lo = 0.0;                          v_lo = g_trig_v_lo;
+    dt_hi = g_trig_t_hi - g_trig_t_lo;    v_hi = g_trig_v_hi;
+    dt_mid = dt_hi; v_mid = v_hi;   /* fallback if the loop body never runs */
+
+    for (iter = 0; iter < 40; iter++) {
+        double denom = v_hi - v_lo;
+        if (fabs(denom) < 1e-300)
+            break;
+        /* regula falsi, with a bisection fallback if it ever steps outside
+         * the current bracket (can happen on a strongly curved crossing) */
+        dt_mid = dt_lo + (dt_hi - dt_lo) * (trigval - v_lo) / denom;
+        if (!(dt_mid > dt_lo && dt_mid < dt_hi))
+            dt_mid = 0.5 * (dt_lo + dt_hi);
+
+        pss_state_set_ic(map, g_trig_x_lo);
+        err = pss_run_period(ckt, dt_mid, "PSS freerun (trigger refine)");
+        if (err) { pss_trig_free(); return 1; }
+        v_mid = ckt->CKTrhsOld[node_num];
+
+        if (fabs(v_mid - trigval) <= 1e-12 * (1.0 + fabs(trigval)))
+            break;
+        if ((dir > 0 && v_mid < trigval) || (dir < 0 && v_mid > trigval)) {
+            dt_lo = dt_mid; v_lo = v_mid;
+        } else {
+            dt_hi = dt_mid; v_hi = v_mid;
+        }
+        if (dt_hi - dt_lo < 1e-15 * (1.0 + dt_hi))
+            break;
+    }
+
+    pss_state_set_ic(map, g_trig_x_lo);
+    err = pss_run_period(ckt, dt_mid, "PSS freerun (trigger endpoint)");
+    if (!err)
+        pss_state_get(map, ckt, x_T);
+    *T_measured = g_trig_t_lo + dt_mid;
+    pss_trig_free();
+    return err;
+}
+
+
+int
+PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
+{
+    PSSstateMap map;
+    int n = 0, j, k, iter, err = OK;
+    double *x0 = NULL, *x1 = NULL, *F = NULL, *M = NULL, *delta = NULL;
+    double *xtrial = NULL, *x1trial = NULL, *scale = NULL, *ripple = NULL;
+    double *A = NULL, *b = NULL;
+    PSScomplex *eig = NULL;
+    double T = 0.0, Tguess, max_period, tol, eps;
+    double save_reltol, save_abstol, save_volttol;
+    int node_num, dir;
+    double trigval;
+    int converged = 0, maxiter;
+    double residual = 0.0;
+    double t_wall_start, t_wall_end;
+
+    map.n = 0; map.refs = NULL;
+
+    if (!job->PSStrigNode) {
+        fprintf(stderr, "PSS-FREERUN: internal error -- dispatched with no "
+                "trigger node (should have been refused before this "
+                "point).\n");
+        return E_UNSUPP;
+    }
+    node_num = job->PSStrigNode->number;
+    trigval  = job->PSStrigVal;
+    dir      = job->PSStrigDir ? job->PSStrigDir : 1;
+
+    if (pss_build_state_map(ckt, &map) || map.n == 0) {
+        fprintf(stderr, "PSS-FREERUN: no capacitor/inductor states found -- "
+                "nothing to shoot.\n");
+        if (map.refs) tfree(map.refs);
+        return E_UNSUPP;
+    }
+    n = map.n;
+
+    Tguess = (job->PSSguessedFreq > 0.0) ? 1.0 / job->PSSguessedFreq : 1e-6;
+    /* MAX_PERIOD: 10x the guess -- SIMPLIS's own free-running guidance
+     * (research/simplis-pop-ac.md Sec.2: "Self-oscillating systems: ...
+     * MAX_PERIOD should be about 10x"), looser than the driven-mode
+     * (clocked) recommendation there (>=3x) since there is no known clock
+     * to bound the search here. */
+    max_period = 10.0 * Tguess;
+
+    ckt->CKTmaxStep = Tguess / (job->PSSpoints > 0 ? (double) job->PSSpoints : 200.0);
+    ckt->CKTdelmin  = 1e-9 * ckt->CKTmaxStep;
+    ckt->CKTmode    = job->PSSmode | MODEUIC;
+    ckt->CKTinitTime = 0.0;
+
+    save_reltol  = ckt->CKTreltol;
+    save_abstol  = ckt->CKTabstol;
+    save_volttol = ckt->CKTvoltTol;
+    if (1e-5 < save_reltol)
+        ckt->CKTreltol = 1e-5;   /* same tightening rationale as the driven engine */
+
+    x0 = TMALLOC(double, n); x1 = TMALLOC(double, n);
+    F  = TMALLOC(double, n); M  = TMALLOC(double, (size_t) n * n);
+    delta = TMALLOC(double, n);
+    xtrial = TMALLOC(double, n); x1trial = TMALLOC(double, n);
+    scale = TMALLOC(double, n); ripple = TMALLOC(double, n);
+    A = TMALLOC(double, (size_t) n * n); b = TMALLOC(double, n);
+    if (!x0 || !x1 || !F || !M || !delta || !xtrial || !x1trial ||
+        !scale || !ripple || !A || !b) {
+        err = E_NOMEM;
+        goto fr_cleanup;
+    }
+
+    /* Warm-up: StabTime seconds of plain transient from the deck's own
+     * device IC=/default state, mirroring the driven engine's own
+     * pre-stabilisation budget (same card field) -- needed here because a
+     * hysteretic/free-running converter's cold start can be far from its
+     * eventual limit cycle (refs/r5_hysteretic_buck.cir's own header: "q
+     * stays pinned at 1 ... until Vout first reaches vref_hi", settling
+     * to steady switching only after ~400us on that deck) and this
+     * engine, unlike the driven one, has no staged-warm-up/Broyden
+     * escalation to fall back on if Newton is started too far from the
+     * orbit. */
+    pss_state_get_ic(&map, x0);
+    if (job->PSSstabTime > 0.0) {
+        pss_state_set_ic(&map, x0);
+        err = pss_run_period(ckt, job->PSSstabTime, "PSS freerun (warm-up)");
+        if (err) {
+            fprintf(stderr, "PSS-FREERUN: WARNING -- the StabTime=%.6g s "
+                    "warm-up transient failed (ngspice error %d); starting "
+                    "Newton from the deck's own IC instead (may not "
+                    "converge).\n", job->PSSstabTime, err);
+        } else {
+            pss_state_get(&map, ckt, x0);
+        }
+        err = OK;
+    }
+
+    tol     = (job->steady_coeff > 0.0) ? job->steady_coeff : 1e-6;
+    maxiter = (job->sc_iter > 0) ? job->sc_iter : 50;
+    eps     = 1e-6;
+
+    t_wall_start = SPfrontEnd->IFseconds();
+
+    for (iter = 0; iter < maxiter; iter++) {
+        double Tmeas;
+
+        pss_ripple_reset(&map, x0);
+        PSSrippleRecordActive = 1;
+        err = pss_run_until_trigger(ckt, &map, x0, node_num, trigval, dir,
+                                     max_period, x1, &Tmeas);
+        PSSrippleRecordActive = 0;
+        if (err) {
+            fprintf(stderr, "PSS-FREERUN: no trigger crossing found within "
+                    "MAX_PERIOD=%.6g s (10x the fguess estimate) at Newton "
+                    "iteration %d -- either trigger=/trigval=/trigdir= "
+                    "names the wrong node/threshold/direction, or this "
+                    "circuit genuinely has no periodic orbit here (e.g. a "
+                    "collapsed hysteresis band or a stable DC point that "
+                    "never re-crosses); reporting FAILED, not a false "
+                    "steady state.\n", max_period, iter);
+            goto fr_fail;
+        }
+        pss_ripple_get(&map, ripple);
+        T = Tmeas;
+
+        residual = 0.0;
+        for (k = 0; k < n; k++) {
+            F[k] = x1[k] - x0[k];
+            scale[k] = (ripple[k] > 1e-9) ? ripple[k] : 1e-9;
+            { double r = fabs(F[k]) / scale[k]; if (r > residual) residual = r; }
+        }
+        fprintf(stdout, "PSS-FREERUN: iter=%d residual=%.6e period=%.9g "
+                "fsw=%.6g\n", iter, residual, T, 1.0 / T);
+        fflush(stdout);
+
+        if (residual <= tol) { converged = 1; break; }
+
+        /* central-FD monodromy -- see this file's card #489 header
+         * comment for why this is already the terminal-projected M. */
+        for (j = 0; j < n; j++) {
+            double h = fabs(x0[j]) * eps; double Tp, Tm;
+            if (h < 1e-9) h = 1e-9;
+
+            for (k = 0; k < n; k++) xtrial[k] = x0[k];
+            xtrial[j] += h;
+            if (pss_run_until_trigger(ckt, &map, xtrial, node_num, trigval,
+                                       dir, max_period, x1trial, &Tp)) {
+                fprintf(stderr, "PSS-FREERUN: monodromy perturbation (+h, "
+                        "state %d) lost the trigger crossing at iter=%d; "
+                        "treating this attempt as non-convergent.\n", j, iter);
+                goto fr_fail;
+            }
+            for (k = 0; k < n; k++) M[k * n + j] = x1trial[k];
+
+            for (k = 0; k < n; k++) xtrial[k] = x0[k];
+            xtrial[j] -= h;
+            if (pss_run_until_trigger(ckt, &map, xtrial, node_num, trigval,
+                                       dir, max_period, x1trial, &Tm)) {
+                fprintf(stderr, "PSS-FREERUN: monodromy perturbation (-h, "
+                        "state %d) lost the trigger crossing at iter=%d; "
+                        "treating this attempt as non-convergent.\n", j, iter);
+                goto fr_fail;
+            }
+            for (k = 0; k < n; k++)
+                M[k * n + j] = (M[k * n + j] - x1trial[k]) / (2.0 * h);
+        }
+
+        for (k = 0; k < n * n; k++) A[k] = M[k];
+        for (k = 0; k < n; k++) A[k * n + k] -= 1.0;
+        for (k = 0; k < n; k++) b[k] = -F[k];
+        if (pss_solve_dense(A, b, n, delta)) {
+            fprintf(stderr, "PSS-FREERUN: singular (M-I) at iter=%d -- "
+                    "cannot take a Newton step; reporting FAILED.\n", iter);
+            goto fr_fail;
+        }
+
+        {
+            double damp = 1.0;
+            int bt, accepted = 0;
+            for (bt = 0; bt < 10 && !accepted; bt++) {
+                double newres = 0.0, Tt; int ok2;
+                for (k = 0; k < n; k++) xtrial[k] = x0[k] + damp * delta[k];
+                ok2 = !pss_run_until_trigger(ckt, &map, xtrial, node_num,
+                                              trigval, dir, max_period,
+                                              x1trial, &Tt);
+                if (ok2) {
+                    for (k = 0; k < n; k++) {
+                        double r = fabs(x1trial[k] - xtrial[k]) / scale[k];
+                        if (r > newres) newres = r;
+                    }
+                }
+                if ((ok2 && newres < residual * 1.5) || bt == 9) {
+                    for (k = 0; k < n; k++) x0[k] = xtrial[k];
+                    accepted = 1;
+                }
+                damp *= 0.5;
+            }
+        }
+    }
+
+    if (!converged) {
+        fprintf(stderr, "PSS-FREERUN: FAILED to converge within %d Newton "
+                "iterations (final residual %.6e, tol %.3e); this is NOT a "
+                "periodic orbit.\n", maxiter, residual, tol);
+        goto fr_fail;
+    }
+    t_wall_end = SPfrontEnd->IFseconds();
+
+    /* Floquet: see this file's card #489 header comment -- M is already
+     * the projected monodromy, so its trivial direction sits near 0, not
+     * 1; identify it as the smallest-modulus eigenvalue and report the
+     * other n-1 as the genuine multipliers. */
+    eig = TMALLOC(PSScomplex, n);
+    if (eig && pss_eigenvalues(M, n, eig) == 0) {
+        int trivial_idx = 0, kk;
+        double trivial_mag = 1e300, specrad = -1.0;
+        for (kk = 0; kk < n; kk++) {
+            double mag = sqrt(eig[kk].re * eig[kk].re + eig[kk].im * eig[kk].im);
+            if (mag < trivial_mag) { trivial_mag = mag; trivial_idx = kk; }
+        }
+        for (kk = 0; kk < n; kk++) {
+            double mag;
+            if (kk == trivial_idx) continue;
+            mag = sqrt(eig[kk].re * eig[kk].re + eig[kk].im * eig[kk].im);
+            if (mag > specrad) specrad = mag;
+        }
+        fprintf(stdout, "\nPSS-FREERUN: CONVERGED iter=%d residual=%.6e "
+                "period=%.9g fsw=%.6g spectral_radius=%.6f %s "
+                "wall_time=%.3fs\n", iter, residual, T, 1.0 / T,
+                specrad, (n <= 1) ? "UNKNOWN(n=1, no non-trivial multiplier)" :
+                (specrad < 1.0 ? "stable" : "UNSTABLE"),
+                t_wall_end - t_wall_start);
+        fprintf(stdout, "PSS-FREERUN: FLOQUET trivial(projected flow "
+                "direction, index %d)=%.6g%+.6gi (expect near 0)\n",
+                trivial_idx, eig[trivial_idx].re, eig[trivial_idx].im);
+        for (kk = 0; kk < n; kk++) {
+            double mag;
+            if (kk == trivial_idx) continue;
+            mag = sqrt(eig[kk].re * eig[kk].re + eig[kk].im * eig[kk].im);
+            fprintf(stdout, "PSS-FREERUN: FLOQUET multiplier[%d]=%.6g%+.6gi "
+                    "|.|=%.6g\n", kk, eig[kk].re, eig[kk].im, mag);
+        }
+    } else {
+        fprintf(stderr, "PSS-FREERUN: WARNING -- the eigenvalue solver did "
+                "not converge on the monodromy matrix; Floquet report is "
+                "NOT trustworthy this run.\n");
+        fprintf(stdout, "\nPSS-FREERUN: CONVERGED iter=%d residual=%.6e "
+                "period=%.9g fsw=%.6g spectral_radius=UNKNOWN "
+                "wall_time=%.3fs\n", iter, residual, T, 1.0 / T,
+                t_wall_end - t_wall_start);
+    }
+
+    if (getenv("PSS_FREERUN_DEBUG")) {
+        int kk;
+        for (kk = 0; kk < n; kk++)
+            fprintf(stderr, "DEBUG x0[%d] (%s) = %.10g\n", kk,
+                    map.refs[kk].isCap ? "cap" : "ind", x0[kk]);
+    }
+
+    /* Emit the converged trajectory as an ordinary time-domain plot -- now
+     * that T is converged/known, this is a single plain period run (same
+     * mechanism as the driven engine's own emission), not another
+     * trigger-relocation round trip. */
+    pss_state_set_ic(&map, x0);
+    err = pss_run_period(ckt, T, "Time Domain Periodic Steady State Analysis (free-running)");
+    if (err) {
+        fprintf(stderr, "PSS-FREERUN: WARNING -- converged, but the final "
+                "trajectory output run failed (ngspice error %d); the "
+                "CONVERGED line above is still accurate for the orbit "
+                "itself, just not the emitted plot.\n", err);
+    }
+
+    /* card #489: `.pac`/`.pstb` on a free-running orbit -- NOT implemented
+     * this pass. pacshoot.c's LPTV linearisation (pac_pstb_run()) assumes
+     * a FIXED period T with no period-variation term; a free-running
+     * orbit's true small-signal response needs that term (how T itself
+     * shifts under a perturbation feeds back into every sideband -- see
+     * docs/pss-pac.md's free-running section for the derivation of what
+     * is missing and why). Refused here with a clear, honest message
+     * rather than silently running the fixed-period engine on a moving-
+     * period orbit and reporting a wrong number. */
+    if (job->PSSdoPAC || job->PSSdoPSTB) {
+        fprintf(stderr, "PSS-FREERUN: WARNING -- .pac/.pstb on a free-"
+                "running (trigger=) orbit is NOT implemented this pass "
+                "(card #489): pacshoot.c's existing engine assumes a FIXED "
+                "period and has no period-variation term, which a free-"
+                "running orbit's small-signal response needs (see docs/"
+                "pss-pac.md's free-running section). Skipping the .pac/"
+                ".pstb post-processing; the PSS-FREERUN orbit/Floquet "
+                "result above is still valid on its own.\n");
+    }
+
+    err = OK;
+
+ fr_cleanup:
+    ckt->CKTreltol  = save_reltol;
+    ckt->CKTabstol  = save_abstol;
+    ckt->CKTvoltTol = save_volttol;
+    PSStrigActive = 0;
+    pss_trig_free();
+    PSSrippleRecordActive = 0;
+    pss_ripple_free();
+    if (x0) tfree(x0);
+    if (x1) tfree(x1);
+    if (F) tfree(F);
+    if (M) tfree(M);
+    if (delta) tfree(delta);
+    if (xtrial) tfree(xtrial);
+    if (x1trial) tfree(x1trial);
+    if (scale) tfree(scale);
+    if (ripple) tfree(ripple);
+    if (A) tfree(A);
+    if (b) tfree(b);
+    if (eig) tfree(eig);
+    if (map.refs) tfree(map.refs);
+    return err;
+
+ fr_fail:
+    err = E_ITERLIM;
+    goto fr_cleanup;
+}

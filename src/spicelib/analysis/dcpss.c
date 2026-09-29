@@ -39,6 +39,7 @@ extern char* eng(double value, int digits, bool numeric, bool bytes);
 
 /* card #458: shooting-Newton driven PSS, implemented in pssshoot.c */
 extern int PSSshootDriven(CKTcircuit *ckt, PSSan *job);
+extern int PSSshootFreerun(CKTcircuit *ckt, PSSan *job);   /* card #489 */
 
 #define INIT_STATS() \
 do { \
@@ -3523,11 +3524,25 @@ DCpss(CKTcircuit *ckt,
      * so a `method=shoot` deck without a driven source gets a clear error
      * instead of a wrong answer. */
     if (job->PSSmethod == PSS_METHOD_SHOOT) {
+        /* card #489 (plan T6.2): a `trigger=<node>` card selects the
+         * free-running (autonomous) Poincare-section engine instead of
+         * the fixed-period driven engine, REGARDLESS of whether a driven
+         * source was also detected above -- an explicit trigger= is the
+         * deck asking for event-located shooting, so it takes precedence
+         * (a hybrid deck with both a driving clock AND a trigger, e.g.
+         * COT/QR converters, is exactly the case the free-running engine
+         * is for; see docs/pss-pac.md). design ruling #446 B/#447 A's
+         * original free-running refusal (card #458 scope, smooth-switch-
+         * only) is UNCHANGED for a deck with no trigger= at all. */
+        if (job->PSStrigNode) {
+            return PSSshootFreerun(ckt, job);
+        }
         if (!pss_driven) {
             fprintf(stderr, "Error: .pss method=shoot needs a driven "
-                    "(clocked) circuit -- no V/I source with a time "
-                    "function was found. Free-running shooting is not "
-                    "implemented (card #458 scope).\n");
+                    "(clocked) circuit, or an explicit trigger=<node> for "
+                    "free-running (autonomous) shooting (card #489) -- no "
+                    "V/I source with a time function was found and no "
+                    "trigger= was given.\n");
             return (E_UNSUPP);
         }
         return PSSshootDriven(ckt, job);

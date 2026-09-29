@@ -119,6 +119,25 @@ typedef struct {
      * behaviour to before this field existed). See pacshoot.c's
      * pac_run_period() for the resolution order. */
     long int PACrecordPoints;
+
+    /* card #489 (plan T6.2): free-running (autonomous) shooting. A
+     * `.pss ... trigger=<node> [trigval=<v>] [trigdir=rise|fall]
+     * method=shoot` card selects the Poincare-section engine
+     * (PSSshootFreerun(), pssshoot.c) instead of the fixed-period driven
+     * engine (PSSshootDriven()) -- selected whenever PSStrigNode is
+     * non-NULL (trigger= was given), independent of whether a driven
+     * source is also detected (a trigger takes precedence: the deck asked
+     * for event-located shooting explicitly). fguess is then used only as
+     * a rough period ESTIMATE (to size MAX_PERIOD and StabTime's own
+     * pre-run), not an exact clock -- unlike the driven engine, where it
+     * is the exact clock. See docs/pss-pac.md's free-running section for
+     * the algorithm (event-located Poincare map, no explicit saltation --
+     * design ruling #447 A restricts this engine to smooth switch models,
+     * same as the driven engine, so every "event" here is a smooth
+     * threshold crossing, not a true discontinuity). */
+    CKTnode *PSStrigNode;    /* NULL = driven/fixed-period (default, unchanged) */
+    double   PSStrigVal;     /* threshold the trigger node must cross (default 0.5) */
+    int      PSStrigDir;     /* +1 = rise (default), -1 = fall */
 } PSSan;
 
 enum {
@@ -158,6 +177,9 @@ enum {
     PSTB_DO,
     PSTB_PROBE,
     PAC_RECPOINTS,
+    TRIG_NODE,
+    TRIG_VAL,
+    TRIG_DIR,
 };
 
 #endif

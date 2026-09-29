@@ -96,4 +96,13 @@ extern int PSSrippleRecordActive;
 
 void PSSrippleRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), same site as the hooks above */
 
+/* ---- card #489 (plan T6.2): free-running (autonomous) shooting's
+ * Poincare-section trigger detector. Same no-op-unless-active pattern as
+ * the hooks above. See pssshoot.c's PSStrigRecordStep() header comment
+ * for the crossing-detection/bracketing it does. ---- */
+
+extern int PSStrigActive;   /* dctran.c: watch the trigger node for a crossing */
+
+void PSStrigRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), same site as the hooks above */
+
 #endif

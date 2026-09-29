@@ -139,6 +139,25 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->PACrecordPoints = value->iValue;
         break;
 
+    /* card #489: free-running (autonomous) shooting trigger. */
+    case TRIG_NODE:
+        job->PSStrigNode = value->nValue;
+        break;
+    case TRIG_VAL:
+        job->PSStrigVal = value->rValue;
+        break;
+    case TRIG_DIR:
+        if (value->sValue && strcmp(value->sValue, "rise") == 0)
+            job->PSStrigDir = 1;
+        else if (value->sValue && strcmp(value->sValue, "fall") == 0)
+            job->PSStrigDir = -1;
+        else {
+            fprintf(stderr, "Error: .pss trigdir=%s not recognised "
+                    "(known: rise (default), fall) - ignored\n",
+                    value->sValue ? value->sValue : "?");
+        }
+        break;
+
     default:
         return(E_BADPARM);
     }
@@ -172,7 +191,10 @@ static IFparm PSSparms[] = {
     { "solver",       PAC_SOLVER,	IF_SET|IF_STRING,	"PAC solver: fd (default, frequency-domain) or td (card #465, time-domain shooting-based)" },
     { "pstb",         PSTB_DO,		IF_SET|IF_INTEGER,	"run a .pstb periodic loop-gain sweep (card #465)" },
     { "pstb_probe",   PSTB_PROBE,	IF_SET|IF_STRING,	"pstb probe V-source instance name" },
-    { "pacpoints",    PAC_RECPOINTS,	IF_SET|IF_INTEGER,	"card #465: PAC/PSTB recording-pass time points per period (0/unset = deprecated PAC_RECORD_POINTS env var, else PSS's own points=)" }
+    { "pacpoints",    PAC_RECPOINTS,	IF_SET|IF_INTEGER,	"card #465: PAC/PSTB recording-pass time points per period (0/unset = deprecated PAC_RECORD_POINTS env var, else PSS's own points=)" },
+    { "trigger",      TRIG_NODE,	IF_SET|IF_STRING,	"card #489: free-running shooting Poincare-section trigger node (given = selects PSSshootFreerun)" },
+    { "trigval",      TRIG_VAL,	IF_SET|IF_REAL,		"card #489: trigger threshold voltage (default 0.5)" },
+    { "trigdir",      TRIG_DIR,	IF_SET|IF_STRING,	"card #489: trigger crossing direction, rise (default) or fall" }
 };
 
 SPICEanalysis PSSinfo  = {

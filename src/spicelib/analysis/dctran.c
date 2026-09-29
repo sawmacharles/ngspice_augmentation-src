@@ -554,6 +554,11 @@ DCtran(CKTcircuit *ckt,
        pass has it active. */
     if (PSSpacActive)
         PSSpacRecordStep(ckt);
+    /* card #489: free-running shooting's trigger-crossing detector, same
+       call site again. No-op unless PSSshootFreerun()'s own period-map
+       evaluation has it active. */
+    if (PSStrigActive)
+        PSStrigRecordStep(ckt);
 #endif
 
 #ifdef XSPICE

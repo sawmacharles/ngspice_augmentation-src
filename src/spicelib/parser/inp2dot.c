@@ -1158,10 +1158,22 @@ dot_pss(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* Steady coefficient */
     GCA(INPapName, (ckt, which, foo, "steady_coeff", parm));
 
+    /* card #489: trigval/trigdir defaults (0.5, rise) -- set here so the
+     * trailing-token loop below only needs to OVERRIDE them when the deck
+     * gives trigval=/trigdir= explicitly; a card with no trigger= at all
+     * never uses these (PSSshootFreerun() is only selected when
+     * PSStrigNode != NULL, set below only if trigger= appears). */
+    ptemp.rValue = 0.5;
+    GCA(INPapName, (ckt, which, foo, "trigval", &ptemp));
+    ptemp.sValue = "rise";
+    GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+
     /* card #458: zero or more trailing tokens, `uic` and/or `method=shoot`
      * (order-independent), on top of the existing (required, positional)
      * arguments above -- the pre-existing single-optional-"uic" behaviour
-     * is unchanged for decks that don't use `method=`.
+     * is unchanged for decks that don't use `method=`. card #489 adds
+     * `trigger=<node>` `trigval=<v>` `trigdir=rise|fall` (free-running
+     * shooting -- see pssdefs.h's PSStrigNode comment).
      *
      * Trap (found running the first shoot-mode smoke test): INPgetTok()
      * treats '=' as a plain separator character (inpgtok.c), not part of
@@ -1182,6 +1194,21 @@ dot_pss(char *line, void *ckt, INPtables *tab, struct card *current,
             INPgetTok(&line, &mword, 1);
             ptemp.sValue = mword;
             GCA(INPapName, (ckt, which, foo, "method", &ptemp));
+        } else if (strcmp(word, "trigger") == 0) {
+            char *tnname;
+            CKTnode *tnnode;
+            INPgetNetTok(&line, &tnname, 0);
+            INPtermInsert(ckt, &tnname, tab, &tnnode);
+            ptemp.nValue = tnnode;
+            GCA(INPapName, (ckt, which, foo, "trigger", &ptemp));
+        } else if (strcmp(word, "trigval") == 0) {
+            parm = INPgetValue(ckt, &line, IF_REAL, tab);
+            GCA(INPapName, (ckt, which, foo, "trigval", parm));
+        } else if (strcmp(word, "trigdir") == 0) {
+            char *dword;
+            INPgetTok(&line, &dword, 1);
+            ptemp.sValue = dword;
+            GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
         } else {
             fprintf(stderr,"Error: unknown parameter %s on .pss - ignored\n", word);
         }
