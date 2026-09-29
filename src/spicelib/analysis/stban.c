@@ -871,24 +871,39 @@ endsweep:
     {
         int pmi = -1, gmi = -1;
         double pmbest = 0.0, gmbest = 0.0;
-        /* card #464: Re(T) < 0 at the lowest swept frequency means the loop
-         * has not settled to the positive-real DC value a negative-feedback
-         * loop should have -- it is unstable there if |T|>1, and any PM/GM
-         * read off the sweep is not a real stability margin. Mirrors
-         * tools/stbcore.margins' "low_f_positive_feedback" / "note" exactly
-         * (found on the pre-fix refs/r1c_fully_diff.cir, 2026-09-29: this
-         * printed "phase margin 274/186 deg" for a loop that was actually
-         * unstable at DC). freqs[] is ascending (DECADE/OCTAVE/LINEAR sweeps
-         * only), so index 0 is always the lowest frequency swept. */
-        int low_f_posfb = (npts > 0) && (Tarr[0].re < 0.0);
+        /* card #464, narrowed by card #476: Re(T) < 0 alone at the lowest
+         * swept frequency false-triggered on healthy integrator-type loops
+         * (a few degrees of extra lag past -90 deg on a near-integrator
+         * compensator branch makes Re(T) slightly negative with no real
+         * instability -- found on tests/fixtures/compopt_r3_averaged_detuned.cir
+         * at fstart=10 Hz). DECISION (maintainer, option A, card #476): let
+         * arg0 = arg(T(fmin)) in degrees, mag0 = |T(fmin)|.
+         *   - low_f_posfb (the WARNING): |arg0| > 150 deg AND mag0 > 1 --
+         *     positive feedback WITH loop gain, cannot be stable in the
+         *     usual sense. Mirrors tools/stbcore.margins' "low_f_positive_
+         *     feedback" / "note" exactly (found on the pre-fix
+         *     refs/r1c_fully_diff.cir, 2026-09-29: this printed "phase
+         *     margin 274/186 deg" for a loop that was actually unstable at
+         *     DC).
+         *   - low_f_posfb_low_gain (a note, not the warning): |arg0| > 150
+         *     deg but mag0 <= 1.
+         *   - low_f_integrator (a neutral label): arg0 in [-120, -60] deg
+         *     (-90 +/- 30), ordinary integrator-like low-frequency behaviour.
+         * freqs[] is ascending (DECADE/OCTAVE/LINEAR sweeps only), so index 0
+         * is always the lowest frequency swept. */
+        double arg0 = (npts > 0) ? 180.0 / M_PI * stb_cph(Tarr[0]) : 0.0;
+        double mag0 = (npts > 0) ? stb_cmag(Tarr[0]) : 0.0;
+        int low_f_posfb = (npts > 0) && (fabs(arg0) > 150.0) && (mag0 > 1.0);
+        int low_f_posfb_low_gain = (npts > 0) && (fabs(arg0) > 150.0) && (mag0 <= 1.0);
+        int low_f_integrator = (npts > 0) && (arg0 >= -120.0) && (arg0 <= -60.0);
         for (i = 0; i < npm; i++)
             if (pmi < 0 || pmx[i].value < pmbest) { pmi = i; pmbest = pmx[i].value; }
         for (i = 0; i < ngm; i++)
             if (gmi < 0 || gmx[i].value < gmbest) { gmi = i; gmbest = gmx[i].value; }
 
         {
-            IFuid uids[6];
-            double outv[6];
+            IFuid uids[8];
+            double outv[8];
             runDesc *mplot = NULL;
             double nan = strtod("NaN", NULL);
 
@@ -898,9 +913,14 @@ endsweep:
             SPfrontEnd->IFnewUid(ckt, &uids[3], NULL, "gainMarginFreq", UID_OTHER, NULL);
             /* card #464: lowFPositiveFeedback (1/0) and phaseMarginFalling
              * (1.0 = usual falling |T| crossing, 0.0 = rising, NaN = no PM
-             * crossing at all) -- the scalar/flag mechanism the warning uses. */
+             * crossing at all) -- the scalar/flag mechanism the warning uses.
+             * card #476 (additive): lowFPositiveFeedbackLowGain (1/0, the
+             * note case: |arg0|>150 deg but mag0<=1) and lowFIntegrator
+             * (1/0, the neutral -90+/-30 deg label). */
             SPfrontEnd->IFnewUid(ckt, &uids[4], NULL, "lowFPositiveFeedback", UID_OTHER, NULL);
             SPfrontEnd->IFnewUid(ckt, &uids[5], NULL, "phaseMarginFalling", UID_OTHER, NULL);
+            SPfrontEnd->IFnewUid(ckt, &uids[6], NULL, "lowFPositiveFeedbackLowGain", UID_OTHER, NULL);
+            SPfrontEnd->IFnewUid(ckt, &uids[7], NULL, "lowFIntegrator", UID_OTHER, NULL);
 
             outv[0] = pmi >= 0 ? pmx[pmi].value : nan;
             outv[1] = pmi >= 0 ? pmx[pmi].freq : nan;
@@ -908,13 +928,15 @@ endsweep:
             outv[3] = gmi >= 0 ? gmx[gmi].freq : nan;
             outv[4] = low_f_posfb ? 1.0 : 0.0;
             outv[5] = pmi >= 0 ? pmx[pmi].aux : nan;
+            outv[6] = low_f_posfb_low_gain ? 1.0 : 0.0;
+            outv[7] = low_f_integrator ? 1.0 : 0.0;
 
             error = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob,
-                (IFuid) "STB Margins", NULL, 0, 6, uids, IF_REAL, &mplot);
+                (IFuid) "STB Margins", NULL, 0, 8, uids, IF_REAL, &mplot);
             if (!error) {
                 IFvalue refval, outdata;
                 refval.rValue = 0;
-                outdata.v.numValue = 6;
+                outdata.v.numValue = 8;
                 outdata.v.vec.rVec = outv;
                 SPfrontEnd->OUTpData(mplot, &refval, &outdata);
                 SPfrontEnd->OUTendPlot(mplot);
@@ -944,9 +966,17 @@ endsweep:
             printf(" (%d crossings found; the lowest margin is reported)", ngm);
         printf("\n");
 
+        /* card #476: exactly one of these three fires (disjoint arg0 ranges) --
+         * mirrors tools/stb.py's describe() elif chain exactly. */
         if (low_f_posfb) {
             printf("stb%s%s: WARNING: positive feedback at low frequency: loop is unstable "
                 "if |T|>1 there; phase/gain margins are not meaningful\n",
+                job->JOBname ? " " : "", job->JOBname ? (char *) job->JOBname : "");
+        } else if (low_f_posfb_low_gain) {
+            printf("stb%s%s: note: positive feedback at low frequency, loop gain < 1\n",
+                job->JOBname ? " " : "", job->JOBname ? (char *) job->JOBname : "");
+        } else if (low_f_integrator) {
+            printf("stb%s%s: note: integrator-like low-frequency behaviour\n",
                 job->JOBname ? " " : "", job->JOBname ? (char *) job->JOBname : "");
         }
     }
