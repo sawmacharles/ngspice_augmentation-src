@@ -870,6 +870,7 @@ estimate:
 /* card #505: replay mode. PSS_REPLAY=1 forces on, 0 off; default (unset) off
  * until validated -- see pss_replay_enabled() callers. */
 static int g_replay_mode = -1;   /* -1 = read env */
+static int g_pss_has_switch;      /* defined (with its comment) further down */
 static int
 pss_replay_enabled(void)
 {
@@ -890,7 +891,7 @@ pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
     if (record)
         pss_break_reset();
     PSSbreakRecordActive  = record;
-    if (force && pss_replay_enabled() && g_rp_n > 0) {
+    if (force && pss_replay_enabled() && g_rp_n > 0 && !g_pss_has_switch) {
         PSSreplayActive = 1;
         g_rp_idx = 0;
         PSSbreakInstallActive = 0;
@@ -3905,6 +3906,12 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * overrides; never reaches abstol/voltTol. */
         double tight_reltol = getenv("PSS_SHOOT_RELTOL") ? atof(getenv("PSS_SHOOT_RELTOL")) : 1e-5;
         if (tight_reltol > save_reltol || tight_reltol <= 0.0) tight_reltol = save_reltol;
+        /* card #505: tighter node-voltage tolerance for the Newton attempts only
+         * (PSS_SHOOT_VNTOL; 0 = the deck's own). The period map's noise floor
+         * (what two runs at x0 and x0+1e-12 disagree by) is ~ vntol: 7e-7 V on
+         * R3d's c1f against a convergence tolerance of 1e-6*0.0113 = 1.1e-8. */
+        double tight_vntol = getenv("PSS_SHOOT_VNTOL") ? atof(getenv("PSS_SHOOT_VNTOL")) : 0.0;
+        if (tight_vntol <= 0.0 || tight_vntol > save_volttol) tight_vntol = save_volttol;
 
         maxiter = (job->sc_iter > 0) ? job->sc_iter : 20;
         tol     = (job->steady_coeff > 0.0) ? job->steady_coeff : 1e-6;
@@ -3951,6 +3958,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                         M_init[k * n_slow + j] =
                             phi_full_detect[slow_idx[k] * n + slow_idx[j]];
             ckt->CKTreltol = tight_reltol;
+            ckt->CKTvoltTol = tight_vntol;   /* card #505 */
             converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
                                              maxiter, tol, eps, -1.0, broyden_enabled,
                                              broyden_period, "[no warm-up]",
@@ -3958,6 +3966,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                                              (phi_full_detect_valid && M_init) ? M_init : NULL,
                                              NULL);
             ckt->CKTreltol = save_reltol;
+            ckt->CKTvoltTol = save_volttol;   /* card #505 */
         } else {
             double stage_len = warmup_periods * T;
             double cumulative = 0.0;
@@ -4145,6 +4154,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 snprintf(label, sizeof label, "[stage %d/%s]", stage,
                          last_stage ? "final" : "probe");
                 ckt->CKTreltol = tight_reltol;
+                ckt->CKTvoltTol = tight_vntol;   /* card #505 */
                 {
                 double _pnt0 = getenv("PSS_SHOOT_PROFILE") ? SPfrontEnd->IFseconds() : 0.0;
                 int seed_used_this = 0;
@@ -4173,6 +4183,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 if (seed_used_this)
                     seed_available = 0;
                 ckt->CKTreltol = save_reltol;
+                ckt->CKTvoltTol = save_volttol;   /* card #505 */
                 if (getenv("PSS_SHOOT_PROFILE"))
                     fprintf(stderr, "PROFILE: stage %d newton attempt (%d iters) "
                             "took %.4fs\n", stage, iter, SPfrontEnd->IFseconds() - _pnt0);
@@ -4187,16 +4198,21 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                  * baseline. Only reached when the classic attempt FAILED,
                  * so every deck that converged before is untouched. */
                 if (!converged_flag && last_stage && !pss_replay_enabled() &&
-                    getenv("PSS_REPLAY") == NULL && g_rp_n > 0) {
+                    getenv("PSS_REPLAY") == NULL && g_rp_n > 0 && !g_pss_has_switch) {
                     int seed_dummy = 0;
                     fprintf(stdout, "PSS-SHOOT: [stage %d/final] the forced-grid Newton attempt did not "
                             "converge (residual %.3e); retrying once with exact step-sequence replay "
                             "(card #505).\n", stage, residual);
                     fflush(stdout);
-                    for (k = 0; k < n; k++) x0[k] = x0_stage_start[k];
+                    /* continue from the classic attempt's own last ACCEPTED
+                     * iterate (x0 is updated in place on every accepted step,
+                     * and Newton only accepts residual-reducing steps), not
+                     * from the warm-up endpoint: the classic run usually got
+                     * within 1e-5..1e-4 of the orbit before it plateaued. */
                     g_replay_mode = 1;
                     snprintf(label, sizeof label, "[stage %d/final+replay]", stage);
                     ckt->CKTreltol = tight_reltol;
+                    ckt->CKTvoltTol = tight_vntol;   /* card #505 */
                     converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
                                                      this_maxiter, tol, eps,
                                                      this_trust, broyden_enabled,
@@ -4204,6 +4220,30 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                                                      &iter, &residual, Phi, use_analytic,
                                                      NULL, &seed_dummy);
                     ckt->CKTreltol = save_reltol;
+                    ckt->CKTvoltTol = save_volttol;   /* card #505 */
+                    if (!converged_flag) {
+                        /* third rung: replay again from the warm-up endpoint
+                         * (a different basin/grid than the classic attempt's
+                         * last iterate; measured: R3d's shoot deck converges
+                         * from here but plateaus at 2e-5 from the classic
+                         * iterate, while its .pac/.pstb decks show the reverse). */
+                        fprintf(stdout, "PSS-SHOOT: [stage %d/final+replay] did not converge either "
+                                "(residual %.3e); retrying replay from the warm-up endpoint "
+                                "(card #505).\n", stage, residual);
+                        fflush(stdout);
+                        for (k = 0; k < n; k++) x0[k] = x0_stage_start[k];
+                        snprintf(label, sizeof label, "[stage %d/final+replay2]", stage);
+                        ckt->CKTreltol = tight_reltol;
+                        ckt->CKTvoltTol = tight_vntol;   /* card #505 */
+                        converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
+                                                         this_maxiter, tol, eps,
+                                                         this_trust, broyden_enabled,
+                                                         broyden_period, label,
+                                                         &iter, &residual, Phi, use_analytic,
+                                                         NULL, &seed_dummy);
+                        ckt->CKTreltol = save_reltol;
+                        ckt->CKTvoltTol = save_volttol;   /* card #505 */
+                    }
                     if (!converged_flag)
                         g_replay_mode = -1;   /* back to the env/default choice */
                 }
@@ -4229,6 +4269,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * function should run at. Restored to save_reltol only at
          * shoot_cleanup, as before. */
         ckt->CKTreltol = tight_reltol;
+        ckt->CKTvoltTol = tight_vntol;   /* card #505 */
 
         if (phi_full_detect) tfree(phi_full_detect);
         if (M_init) tfree(M_init);
@@ -4460,7 +4501,28 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * overwritten by a record=1 call, and every record=1 call left in
      * this file by this fix runs before this point). */
     pss_state_set_ic(&map, x0);
-    err = pss_run_period_ex_safe(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
+    /* card #505: emit the orbit from an exact REPLAY of the Floquet baseline
+     * run (a free, LTE-controlled trapezoidal run at the converged x0), not
+     * from the classic forced-breakpoint run (backward-Euler restart at every
+     * recorded time): same accuracy as a plain .tran at this reltol. Measured
+     * on R4d: the classic-forced emission put the vc orbit 0.21 % of ripple
+     * from the settled .tran reference (target 0.1 %). Falls back to the
+     * classic forced run if the replay run fails. PSS_NO_REPLAY_EMIT
+     * disables. */
+    {
+        int saved_mode = g_replay_mode;
+        int used_replay = 0;
+        if (g_rp_n > 0 && !g_pss_has_switch && getenv("PSS_NO_REPLAY_EMIT") == NULL) {
+            g_replay_mode = 1;
+            used_replay = 1;
+        }
+        err = pss_run_period_ex_safe(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
+        if (err && used_replay) {
+            g_replay_mode = saved_mode;
+            err = pss_run_period_ex_safe(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
+        }
+        g_replay_mode = saved_mode;
+    }
     if (err) {
         fprintf(stderr, "PSS-SHOOT: WARNING -- converged, but the final "
                 "trajectory output run failed (ngspice error %d); the "
