@@ -280,11 +280,59 @@ STBan(CKTcircuit *ckt, int restart)
         }
         node_a = GENnode(inst)[0];
         node_b = GENnode(inst)[1];
+        /* card #460: loop-mode probe with EITHER terminal at literal
+         * ground (node 0) is degenerate for Tian's two-injection method,
+         * for a reason that has nothing to do with this file's own
+         * node-0-trash-slot hazard (guarded below): the probe's own 0V
+         * branch equation is V(node_a) - V(node_b) = <this run's
+         * injection>. If node_a==0 (true ground, a fixed 0, not a row of
+         * its own), that equation ALONE algebraically forces node_b to a
+         * fixed value equal to -<injection>, for EVERY circuit,
+         * regardless of anything attached elsewhere -- so run 1's
+         * "voltage read back at node_b" is not a network response at
+         * all, it is the injection itself, unchanged. If node_b==0, the
+         * symmetric thing happens to run 2: injecting current AT literal
+         * ground has nowhere to go but through the probe's own branch
+         * (ground has no KCL row to receive it), so node_a's response
+         * -- which this file does not even read, see the loop below --
+         * or a naive read of node_b (=ground, always exactly 0 by
+         * definition) carries no information either. Proved three ways
+         * (algebraically from the branch equation above; empirically
+         * from this build with STB_DEBUG=1 on tests/fixtures/
+         * stb3_gnd_loop_linear.cir and stb3_gnd_loop_mos.cir, both
+         * orientations; and independently via tools/stb.py's real
+         * 3-element lgprobe subckt, which has its own separate internal
+         * "x" node and STILL comes out identically degenerate for the
+         * same algebraic reason) -- see the card #460 report. Both
+         * degenerate cases converge on T=0 exactly once the node-0
+         * read/write hazard below is also guarded (before that guard,
+         * node_b==0 additionally read back STALE data and gave a small
+         * WRONG nonzero T, not the honest degenerate 0 -- see the FAIL
+         * before that guard is added below). Warn rather than silently
+         * hand back a T that looks like "provably stable, huge margin"
+         * when it is actually "this measurement carries no information"
+         * (rule: no silent numbers) -- but still compute and report the
+         * (honest, degenerate) T=0 rather than refuse outright: unlike
+         * the device-mode probe2/mode= conflict above, there is a
+         * single well-defined right answer here (T=0), not an
+         * ill-posed request. */
+        if (node_a == 0 || node_b == 0)
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb probe '%s': one terminal is literal ground (node 0) "
+                "-- Tian's two-injection loop-based method cannot measure "
+                "a loop broken there (the probe's own branch equation "
+                "pins the OTHER terminal to the injection value itself, "
+                "or the injected current has nowhere to go but the "
+                "probe's own branch): loopgain/T will read exactly 0 at "
+                "every frequency, which means 'not measured', not 'stable "
+                "with a huge margin'. Break the loop one component "
+                "further from true ground.", job->STBprobeName);
     } else {
         SPfrontEnd->IFerrorf(ERR_WARNING,
             "stb probe '%s' must be a voltage source (an existing 0V V-source "
             "in series with the loop-break wire) or a supported active device "
-            "instance (device mode: mos1 only in this fork)", job->STBprobeName);
+            "instance (device mode: mos1 or bsim4, quasi-static only, in "
+            "this fork)", job->STBprobeName);
         return E_NOTFOUND;
     }
 
@@ -317,6 +365,16 @@ STBan(CKTcircuit *ckt, int restart)
          * p's, same as stb/diffprobe.lib's diffprobe_dm baking acphase=180
          * on its second branch); cm = in phase (diffprobe_cm, acphase=0). */
         dmcm_sign = (job->STBmode == STB_MODE_DM) ? -1.0 : 1.0;
+        /* card #460: branch n's own node_b2==0 hits the same current-
+         * injection write hazard as branch p's node_b (guarded below) --
+         * warn the same way (branch n is never read back, only driven in
+         * lockstep, but a degenerate branch n still perturbs the shared
+         * two-injection solve if left unguarded). */
+        if (GENnode(inst2)[0] == 0 || node_b2 == 0)
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb probe2 '%s': one terminal is literal ground (node 0) "
+                "-- see the probe= warning above; the same degeneracy "
+                "applies to the correlated branch", job->STBprobeName2);
     } else if (job->STBmodeGiven) {
         SPfrontEnd->IFerrorf(ERR_WARNING, "stb mode=dm|cm given without probe=<Vp>,<Vn>");
         return E_PARMVAL;
@@ -555,7 +613,20 @@ STBan(CKTcircuit *ckt, int restart)
             ckt->CKTirhs[branch_probe2] = 0.0;
         }
         SMPcSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTirhs, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
-        v1.re = ckt->CKTrhs[node_b];  v1.im = ckt->CKTirhs[node_b];
+        /* card #460: node index 0 (true ground) is not a real unknown --
+         * it is excluded from the factored system, and CKTrhs[0]/
+         * CKTirhs[0] is a "trash" slot SMPcSolve never touches, so it
+         * still holds whatever this loop last wrote there. Ground's
+         * voltage is always exactly 0 by definition; read that directly
+         * rather than the trash slot (same hazard and same guard pattern
+         * as the device-mode fix in c931b1f4c, and as devp.node_d/
+         * devp.node_s above). Only node_b can be 0 here -- node_a is
+         * never dereferenced into CKTrhs/CKTirhs in this file, so it
+         * needs no guard; see the warning above where node_a/node_b were
+         * resolved for why a node_a==0 probe is ALSO degenerate anyway
+         * (T=0), just not via this trash-slot mechanism. */
+        v1.re = node_b ? ckt->CKTrhs[node_b]  : 0.0;
+        v1.im = node_b ? ckt->CKTirhs[node_b] : 0.0;
         /* The raw MNA branch unknown for a V-source is the current flowing
          * INTO its positive terminal (node_a) from the external circuit;
          * ngspice's printed "i(Vxxx)" (what tools/stbcore.tian is written
@@ -573,21 +644,33 @@ STBan(CKTcircuit *ckt, int restart)
             ckt->CKTrhs[i] = 0.0;
             ckt->CKTirhs[i] = 0.0;
         }
-        ckt->CKTrhs[node_b] += 1.0;
+        /* card #460: guard the write too -- ground has no KCL row of its
+         * own to receive this injection (it is the reference, not an
+         * unknown), so writing here is a no-op for the real solve either
+         * way; skip it rather than leave a stray value sitting in the
+         * trash slot for the read below (and for the STB_DEBUG dump) to
+         * pick up. */
+        if (node_b) ckt->CKTrhs[node_b] += 1.0;
         /* localgnd=: reference the injected current to the given local
          * ground node instead of true ground (same two-terminal-source
          * pattern as the unmerged loop_analysis branch's LOOPan() used for
          * its optional refnode=). NOT independently validated numerically
          * (no reference deck here uses localgnd=) -- see the card #456
-         * report's "what was not done". */
-        if (job->STBlocalGndGiven && job->STBlocalGnd)
+         * report's "what was not done". Guarded the same way (card #460):
+         * localgnd=0 would just mean "local ground IS true ground", i.e.
+         * no local-reference correction at all -- a no-op, not a special
+         * case, once guarded. */
+        if (job->STBlocalGndGiven && job->STBlocalGnd && job->STBlocalGnd->number)
             ckt->CKTrhs[job->STBlocalGnd->number] -= 1.0;
         /* card #457 probe=Vp,Vn mode=dm|cm: drive branch n's current
-         * injection in lockstep (same dmcm_sign as run 1, above). */
-        if (job->STBprobeName2Given)
+         * injection in lockstep (same dmcm_sign as run 1, above). card
+         * #460: guarded the same way as node_b just above. */
+        if (job->STBprobeName2Given && node_b2)
             ckt->CKTrhs[node_b2] += dmcm_sign * 1.0;
         SMPcSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTirhs, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
-        v2.re = ckt->CKTrhs[node_b];  v2.im = ckt->CKTirhs[node_b];
+        /* card #460: same ground-read guard as v1, above. */
+        v2.re = node_b ? ckt->CKTrhs[node_b]  : 0.0;
+        v2.im = node_b ? ckt->CKTirhs[node_b] : 0.0;
         i2.re = -ckt->CKTrhs[branch_probe]; i2.im = -ckt->CKTirhs[branch_probe];
 
         if (getenv("STB_DEBUG"))
