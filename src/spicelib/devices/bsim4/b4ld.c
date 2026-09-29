@@ -78,7 +78,29 @@ CKTcircuit *ckt)
     BSIM4instance **InstArray;
     InstArray = model->BSIM4InstanceArray;
 
-#pragma omp parallel for
+    /* accel candidate 0103 (card #478 T9.2 task 3): hard-coded
+     * schedule(guided) instead of the implied schedule(static) (equal
+     * contiguous chunks, one per thread -- GCC's default for a bare
+     * "#pragma omp parallel for"). Unlike round 1's schedule(runtime)
+     * (REJECTED: 15%/4.6%/7.6% slower on d/a/b -- patches-wip/accel/
+     * README.md), a hard-coded clause is a compile-time constant, so
+     * libgomp specialises it exactly like the implied default -- no
+     * runtime schedule-kind dispatch on every parallel-region entry (and
+     * BSIM4load's parallel region is entered on every CKTload call, i.e.
+     * every Newton iteration, so that per-entry cost is paid often).
+     * guided starts with large chunks and shrinks them as the loop
+     * empties, which can reduce tail-end load imbalance vs one big
+     * contiguous block per thread when instance cost is heterogeneous
+     * across the flattened InstanceArray (mixed NMOS/PMOS .model cards,
+     * mixed W). Measured against a hard-coded schedule(static, 4)
+     * alternative too (tried first, on d_analog_block_long/e_pex_tree:
+     * 0.1%/2.1% slower, i.e. a wash -- not committed); guided is the one
+     * that showed a real, repeatable win (research/
+     * transient-acceleration.md). Same arithmetic, same per-instance
+     * scratch-field writes as before (research/transient-acceleration.md
+     * section 3) -- iteration-order-independent, so accel_same_results
+     * tolerance stated before measuring: 0 (bit-identical). */
+#pragma omp parallel for schedule(guided)
     for (idx = 0; idx < model->BSIM4InstCount; idx++) {
         BSIM4instance *here = InstArray[idx];
         int local_error = BSIM4LoadOMP(here, ckt);
