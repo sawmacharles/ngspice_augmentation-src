@@ -407,6 +407,18 @@ static double g_pac_T = 0.0;                              /* period, for the 1/T
 static double *g_pac_rhs_re = NULL, *g_pac_rhs_im = NULL, *g_pac_scratch = NULL; /* [neq+1] */
 static int g_pac_exact_jac = 0;   /* card #465 THIRD pass, task 1: see pac_refactor_at_accepted() */
 
+/* card #465 FOURTH pass, task 1: the true y(0) at a NON-state row (any row
+ * that is not a capacitor/inductor terminal the reduced state tracks, e.g.
+ * a resistor node or a probe's branch equation) is NOT zero in general --
+ * see pac_finish_demod_wraparound()'s header for the periodicity argument
+ * that recovers it exactly, with no extra algebraic solve, from y(T) once
+ * the period run has completed. g_pac_first_y/g_pac_first_t/g_pac_have_first
+ * stash the FIRST accepted step's (t_1, y_1) so that closing computation
+ * can be done after the loop. [(neq+1)*M], same layout as g_pac_Cprev. */
+static PACc *g_pac_first_y = NULL;
+static double g_pac_first_t = 0.0;
+static int g_pac_have_first = 0;
+
 static PACc
 pac_get(const PACc *C, int row, int M, int m)
 {
@@ -433,10 +445,14 @@ pac_free(void)
     if (g_pac_rhs_re) tfree(g_pac_rhs_re);
     if (g_pac_rhs_im) tfree(g_pac_rhs_im);
     if (g_pac_scratch) tfree(g_pac_scratch);
+    if (g_pac_first_y) tfree(g_pac_first_y);
     g_pac_Cprev = g_pac_Cnew = NULL;
     g_pac_Tprev = g_pac_Tnew = NULL;
     g_pac_omega = NULL; g_pac_useforce = NULL; g_pac_demod = NULL;
     g_pac_rhs_re = g_pac_rhs_im = g_pac_scratch = NULL;
+    g_pac_first_y = NULL;
+    g_pac_first_t = 0.0;
+    g_pac_have_first = 0;
     g_pac_map = NULL;
     g_pac_n = g_pac_neq = g_pac_M = 0;
     g_pac_failed = 1;
@@ -479,20 +495,26 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
     g_pac_scratch = TMALLOC(double, (size_t) (neq + 1));
     g_pac_br = (double *) br;   /* not owned, caller keeps alive for this pass */
     g_pac_bi = (double *) bi;
-    if (demod_active)
+    if (demod_active) {
         g_pac_demod = TMALLOC(PACc, (size_t) neq * M);
+        g_pac_first_y = TMALLOC(PACc, (size_t) (neq + 1) * M);
+    }
 
     if (!g_pac_Cprev || !g_pac_Cnew || !g_pac_Tprev || !g_pac_Tnew || !g_pac_omega ||
         !g_pac_useforce || !g_pac_rhs_re || !g_pac_rhs_im || !g_pac_scratch ||
-        (demod_active && !g_pac_demod)) {
+        (demod_active && (!g_pac_demod || !g_pac_first_y))) {
         pac_free();
         return 1;
     }
 
     memset(g_pac_Cprev, 0, (size_t) (neq + 1) * M * sizeof(PACc));
     memset(g_pac_Tprev, 0, (size_t) n * M * sizeof(PACc));
-    if (demod_active)
+    if (demod_active) {
         memset(g_pac_demod, 0, (size_t) neq * M * sizeof(PACc));
+        memset(g_pac_first_y, 0, (size_t) (neq + 1) * M * sizeof(PACc));
+    }
+    g_pac_have_first = 0;
+    g_pac_first_t = 0.0;
     for (m = 0; m < M; m++) {
         g_pac_omega[m] = omega[m];
         g_pac_useforce[m] = useforce[m];
@@ -612,11 +634,21 @@ PSSpacRecordStep(CKTcircuit *ckt)
 {
     int n, neq, M, d, m, row, order;
     double ag0, ag1, t_new, h;
+    int is_first_call;
 
     if (g_pac_failed || !g_pac_map)
         return;
     if (ckt->CKTtime <= 0.0)
         return;   /* t=0 base case already set by pac_reset() */
+
+    /* card #465 FOURTH pass, task 1: g_pac_tprev is set to exactly 0.0 by
+     * pac_reset() and only ever reassigned to a real t_new at the tail of
+     * this function, so this test identifies the very first accepted-step
+     * call of this recording period run -- see pac_finish_demod_wraparound()
+     * for why the demod quadrature's first segment is deferred rather than
+     * accumulated here using g_pac_Cprev's (wrong, at non-state rows) t=0
+     * seed value. */
+    is_first_call = (g_pac_tprev == 0.0);
 
     if (ckt->CKTintegrateMethod != TRAPEZOIDAL || ckt->CKTorder < 1 || ckt->CKTorder > 2) {
         fprintf(stderr, "PAC-TD: analytic propagation only implements "
@@ -740,16 +772,29 @@ PSSpacRecordStep(CKTcircuit *ckt)
     }
 
     if (g_pac_demod_active) {
-        for (m = 0; m < M; m++) {
-            double w = g_pac_omega[m];
-            PACc ph_old = pc_conjexp(w * g_pac_tprev);
-            PACc ph_new = pc_conjexp(w * t_new);
-            for (row = 1; row <= neq; row++) {
-                PACc yold = pac_get(g_pac_Cprev, row, M, m);
-                PACc ynew = pac_get(g_pac_Cnew, row, M, m);
-                PACc term = pc_scale(pc_add(pc_mul(yold, ph_old), pc_mul(ynew, ph_new)), 0.5 * h);
-                size_t idx = (size_t) (row - 1) * M + m;
-                g_pac_demod[idx] = pc_add(g_pac_demod[idx], term);
+        if (is_first_call) {
+            /* card #465 FOURTH pass, task 1: y(0) at a non-state row is NOT
+             * known yet (g_pac_Cprev's t=0 seed is only correct at the n
+             * reduced-state rows -- see pac_reset()) -- stash (t_1, y_1) and
+             * let pac_finish_demod_wraparound() supply the correct [0,t_1]
+             * segment, exactly, once y(T) closes the loop (periodicity). */
+            for (m = 0; m < M; m++)
+                for (row = 1; row <= neq; row++)
+                    pac_set(g_pac_first_y, row, M, m, pac_get(g_pac_Cnew, row, M, m));
+            g_pac_first_t = t_new;
+            g_pac_have_first = 1;
+        } else {
+            for (m = 0; m < M; m++) {
+                double w = g_pac_omega[m];
+                PACc ph_old = pc_conjexp(w * g_pac_tprev);
+                PACc ph_new = pc_conjexp(w * t_new);
+                for (row = 1; row <= neq; row++) {
+                    PACc yold = pac_get(g_pac_Cprev, row, M, m);
+                    PACc ynew = pac_get(g_pac_Cnew, row, M, m);
+                    PACc term = pc_scale(pc_add(pc_mul(yold, ph_old), pc_mul(ynew, ph_new)), 0.5 * h);
+                    size_t idx = (size_t) (row - 1) * M + m;
+                    g_pac_demod[idx] = pc_add(g_pac_demod[idx], term);
+                }
             }
         }
     }
@@ -757,6 +802,88 @@ PSSpacRecordStep(CKTcircuit *ckt)
     { PACc *tmp = g_pac_Cprev; g_pac_Cprev = g_pac_Cnew; g_pac_Cnew = tmp; }
     { PACc *tmp = g_pac_Tprev; g_pac_Tprev = g_pac_Tnew; g_pac_Tnew = tmp; }
     g_pac_tprev = t_new;
+}
+
+/* ------------------------------------------------------------------ */
+/* card #465 FOURTH pass, task 1: DISCRETISATION FIX for the pac_sb0(d)
+ * .pstb-vs-native-.stb O(1/Points) [NOT O(h^2)] error.
+ *
+ * ROOT CAUSE (traced this pass, replacing the THIRD pass's
+ * PAC_EXACT_JACOBIAN Jacobian-staleness fix attempt, which did not touch
+ * this error -- it is a linear circuit, PSSsensRecordStep's/this file's
+ * own J_k staleness only matters for history-dependent nonlinear devices):
+ * pac_reset() seeds g_pac_Cprev's t=0 row for the demodulation pass with
+ * the TRUE y(0) only at the n reduced-state rows (the caller-supplied
+ * ic0[], x0 or xi -- a capacitor/inductor terminal IS one of those rows,
+ * pac_state_row()). Every OTHER row (a plain circuit node or a branch
+ * equation, e.g. pac_td_pstb()'s branch_probe output, OR pac_td_pac()'s
+ * many non-capacitor/inductor node outputs) is left at pac_reset()'s
+ * memset() zero. That zero is WRONG in general -- a non-state row's true
+ * value at t=0 is whatever the algebraic KCL constraint gives, given the
+ * (correct) state ICs and the forcing b(0) -- and PSSpacRecordStep()'s
+ * demodulation quadrature (this file's header, step 3) used it anyway for
+ * the FIRST trapezoid segment [0, t_1], the ONLY segment that reads
+ * g_pac_Cprev's un-propagated seed. Every OTHER segment [t_{k-1}, t_k]
+ * (k=2..N) uses two values that both came out of a genuine SMPsolve() at
+ * an accepted step -- correct for ALL rows, state and non-state alike --
+ * so only this one segment was ever wrong. A wrong O(1) value multiplying
+ * 0.5*h_1 in a sum normalised by 1/T contributes an O(h_1/T) = O(1/Points)
+ * error to Y0 -- exactly the empirically observed scaling (test_pac.py's
+ * "pstb_loop" header, 8.3e-4 at Points=2000 down to 5.77e-7 only by
+ * Points=3,000,000, textbook 1/Points).
+ *
+ * DERIVATION of the exact fix (no extra algebraic solve needed): this
+ * file's header already establishes that re-running the SAME period from
+ * the SAME converged x0 reproduces the transient's adaptive-step decisions
+ * bit for bit. Consider "period rep 2", i.e. relabelling t -> t+T and
+ * continuing: because b(t+T) = b*e^{jw(t+T)} = e^{jwT} b(t) and the state
+ * seed at the start of rep 2 is x(T) = e^{jwT} x0 (exactly, since xi was
+ * solved for precisely that Floquet boundary condition), and because
+ * PSSpacRecordStep()'s per-step map from (previous state row values,
+ * forcing at t_k) to y_k (ALL rows, via ONE full SMPsolve()) is LINEAR and
+ * uses the IDENTICAL companion coefficients/Jacobian/time grid at
+ * "relative step k of rep 2" as at "relative step k of rep 1" (same
+ * physical point in the periodic orbit) -- by linearity y_k^{rep2} =
+ * e^{jwT} y_k^{rep1} for EVERY row, not just the n state rows. Taking
+ * k = N (the last accepted step, t=T): y(T) computed by THIS run IS
+ * "y_N^{rep1}", and by the SAME relation applied one step earlier,
+ * "y_0^{rep2}" (= the true y(0) this file needs, continuing seamlessly
+ * from where rep 1 left off) satisfies y(T) = y_N^{rep1} = e^{jwT} *
+ * y_0^{rep2's own analogue, i.e. THIS run's true y(0)}. Hence:
+ *
+ *     y(0) = e^{-jwT} * y(T)                                   (EXACT)
+ *
+ * for every row, state or not -- sanity check: at the n state rows this
+ * reproduces y(0)=xi exactly, since y(T)[state] = e^{jwT} xi BY
+ * CONSTRUCTION (the boundary solve in pac_engine_run), so this fix leaves
+ * the (already-correct) state-row t=0 values completely unchanged and only
+ * corrects the non-state rows.
+ *
+ * y(T) is exactly g_pac_Cprev after PSSpacRecordStep()'s last call's final
+ * swap (the period run has just returned) -- no extra CKTload()/SMPsolve()
+ * needed. This function must run AFTER pac_run_period() returns success
+ * and BEFORE pac_free()/the next pac_reset() overwrites g_pac_Cprev. */
+static void
+pac_finish_demod_wraparound(void)
+{
+    int m, row;
+
+    if (!g_pac_demod_active || !g_pac_demod || !g_pac_have_first || !g_pac_first_y)
+        return;
+
+    for (m = 0; m < g_pac_M; m++) {
+        double w = g_pac_omega[m];
+        PACc ph1 = pc_conjexp(w * g_pac_first_t);       /* e^{-j*w*t_1} */
+        PACc ephaseT = pc_conjexp(w * g_pac_T);          /* e^{-j*w*T} */
+        for (row = 1; row <= g_pac_neq; row++) {
+            PACc yT = pac_get(g_pac_Cprev, row, g_pac_M, m);      /* y(T), all rows exact */
+            PACc y0 = pc_mul(yT, ephaseT);                         /* y(0) = e^{-jwT} y(T) */
+            PACc y1 = pac_get(g_pac_first_y, row, g_pac_M, m);
+            PACc term = pc_scale(pc_add(y0, pc_mul(y1, ph1)), 0.5 * g_pac_first_t);
+            size_t idx = (size_t) (row - 1) * g_pac_M + m;
+            g_pac_demod[idx] = pc_add(g_pac_demod[idx], term);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -936,6 +1063,27 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         for (f = 0; f < nfreq; f++)
             z[(size_t) d * nfreq + f] = pac_get(g_pac_Cprev, row_d, M1, n + f);
     }
+    /* card #465 FOURTH pass, task 4 (red-proof, TEST-ONLY, default off):
+     * PAC_REDPROOF_FREEZE_PHI substitutes the identity matrix for the real,
+     * per-step-propagated LPTV monodromy Phi computed above -- a stand-in
+     * for the WRONG "averaged/frozen" linearisation the card's plan calls
+     * out (throwing away the periodic Jacobian's own time-modulation,
+     * exactly what an averaged/frozen-operating-point small-signal model
+     * does). This must make the boundary-value solve below wrong (it
+     * changes the (e^{jwT}I-Phi) xi = z(w) equation actual LTI systems
+     * satisfy only when Phi=I, i.e. w=0), and is asserted BY THE TEST
+     * SUITE (tests/test_pac.py's check_redproof_frozen_phi()) to fail
+     * pac_sb0(b) (R2 exact) and pstb_loop (c) (R3) -- proving those checks
+     * would actually catch this class of regression, not just that they
+     * currently pass. Never set in production; not documented in any
+     * user-facing help text. */
+    if (getenv("PAC_REDPROOF_FREEZE_PHI")) {
+        for (d = 0; d < n; d++)
+            for (j = 0; j < n; j++) {
+                PACc v = { (d == j) ? 1.0 : 0.0, 0.0 };
+                Phi[(size_t) d * n + j] = v;
+            }
+    }
     if (Phi_out) memcpy(Phi_out, Phi, (size_t) n * n * sizeof(PACc));
     pac_free();
 
@@ -993,6 +1141,12 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         err = pac_run_period(ckt, job, T, "TD-shoot recording pass 2 (re-propagate)");
         PSSpacActive = 0;
         if (!err && !g_pac_failed) {
+            /* card #465 FOURTH pass, task 1: supply the [0,t_1] demod
+             * segment that PSSpacRecordStep() deferred -- see
+             * pac_finish_demod_wraparound()'s header for the exact
+             * (periodicity-based) closure. Must run before pac_free()
+             * below (needs g_pac_Cprev, still holding y(T)). */
+            pac_finish_demod_wraparound();
             for (f = 0; f < nfreq; f++) {
                 double invT = 1.0 / T;
                 int o;
@@ -1203,6 +1357,17 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
      * node_b (stban.c: ckt->CKTrhs[node_b] += 1.0). */
     br1[branch_probe] = -1.0;
     if (node_b > 0) br2[node_b] = 1.0;
+    /* card #465 FOURTH pass, task 4 (red-proof, TEST-ONLY, default off):
+     * PAC_REDPROOF_SIGNFLIP flips RHS#1's sign relative to stban.c's own
+     * verbatim-matched convention (this file's header/this function's own
+     * comment -- "BOTH copied verbatim (same sign conventions) from
+     * stban.c's native `.stb` loop-mode"). Tian's eq. 30 combination is
+     * sign-sensitive (asymmetric in v1/i1 vs v2/i2), so this must make
+     * pstb_loop disagree with native `.stb` -- asserted by
+     * tests/test_pac.py's check_redproof_signflip(). Never set in
+     * production. */
+    if (getenv("PAC_REDPROOF_SIGNFLIP"))
+        br1[branch_probe] = 1.0;
 
     nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
     if (nfreq < 1) {
