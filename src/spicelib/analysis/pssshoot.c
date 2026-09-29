@@ -1195,15 +1195,24 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                 /* One period run, sensitivity tracking active: this SAME
                  * run is both the baseline P(x0) (x1 below) AND the
                  * analytic Jacobian source (M below) -- no separate FD
-                 * sweep, no separate baseline call. Not forced onto any
+                 * sweep, no separate baseline call. Not FORCED onto any
                  * grid (force=0): the analytic recursion uses THIS run's
                  * own accepted steps directly (via PSSsensRecordStep(),
                  * hooked at the same dctran.c call site as the
                  * breakpoint-recording hook), so there is no cross-run
-                 * grid-consistency need the FD path's forcing addressed. */
+                 * grid-consistency need the FD path's forcing addressed.
+                 * record=1 (card #488 fix, see PSSbreakRecordStep/
+                 * PSSbreakInstallHook and the q>1 emission-bug root-cause
+                 * comment on the non-analytic branch below): recording is
+                 * pure bookkeeping (PSSbreakRecordStep has no effect on
+                 * the simulated trajectory), so turning it on here costs
+                 * nothing but leaves g_break_times populated with a real
+                 * grid for the POST-Newton Floquet-baseline and final
+                 * trajectory-emission runs to force themselves onto
+                 * instead of running bare/unforced -- see below. */
                 pss_sens_reset(ckt, map);
                 PSSsensActive = 1;
-                err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period, analytic)", 0, 0);
+                err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period, analytic)", 1, 0);
                 PSSsensActive = 0;
             } else {
                 err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
@@ -2526,7 +2535,13 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             pss_state_set_ic(&map, icbuf_fl);
             pss_sens_reset(ckt, &map);
             PSSsensActive = 1;
-            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline, analytic)", 0, 0))
+            /* card #488 fix: force=1, reusing the Newton baseline's own
+             * recorded grid (now populated even in analytic mode -- see
+             * the record=1 change above) instead of running bare/
+             * unforced -- see the non-analytic branch's root-cause
+             * comment below for why an unforced multi-period run is not
+             * reliable on its own. */
+            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline, analytic)", 0, 1))
                 floquet_ok = 0;
             PSSsensActive = 0;
             if (!Phi_full_fl)
@@ -2542,7 +2557,53 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
 
         for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
         pss_state_set_ic(&map, icbuf_fl);
-        if (floquet_ok && pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline)", 1, 0))
+        /* card #488 root cause / fix: this call used to be
+         * pss_run_period_ex(..., record=1, force=0) -- a fresh, BARE
+         * (unforced) natural period run. That is NOT reliable on its own
+         * for a multi-native-cycle period (T = q * the circuit's own
+         * fastest periodic source, q>1): ngspice's per-device breakpoint
+         * bookkeeping for a repeating PULSE/PWL source (VSRCbreak_time,
+         * vsrc/vsrcacct.c's VSRCaccept()) is a field on the *instance*
+         * that persists across this file's repeated DCtran(ckt,1)
+         * restarts within one PSS solve -- it is only ever initialised
+         * once, to -1 ("await first pulse"), at circuit setup
+         * (vsrc/vsrcset.c), never reset by a fresh restart. dctran.c's
+         * own restart path (this file's SUSPECTED CAUSE 2 comment above,
+         * pss_break_reset()/PSSbreakInstallHook()) resets ckt->CKTbreaks
+         * itself to {0, CKTfinalTime} on every restart, but has no way to
+         * reach into an individual device instance's own breakpoint
+         * state -- so VSRCaccept()'s incremental "is it time for the
+         * next edge yet?" check (ckt->CKTtime >= here->VSRCbreak_time)
+         * compares this run's freshly-reset CKTtime (starting at 0)
+         * against a STALE absolute time left over from whichever earlier
+         * DCtran() call last touched this instance, which is very often
+         * already past this run's own CKTfinalTime for a short T=1
+         * native-period run -- so the device schedules NO further
+         * breakpoints of its own for the rest of this run. For q=1 this
+         * is apparently masked well enough by CKTmaxStep (=T/Points)
+         * alone resolving the single switch edge every period without
+         * device-supplied help; reproduced (card #488/#484's "near-fs/2"
+         * finding, research/near-fs2.md) at q=5 (Fguess=fs/5), where the
+         * SAME masking is not enough across all 5 edges and the run
+         * eventually hits ngspice error 106 ("Timestep too small") --
+         * this is why the existing forced-grid machinery (SUSPECTED
+         * CAUSE 2, above) exists at all, and this call site (plus the
+         * final trajectory-emission run below and the two analytic-mode
+         * equivalents) were simply never migrated onto it: they still
+         * ran bare/unforced. Fix: this call is now the SAME force=1
+         * call every other post-iteration-0 run in this engine already
+         * uses, reusing the grid the Newton loop's OWN last baseline run
+         * recorded (now populated even in analytic mode -- see the
+         * record=1 change above) instead of attempting a second bare
+         * natural run of a converged x0 that is, numerically, no more
+         * reliable than the ones already fixed. Verified (q=2, q=3, q=5
+         * R3 orbits, tests/test_pss.py) to remove the corruption without
+         * changing the converged x0/Floquet numbers on q=1 decks (the
+         * grid this reuses is the one already used for every FD
+         * perturbation/trial run in the last Newton iteration, so this
+         * is not a new approximation, just applying the existing one
+         * consistently to the two call sites that had been missed). */
+        if (floquet_ok && pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline)", 0, 1))
             floquet_ok = 0;
 
         for (j = 0; floquet_ok && j < n_slow; j++) {
@@ -2626,9 +2687,23 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 atan2(floq.dominant.im, floq.dominant.re) * 180.0 / M_PI);
 
     /* Emit the converged trajectory as an ordinary time-domain plot, same
-     * title the existing driven-mode algorithm uses. */
+     * title the existing driven-mode algorithm uses. card #488 fix: force
+     * this run onto the last recorded grid (force=1), same as the Floquet
+     * baseline above -- this used to be a bare pss_run_period() call (no
+     * _ex, no forcing), the OTHER unforced multi-period run this card's
+     * root-cause finding covers (see the Floquet-baseline comment above
+     * for the full explanation: a bare run relies on per-device
+     * breakpoint bookkeeping, e.g. vsrc/vsrcacct.c's VSRCbreak_time, that
+     * does not survive this file's repeated DCtran() restarts, and that
+     * is not reliably masked by CKTmaxStep alone once q = T/(fastest
+     * native period) is large enough -- q=5 on refs/r3_vm_buck.cir type
+     * decks reproduced ngspice error 106, "Timestep too small", exactly
+     * here). g_break_times still holds the last good grid whether or not
+     * the Floquet re-evaluation above itself succeeded (it is only
+     * overwritten by a record=1 call, and every record=1 call left in
+     * this file by this fix runs before this point). */
     pss_state_set_ic(&map, x0);
-    err = pss_run_period(ckt, T, "Time Domain Periodic Steady State Analysis");
+    err = pss_run_period_ex(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
     if (err) {
         fprintf(stderr, "PSS-SHOOT: WARNING -- converged, but the final "
                 "trajectory output run failed (ngspice error %d); the "
