@@ -159,17 +159,39 @@ DCtran(CKTcircuit *ckt,
         if (ckt->CKTsoaCheck)
             error = CKTsoaInit();
 
-        /* Fix up the breakpoint list for the continuation.  Drop any restored
-           breakpoints at or before the resume time (they are in the past and
-           would yield a negative time step); keep the genuine future ones (e.g.
-           pending source edges).  Then guarantee the (possibly extended) final
-           time is present and that at least two entries exist -- the stepping
-           loop reads CKTbreaks[1].  Sources re-schedule their own future edges
-           as the run proceeds. */
+        /* Fix up the breakpoint list for the continuation.  Drop only
+           breakpoints strictly in the past (more than CKTdelmin before the
+           resume time); keep the genuine future ones (e.g. pending source
+           edges) AND the current one if CKTtime itself lands on a
+           breakpoint (card #472 T10.4 fix: the ORIGINAL filter here was
+           `> CKTtime + CKTdelmin`, which also discarded a breakpoint sitting
+           exactly at CKTtime.  When a checkpoint is written at t1 that is
+           itself a breakpoint -- e.g. a clocked source's edge -- an
+           in-memory, uninterrupted continuation reaches the same "resume:"
+           label with CKTbreaks[0] still equal to t1 (CKTaccept only clears
+           a breakpoint once CKTtime > CKTbreaks[0], not ==), so the
+           "AlmostEqualUlps(CKTtime, CKTbreaks[0])" check a few lines below
+           this block fires and correctly cuts the integration order to 1
+           and shrinks the next step to resolve whatever is happening right
+           at the edge.  The old filter shifted the NEXT breakpoint (e.g.
+           t1 + a source's rise time) into slot 0, so that check silently
+           never fired after a loadstate landing on a breakpoint, and the
+           restart took one large step straight through the edge instead of
+           the many small ones the uninterrupted run takes -- confirmed
+           empirically on refs/r2_switched_rc.cir: checkpointing exactly at
+           a clock edge (t1 = 300us, a multiple of the 10us clock period)
+           made the restarted v(vx) diverge from the uninterrupted value by
+           ~7.7e-5 relative right at t1, collapsing to ~2e-6 by the next
+           output sample 25ns later, i.e. exactly the signature of one
+           skipped fine step at the edge.  Sources re-schedule their own
+           further-future edges as the run proceeds, so nothing after this
+           first one needs the same care. Then guarantee the (possibly
+           extended) final time is present and that at least two entries
+           exist -- the stepping loop reads CKTbreaks[1]. */
         if(ckt->CKTbreaks != NULL && ckt->CKTbreakSize > 0) {
             int nb, w = 0;
             for(nb = 0; nb < ckt->CKTbreakSize; nb++)
-                if(ckt->CKTbreaks[nb] > ckt->CKTtime + ckt->CKTdelmin)
+                if(ckt->CKTbreaks[nb] >= ckt->CKTtime - ckt->CKTdelmin)
                     ckt->CKTbreaks[w++] = ckt->CKTbreaks[nb];
             ckt->CKTbreakSize = w;
         }
