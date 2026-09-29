@@ -477,32 +477,75 @@ dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
     GCA(INPapName, (ckt, which, foo, steptype, &ptemp));
     tfree(steptype);
 
-    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
-    if (parm->iValue < 1) {
-        pdef = TRUE;
-        parm->iValue = 10;
+    /* card #466: n/fstart/fstop are read the same way .ac reads them (see
+     * dot_ac above), but .ac's own "clamp any bad value to a default,
+     * print only the generic pdef warning" behaviour is wrong for .stb --
+     * it silently swallowed the E_PARMVAL check STBsetParm (stbsetp.c)
+     * already has for fstart/fstop <= 0, so that check's own message
+     * ("Frequency of <= 0 is invalid for STB start/stop") could never
+     * appear: by the time GCA(INPapName, ...) reached STBsetParm, the bad
+     * value had already been overwritten with a valid default (found
+     * 2026-09-29 while checking the independent reader's report, card
+     * #466's brief). The fix: only fill in a default when the field was
+     * genuinely OMITTED -- i.e. INPgetValue/INPevaluate did not advance
+     * `line` at all, so no token was there to read -- and otherwise pass
+     * whatever the user actually typed straight through to the setter, so
+     * an explicitly-bad value (<=0, or fstop < fstart, or n <= 0) is
+     * REFUSED (E_PARMVAL, no analysis, no vectors -- see if_run()'s
+     * "if (deck.error) return 2" for the interactive form and inp.c's
+     * per-card error loop for the netlist-card form; both run off the
+     * same current->error/deck.error this GCA() macro fills in via
+     * INPerror(), which prefers the analysis's own errMsg when set) rather
+     * than silently swapped for a default. STBsetParm's STB_STOP case now
+     * also checks fstop < fstart (job->STBstartFreq, already set by the
+     * "start" GCA() call above by the time "stop" runs) since that
+     * ordering check needs both values at once and has nowhere else
+     * analysis-specific to live; STB_STEPS gained the same "n <= 0"
+     * E_PARMVAL check numsteps never had. */
+    {
+        char *before = line;
+        parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+        if (line == before) {
+            /* omitted -- default, as before */
+            pdef = TRUE;
+            parm->iValue = 10;
+        }
+        /* else: pass the value through as-is, even if <= 0 --
+         * STBsetParm's STB_STEPS case now refuses it. */
+        GCA(INPapName, (ckt, which, foo, "numsteps", parm));
+        if (error)
+            return (0);
     }
-    GCA(INPapName, (ckt, which, foo, "numsteps", parm));
 
-    if ((*line != '.' && !isdigit(*line)) || (*line == '.' && !isdigit(*(line + 1))))
-        pdef = TRUE;
-    parm = INPgetValue(ckt, &line, IF_REAL, tab);
-    startval = parm->rValue;
-    if (startval <= 0) {
-        pdef = TRUE;
-        startval = parm->rValue = 1.;
+    {
+        char *before = line;
+        parm = INPgetValue(ckt, &line, IF_REAL, tab);
+        startval = parm->rValue;
+        if (line == before) {
+            pdef = TRUE;
+            startval = parm->rValue = 1.;
+        }
+        /* else: pass startval through as-is, even if <= 0 --
+         * STBsetParm's STB_START case refuses it (E_PARMVAL). */
+        GCA(INPapName, (ckt, which, foo, "start", parm));
+        if (error)
+            return (0);
     }
-    GCA(INPapName, (ckt, which, foo, "start", parm));
 
-    if ((*line != '.' && !isdigit(*line)) || (*line == '.' && !isdigit(*(line + 1))))
-        pdef = TRUE;
-    parm = INPgetValue(ckt, &line, IF_REAL, tab);
-    stopval = parm->rValue;
-    if (stopval < startval) {
-        pdef = TRUE;
-        parm->rValue = 1000. * startval;
+    {
+        char *before = line;
+        parm = INPgetValue(ckt, &line, IF_REAL, tab);
+        stopval = parm->rValue;
+        if (line == before) {
+            pdef = TRUE;
+            stopval = parm->rValue = 1000. * startval;
+        }
+        /* else: pass stopval through as-is, even if <= 0 or < startval --
+         * STBsetParm's STB_STOP case refuses both (E_PARMVAL). */
+        GCA(INPapName, (ckt, which, foo, "stop", parm));
+        if (error)
+            return (0);
     }
-    GCA(INPapName, (ckt, which, foo, "stop", parm));
 
     if (pdef) {
         fprintf(stderr, "Warning, ngspice assumes default parameter(s) for stb simulation\n");

@@ -36,10 +36,25 @@ STBsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
             job->STBstopFreq = 1.0;
             return (E_PARMVAL);
         }
+        /* card #466: fstart > fstop must be refused, not silently
+         * defaulted -- job->STBstartFreq is already set here, since
+         * dot_stb (inp2dot.c) always sets "start" before "stop". */
+        if (value->rValue < job->STBstartFreq) {
+            errMsg = copy("STB stop frequency must not be less than STB start frequency");
+            job->STBstopFreq = 1.0;
+            return (E_PARMVAL);
+        }
         job->STBstopFreq = value->rValue;
         break;
 
     case STB_STEPS:
+        /* card #466: numsteps <= 0 must be refused, not silently
+         * defaulted -- this case previously had no validation at all. */
+        if (value->iValue <= 0) {
+            errMsg = copy("Number of points must be > 0 for STB numsteps");
+            job->STBnumberSteps = 10;
+            return (E_PARMVAL);
+        }
         job->STBnumberSteps = value->iValue;
         break;
 

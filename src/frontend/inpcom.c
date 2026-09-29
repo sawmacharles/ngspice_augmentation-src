@@ -3884,6 +3884,75 @@ char *inp_remove_ws(char *s)
   No changes to lines in .control section !
 */
 
+/* card #466: auto-quote ".stb" netlist-card string-valued options.
+ *
+ * ".stb"'s probe=/probe2=/mode=/localgnd= options take a bareword value
+ * (an instance name, "inst:terminal", "dm"/"cm", or a node name) -- left
+ * unquoted on a NETLIST card, numparam's final-pass evaluator
+ * (nupa_eval() -> nupa_substitute(), src/frontend/numparam/spicenum.c,
+ * called from inp_subcktexpand(), subckt.c) tries to evaluate that
+ * bareword as a numeric expression and fails with "Undefined parameter
+ * [...]" (fetchnumentry(), numparam/xpressn.c). This is not specific to
+ * ".stb" or even to a recognized card -- reproduced the identical failure
+ * on a bogus, unrecognized ".foocard bar=<bareword>" line while
+ * investigating card #466's brief, so there is no existing numparam
+ * exemption list this could hook into; quoting the value is the only
+ * fix that does not touch numparam itself (a much larger, riskier change
+ * for a private fork). The interactive "stb" control-block command is
+ * never run through numparam at all (see dot_stb's own comment,
+ * src/spicelib/parser/inp2dot.c) so it already accepts these unquoted;
+ * this makes the netlist-card form match it, rather than requiring
+ * everyone to type probe="Vprobe" by hand (still accepted -- this only
+ * adds quotes when they are missing, never touches an already-quoted
+ * value, and only touches ".stb" lines). */
+static char *inp_stb_quote_one_key(char *s, const char *key)
+{
+    size_t keylen = strlen(key);
+    char *hit = s;
+
+    for (;;) {
+        hit = strstr(hit, key);
+        if (!hit)
+            return s;
+
+        char *eq = hit + keylen;
+        bool wordstart = (hit == s) || isspace_c(hit[-1]);
+
+        if (wordstart && *eq == '=') {
+            char *val = eq + 1;
+            if (*val && *val != '"' && !isspace_c(*val)) {
+                char *end = val;
+                while (*end && !isspace_c(*end))
+                    end++;
+                char *newline = tprintf("%.*s\"%.*s\"%s",
+                                         (int) (val - s), s,
+                                         (int) (end - val), val,
+                                         end);
+                tfree(s);
+                return newline;
+            }
+            /* value already quoted, or empty -- leave it for dot_stb's
+             * own parser to accept or reject; keep scanning past here in
+             * case a later key= on the same line still needs quoting. */
+        }
+        hit = eq;
+    }
+}
+
+static char *inp_stb_autoquote(char *s)
+{
+    static const char *const keys[] = { "probe2", "probe", "mode", "localgnd" };
+    size_t k;
+
+    if (!ciprefix(".stb", s))
+        return s;
+
+    for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+        s = inp_stb_quote_one_key(s, keys[k]);
+
+    return s;
+}
+
 static void inp_fix_for_numparam(
         struct names *subckt_w_params, struct card *c)
 {
@@ -3905,6 +3974,8 @@ static void inp_fix_for_numparam(
             continue;
 
         inp_change_quotes(c->line);
+
+        c->line = inp_stb_autoquote(c->line);
 
         if ((!newcompat.hs && !newcompat.s3) || c->compmod > 0)
             if (ciprefix(".subckt", c->line) || ciprefix("x", c->line)) {
