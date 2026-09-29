@@ -185,12 +185,27 @@ CKTsetOpt(CKTcircuit *ckt, JOB *anal, int opt, IFvalue *val)
 #ifdef KLU
     case OPT_SPARSE:
         task->TSKkluMODE = (val->iValue == 0);
+        task->TSKkluExplicit = 1; /* card #496: an explicit choice always wins over autoklu */
         break;
     case OPT_KLU:
         task->TSKkluMODE = (val->iValue != 0);
+        task->TSKkluExplicit = 1; /* card #496: an explicit choice always wins over autoklu */
         break;
     case OPT_KLU_MEMGROW_FACTOR:
         task->TSKkluMemGrowFactor = (val->rValue == 1.2);
+        break;
+    case OPT_AUTOKLU:
+        /* card #496, round 7: opt-in only, never overrides an explicit
+         * klu/sparse option (see OPT_KLU/OPT_SPARSE above and
+         * cktsetup.c). Round 5/6's ranked #1 candidate: defends decks
+         * that never think to ask for KLU against the >>100x SPARSE
+         * pathology measured on a_pex_buck-shaped (badly-ordered,
+         * large) matrices, without changing anything for a deck that
+         * already states its solver. */
+        task->TSKautoklu = (val->iValue != 0);
+        break;
+    case OPT_AUTOKLU_THRESHOLD:
+        task->TSKautokluThreshold = val->rValue;
         break;
 #endif
     case OPT_LTERELTOL:
@@ -369,6 +384,10 @@ static IFparm OPTtbl[] = {
         "Set KLU as Direct Linear Solver" },
  { "klu_memgrow_factor", OPT_KLU_MEMGROW_FACTOR, IF_SET|IF_REAL,
         "KLU Memory Grow Factor (default is 1.2)" },
+ { "autoklu", OPT_AUTOKLU, IF_SET|IF_FLAG,
+        "Automatically switch to KLU for large circuits, unless klu/sparse was set explicitly (card #496)" },
+ { "autoklu_threshold", OPT_AUTOKLU_THRESHOLD, IF_SET|IF_REAL,
+        "Equation count at/above which autoklu switches to KLU (default 2000)" },
 #endif
 
  { "ltereltol", OPT_LTERELTOL,IF_SET | IF_REAL ,"Relative error tolerence" },

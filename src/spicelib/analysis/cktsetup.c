@@ -106,6 +106,50 @@ CKTsetup(CKTcircuit *ckt)
     }
 
 #ifdef KLU
+    /* card #496, transient-ACCELERATION round 7: opt-in automatic
+     * default-solver selection ('.options autoklu'), round 5/6's ranked
+     * #1 candidate (research/transient-acceleration.md round 7).
+     * Round 5 measured that ngspice's own default (always SPARSE unless
+     * a deck explicitly says '.options klu') hits a >>100x pathology on
+     * large, badly-ordered matrices (a_pex_buck: SPARSE did not finish
+     * in 180s where KLU takes 44s) -- this defends a deck that never
+     * thought to ask for KLU, without changing anything for a deck that
+     * already states its solver explicitly (CKTkluExplicit) or is small
+     * (below CKTautokluThreshold equations, where round 5 measured KLU's
+     * own fixed per-call overhead can make it 6-34% SLOWER on tiny
+     * matrices). Equation count is used as the threshold signal, not the
+     * fill-in ratio round 5 also discusses: the fill-in-ratio version
+     * needs a solver-specific symbolic ordering pass before the KLU/
+     * SPARSE choice is even made, which touches the matrix-setup/CSC-
+     * conversion path structurally and was explicitly judged too large
+     * to implement and verify safely in one round (round 5 section 10.1.3,
+     * round 6 section 11) -- this equation-count-only heuristic is the
+     * deliberately smaller, safer subset of that candidate: it is
+     * evaluated here, AFTER DEVsetup has fully stamped the matrix (so
+     * SMPmatSize() below is exact, solver-agnostic -- see spsmp.c), and
+     * BEFORE the COO->CSC/DEVbindCSC conversion just below, i.e. entirely
+     * within this existing branch point and structurally identical
+     * either way it resolves. */
+    if (ckt->CKTautoklu && !ckt->CKTkluExplicit && !ckt->CKTmatrix->CKTkluMODE) {
+        int CKTautokluNeqn = SMPmatSize(matrix);
+        double CKTautokluThresh =
+            (ckt->CKTautokluThreshold > 0) ? ckt->CKTautokluThreshold : 2000.0;
+        if (CKTautokluNeqn >= CKTautokluThresh) {
+            fprintf(stdout,
+                "Note: .options autoklu switching to KLU (%d equations >= "
+                "autoklu_threshold=%g)\n", CKTautokluNeqn, CKTautokluThresh);
+            /* Keep ckt->CKTkluMODE and ckt->CKTmatrix->CKTkluMODE in sync:
+             * several call sites elsewhere (cktic.c, cktacct.c, cktsens.c)
+             * read ckt->CKTkluMODE directly rather than through the matrix,
+             * on the assumption (true everywhere else in the tree) that
+             * cktdojob.c/niinit.c already made the two agree -- checked by
+             * grepping every CKTkluMODE site before adding this override,
+             * not assumed. */
+            ckt->CKTkluMODE = 1;
+            ckt->CKTmatrix->CKTkluMODE = 1;
+        }
+    }
+
     if (ckt->CKTmatrix->CKTkluMODE)
     {
         fprintf (stdout, "Using KLU as Direct Linear Solver\n") ;

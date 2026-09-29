@@ -335,6 +335,14 @@ struct CKTcircuit {
 #ifdef KLU
     unsigned int CKTkluMODE:1;
     double CKTkluMemGrowFactor ;
+    /* card #496, transient-ACCELERATION round 7: opt-in automatic
+     * default-solver selection (round 5/6's ranked candidate; see
+     * research/transient-acceleration.md round 7). Off unless
+     * '.options autoklu' is given; never overrides an explicit
+     * '.options klu'/'.options sparse' (CKTkluExplicit). */
+    unsigned int CKTautoklu:1;
+    unsigned int CKTkluExplicit:1;
+    double CKTautokluThreshold;
 #endif
 };
 

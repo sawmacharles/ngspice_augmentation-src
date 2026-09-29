@@ -79,6 +79,10 @@ struct TSKtask {
 #ifdef KLU
     unsigned int TSKkluMODE:1;
     double TSKkluMemGrowFactor ;
+    /* card #496, round 7: see cktdefs.h's CKTautoklu/CKTkluExplicit */
+    unsigned int TSKautoklu:1;
+    unsigned int TSKkluExplicit:1;
+    double TSKautokluThreshold;
 #endif
 
 };

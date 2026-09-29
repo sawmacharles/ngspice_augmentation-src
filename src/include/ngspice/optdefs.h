@@ -131,6 +131,8 @@ enum {
     OPT_SPARSE,
     OPT_KLU,
     OPT_KLU_MEMGROW_FACTOR,
+    OPT_AUTOKLU,             /* card #496, round 7 */
+    OPT_AUTOKLU_THRESHOLD,
 #endif
 
     OPT_LTERELTOL,

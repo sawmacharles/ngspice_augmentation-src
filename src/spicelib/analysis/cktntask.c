@@ -82,6 +82,9 @@ CKTnewTask(CKTcircuit *ckt, TSKtask **taskPtr, IFuid taskName, TSKtask **defPtr)
 #ifdef KLU
         tsk->TSKkluMODE         = def->TSKkluMODE;
         tsk->TSKkluMemGrowFactor = def->TSKkluMemGrowFactor ;
+        tsk->TSKautoklu         = def->TSKautoklu;
+        tsk->TSKkluExplicit     = def->TSKkluExplicit;
+        tsk->TSKautokluThreshold = def->TSKautokluThreshold;
 #endif
 
         tsk->TSKlteReltol       = def->TSKlteReltol;
@@ -146,6 +149,9 @@ CKTnewTask(CKTcircuit *ckt, TSKtask **taskPtr, IFuid taskName, TSKtask **defPtr)
 #ifdef KLU
         tsk->TSKkluMODE         = CKTkluOFF;
         tsk->TSKkluMemGrowFactor = 1.2 ;
+        tsk->TSKautoklu         = 0; /* card #496: opt-in, off by default */
+        tsk->TSKkluExplicit     = 0;
+        tsk->TSKautokluThreshold = 2000.0;
 #endif
 
 #if (1) /*CDHW*/
