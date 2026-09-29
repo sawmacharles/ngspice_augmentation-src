@@ -187,12 +187,31 @@ DCtran(CKTcircuit *ckt,
            further-future edges as the run proceeds, so nothing after this
            first one needs the same care. Then guarantee the (possibly
            extended) final time is present and that at least two entries
-           exist -- the stepping loop reads CKTbreaks[1]. */
+           exist -- the stepping loop reads CKTbreaks[1].
+
+           Second fix folded in here (found while testing the first one on
+           refs/r2_switched_rc.cir): the saved breakpoint table can contain
+           TWO entries that both equal (or are within CKTdelmin of) the
+           resume time -- e.g. the clock edge's own breakpoint AND the
+           .tran command's own final-time breakpoint for the checkpointed
+           sub-run, which coincide whenever the checkpoint is taken exactly
+           at a source edge. Keeping both verbatim put CKTbreaks[1] ==
+           CKTbreaks[0], so ".1 * MIN(CKTsaveDelta, CKTbreaks[1] -
+           CKTbreaks[0])" a few lines below evaluated to exactly 0 and the
+           very first step after resume failed with "Timestep too small;
+           timestep = 0". Deduping adjacent kept entries that are within
+           CKTdelmin of each other (they are the same instant, restored
+           from two different sources) fixes this without changing the
+           genuine-future-breakpoint case. */
         if(ckt->CKTbreaks != NULL && ckt->CKTbreakSize > 0) {
             int nb, w = 0;
-            for(nb = 0; nb < ckt->CKTbreakSize; nb++)
-                if(ckt->CKTbreaks[nb] >= ckt->CKTtime - ckt->CKTdelmin)
-                    ckt->CKTbreaks[w++] = ckt->CKTbreaks[nb];
+            for(nb = 0; nb < ckt->CKTbreakSize; nb++) {
+                if(ckt->CKTbreaks[nb] < ckt->CKTtime - ckt->CKTdelmin)
+                    continue;
+                if(w > 0 && ckt->CKTbreaks[nb] - ckt->CKTbreaks[w - 1] <= ckt->CKTdelmin)
+                    continue;
+                ckt->CKTbreaks[w++] = ckt->CKTbreaks[nb];
+            }
             ckt->CKTbreakSize = w;
         }
         if(ckt->CKTbreaks == NULL || ckt->CKTbreakSize < 1) {
