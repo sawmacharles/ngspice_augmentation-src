@@ -50,7 +50,16 @@ CKTcircuit *ckt)
     BSIM3instance **InstArray;
     InstArray = model->BSIM3InstanceArray;
 
-#pragma omp parallel for
+    /* accel candidate 0105 (card #483 T9.3 task 2): hard-coded
+     * schedule(guided) instead of the implied schedule(static), same
+     * change as the accepted BSIM4 patch (0103/patches/0015) -- see
+     * b4ld.c's comment on this same pragma for the full mechanism/
+     * evidence, and research/transient-acceleration.md. Same
+     * structure here (flat per-model instance array, one parallel
+     * region per Load() call, no shared mutable state touched inside
+     * it, iteration order does not change the result) -- confirmed by
+     * reading this file, not assumed from the BSIM4 case alone. */
+#pragma omp parallel for schedule(guided)
     for (idx = 0; idx < model->BSIM3InstCount; idx++) {
         BSIM3instance *here = InstArray[idx];
         int local_error = BSIM3LoadOMP(here, ckt);
