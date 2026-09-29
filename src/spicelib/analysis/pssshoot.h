@@ -86,4 +86,14 @@ extern int PSSsensActive;   /* dctran.c: run the per-step sensitivity recursion 
 
 void PSSsensRecordStep(CKTcircuit *ckt);    /* called right after CKTaccept(), same site as PSSbreakRecordStep */
 
+/* ---- card #458 FIFTH pass (plan T4.3): per-state ripple tracking, used to
+ * make the Newton convergence test relative to each state's own ripple
+ * (task 1) instead of only its magnitude. Same no-op-unless-active pattern
+ * as the hooks above. See pssshoot.c's PSSrippleRecordStep() header
+ * comment. ---- */
+
+extern int PSSrippleRecordActive;
+
+void PSSrippleRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), same site as the hooks above */
+
 #endif

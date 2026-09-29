@@ -502,6 +502,11 @@ DCtran(CKTcircuit *ckt,
        PSS_SHOOT_JACOBIAN=analytic active. */
     if (PSSsensActive)
         PSSsensRecordStep(ckt);
+    /* card #458 fifth pass: per-state ripple tracking (task 1), same call
+       site again. No-op unless a `.pss method=shoot` Newton attempt has it
+       active. */
+    if (PSSrippleRecordActive)
+        PSSrippleRecordStep(ckt);
 #endif
 
 #ifdef XSPICE

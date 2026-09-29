@@ -191,21 +191,131 @@ pss_state_set_ic(PSSstateMap *map, const double *x)
     }
 }
 
+/* card #458 FIFTH pass: one state's native value from ckt->CKTrhsOld,
+ * factored out of pss_state_get() below so the new ripple tracker
+ * (PSSrippleRecordStep) can read the SAME quantity mid-period, not just
+ * at t=T. */
+static double
+pss_state_value(const PSSstateRef *ref, CKTcircuit *ckt)
+{
+    if (ref->isCap) {
+        CAPinstance *ci = ref->dev.cap;
+        return ckt->CKTrhsOld[ci->CAPposNode] - ckt->CKTrhsOld[ci->CAPnegNode];
+    } else {
+        INDinstance *ii = ref->dev.ind;
+        return ckt->CKTrhsOld[ii->INDbrEq];
+    }
+}
+
 /* Read x back from the converged solution (ckt->CKTrhsOld) after a period
  * run -- the same physical quantities pss_state_get_ic() seeds. */
 static void
 pss_state_get(PSSstateMap *map, CKTcircuit *ckt, double *x)
 {
     int k;
-    for (k = 0; k < map->n; k++) {
-        if (map->refs[k].isCap) {
-            CAPinstance *ci = map->refs[k].dev.cap;
-            x[k] = ckt->CKTrhsOld[ci->CAPposNode] - ckt->CKTrhsOld[ci->CAPnegNode];
-        } else {
-            INDinstance *ii = map->refs[k].dev.ind;
-            x[k] = ckt->CKTrhsOld[ii->INDbrEq];
-        }
+    for (k = 0; k < map->n; k++)
+        x[k] = pss_state_value(&map->refs[k], ckt);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* card #458 FIFTH pass (plan T4.3), task 1: per-state RIPPLE tracking over
+ * one period -- min/max of every native state over every accepted step of
+ * a period run, used to make the Newton convergence test relative to each
+ * state's own ripple (max-min over the period) rather than only its
+ * magnitude. Why this matters: a state that sits at a large, steady DC
+ * value but has a SMALL ripple (this deck family's compensator internal
+ * nodes -- e.g. opout ~0.55V DC but only ~12mV of ripple) was previously
+ * scaled by its own magnitude (~0.5V) in pss_newton_run's residual test,
+ * which is a MUCH LOOSER absolute tolerance (tol*0.5V ~ 5e-7V) than the
+ * SAME relative tolerance applied to its ripple (tol*12mV ~ 1e-8V) would
+ * ask for -- i.e. magnitude-based scaling can call Newton "converged" on
+ * such a state well before its error is small relative to the only thing
+ * that is actually being asked to match (the periodic orbit's own
+ * ripple), exactly the card's hypothesis (c). Same no-op-unless-active
+ * pattern as the existing breakpoint/sensitivity hooks: PSSrippleRecordActive
+ * defaults to 0, so every other analysis is unaffected. */
+
+int PSSrippleRecordActive = 0;
+
+static PSSstateMap *g_ripple_map = NULL;
+static double *g_ripple_min = NULL, *g_ripple_max = NULL;   /* [n] */
+
+static void
+pss_ripple_reset(PSSstateMap *map, const double *x0)
+{
+    int k;
+    g_ripple_map = map;
+    if (!g_ripple_min || !g_ripple_max) {
+        if (g_ripple_min) tfree(g_ripple_min);
+        if (g_ripple_max) tfree(g_ripple_max);
+        g_ripple_min = TMALLOC(double, map->n);
+        g_ripple_max = TMALLOC(double, map->n);
     }
+    if (!g_ripple_min || !g_ripple_max) {
+        g_ripple_map = NULL;   /* allocation failed: degrade to a no-op tracker */
+        return;
+    }
+    /* card #458 FIFTH pass, bug found by this pass's own testing: seed
+     * min/max from the KNOWN exact t=0 value (x0, the same array just
+     * written into the device IC fields), not a wide +-1e300 sentinel
+     * waiting for the t=0 accept callback to fill it in. ckt->CKTrhsOld
+     * is NOT yet populated with the UIC value at the exact instant
+     * CKTaccept() first fires for t=0 on a UIC restart (confirmed:
+     * reading it there produced ~1e265-1e280 garbage, not the true IC) --
+     * exactly why PSSbreakRecordStep/PSSsensRecordStep (pre-existing,
+     * this same file) both explicitly SKIP t<=0 rather than trust it.
+     * Seeding from x0 directly sidesteps the same trap without needing a
+     * throwaway CKTrhsOld read at all. */
+    for (k = 0; k < map->n; k++) {
+        g_ripple_min[k] = x0[k];
+        g_ripple_max[k] = x0[k];
+    }
+}
+
+/* Called from dctran.c right after CKTaccept(), same call site as
+ * PSSbreakRecordStep/PSSsensRecordStep. Skips t<=0 like those two --
+ * see pss_ripple_reset()'s comment for why: ckt->CKTrhsOld is not
+ * trustworthy there on a UIC restart; the t=0 value is instead seeded
+ * directly from x0 by pss_ripple_reset() itself. */
+void
+PSSrippleRecordStep(CKTcircuit *ckt)
+{
+    int k;
+    if (!g_ripple_map || !g_ripple_min)
+        return;
+    if (ckt->CKTtime <= 0.0)
+        return;
+    for (k = 0; k < g_ripple_map->n; k++) {
+        double v = pss_state_value(&g_ripple_map->refs[k], ckt);
+        if (v < g_ripple_min[k]) g_ripple_min[k] = v;
+        if (v > g_ripple_max[k]) g_ripple_max[k] = v;
+    }
+}
+
+/* ripple[k] = max-min over whatever period run last ran with
+ * PSSrippleRecordActive set; 0.0 for any state never recorded (e.g. if
+ * allocation failed -- degrades to the old magnitude-only floor via the
+ * ABSTOL_FLOOR max() in pss_newton_run, never a crash). */
+static void
+pss_ripple_get(PSSstateMap *map, double *ripple)
+{
+    int k;
+    for (k = 0; k < map->n; k++) {
+        if (g_ripple_min && g_ripple_max && g_ripple_min[k] <= g_ripple_max[k])
+            ripple[k] = g_ripple_max[k] - g_ripple_min[k];
+        else
+            ripple[k] = 0.0;
+    }
+}
+
+static void
+pss_ripple_free(void)
+{
+    if (g_ripple_min) tfree(g_ripple_min);
+    if (g_ripple_max) tfree(g_ripple_max);
+    g_ripple_min = g_ripple_max = NULL;
+    g_ripple_map = NULL;
 }
 
 
@@ -863,22 +973,69 @@ pss_sens_get_phi(PSSstateMap *map, double *Phi)
  * left at its last ACCEPTED iterate (never a rejected/failed trial), and
  * the specific cause was already printed to stderr when it happened. */
 static int
-pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
-                double *x0, int maxiter_this, double tol, double eps,
+pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
+                int n_slow, const int *slow_idx, double *x_full,
+                int maxiter_this, double tol, double eps,
                 double trust_radius, int broyden_enabled, int broyden_period,
                 const char *stage_label,
                 int *iter_out, double *residual_out, double *Phi_out,
                 int use_analytic)
 {
-    int iter = 0, j, k, err;
+    /* card #458 FIFTH pass (plan T4.3): generalised to a REDUCED Newton
+     * unknown set -- n_slow of map->n total native states, indexed by
+     * slow_idx[0..n_slow) (task 2). `n` (== n_slow) is kept as the local
+     * name for the Newton-unknown count so the bulk of this function
+     * (unchanged below) still reads exactly as the fourth pass's did;
+     * every array that used to be n(=map->n)-sized and doubled as both
+     * "the Newton unknowns" and "every native state" is now n(=n_slow)-
+     * sized for the FORMER role only -- the LATTER role (device IC
+     * set/get, which always needs every native state, Newton-controlled
+     * or not) is carried by the new n_full-sized icbuf/outbuf/x_full
+     * below. Eliminated (fast/"carried") states are written to the
+     * device IC fields every period run exactly like a Newton unknown
+     * would be, just never perturbed or solved for -- see the two
+     * "carry the eliminated states forward" comments below for where
+     * their value comes from instead. */
+    int n = n_slow;
+    int n_full = map->n;
+    int iter = 0, i, j, k, err;
     double residual = 0.0;
-    double *x1 = NULL, *F = NULL, *scale = NULL, *delta_x = NULL,
+    double *x0 = NULL, *x1 = NULL, *F = NULL, *scale = NULL, *delta_x = NULL,
            *xtrial = NULL, *x1trial = NULL, *A = NULL, *b = NULL,
-           *M = NULL, *pert = NULL, *s = NULL, *y = NULL, *Ms = NULL;
+           *M = NULL, *s = NULL, *y = NULL, *Ms = NULL;
+    double *icbuf = NULL, *outbuf = NULL, *ripple_full = NULL, *Phi_full = NULL;
+    int *is_slow = NULL;
     int have_baseline = 0;   /* do x0/x1/F already hold a valid, just-run point? */
     int recompute = 1;       /* does THIS iteration's Jacobian need a fresh FD sweep? */
     int since_recompute = 0;
     int result = 0;
+    /* card #458 FIFTH pass, task 1: the floor under a state's RIPPLE
+     * (not, as in the second/third pass, under its magnitude). The old
+     * value (1e-3, a 1mV/1mA floor chosen there to keep a near-zero
+     * cold-start MAGNITUDE from blowing up the residual division, per
+     * that pass's own comment) turned out, measured on this pass's own
+     * long-settling R3/nominal R4 fixtures, to be the BINDING constraint
+     * for several genuinely slow (not fast-state-eliminated) states whose
+     * true ripple is sub-mV (e.g. Cout in the long-settling variant,
+     * ripple ~0.3mV) -- landing exactly AT a 1mV floor is still the
+     * LOOSER of the two choices in the max() below (never stricter than
+     * using the true, smaller ripple would be), but demanding residual
+     * convergence to 1e-6*1e-3=1e-9 absolute native units is far tighter
+     * than this class of circuit's own numerical noise floor (reltol=
+     * 1e-5, FD eps=1e-5) can usefully resolve, and cost multiple extra
+     * staged warm-up rounds to satisfy -- see the card #458 fifth-pass
+     * report for the measured before/after. Raised to 1e-2 as this
+     * pass's own shipped default (still far tighter than the pre-task-1
+     * magnitude-relative test ever was for a volts/amps-scale state, and
+     * still small enough that the degenerate-all-off-fixed-point guard
+     * below is unaffected -- that trap sits at ~1e-7, five orders of
+     * magnitude under even this raised floor). PSS_SHOOT_RIPPLE_FLOOR
+     * overrides (debug env var, no effect unless set, same pattern as
+     * the file's other tunables) -- used for the sweep this value was
+     * chosen from, not verified as circuit-optimal beyond that sweep. */
+    double ripple_floor = getenv("PSS_SHOOT_RIPPLE_FLOOR") ?
+                           atof(getenv("PSS_SHOOT_RIPPLE_FLOOR")) : 1e-2;
+    if (ripple_floor <= 0.0) ripple_floor = 1e-2;
 
     /* card #458 FOURTH pass: the analytic Jacobian has no Broyden analogue
      * in this implementation -- every iteration re-runs ONE period WITH
@@ -893,6 +1050,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
     if (use_analytic)
         broyden_enabled = 0;
 
+    x0      = TMALLOC(double, n);
     x1      = TMALLOC(double, n);
     F       = TMALLOC(double, n);
     scale   = TMALLOC(double, n);
@@ -902,22 +1060,41 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
     A       = TMALLOC(double, n * n);
     b       = TMALLOC(double, n);
     M       = TMALLOC(double, n * n);
-    pert    = TMALLOC(double, n);
     s       = TMALLOC(double, n);
     y       = TMALLOC(double, n);
     Ms      = TMALLOC(double, n);
-    if (!x1 || !F || !scale || !delta_x || !xtrial || !x1trial || !A || !b ||
-        !M || !pert || !s || !y || !Ms) {
+    icbuf       = TMALLOC(double, n_full);
+    outbuf      = TMALLOC(double, n_full);
+    ripple_full = TMALLOC(double, n_full);
+    Phi_full    = TMALLOC(double, (size_t) n_full * n_full);
+    is_slow     = TMALLOC(int, n_full);
+    if (!x0 || !x1 || !F || !scale || !delta_x || !xtrial || !x1trial || !A || !b ||
+        !M || !s || !y || !Ms || !icbuf || !outbuf || !ripple_full || !Phi_full || !is_slow) {
         fprintf(stderr, "PSS-SHOOT: %s out of memory allocating Newton "
                 "scratch space.\n", stage_label);
         result = 0;
         goto newton_done;
     }
+    for (i = 0; i < n_full; i++) is_slow[i] = 0;
+    for (k = 0; k < n; k++) is_slow[slow_idx[k]] = 1;
+    for (i = 0; i < n_full; i++) ripple_full[i] = 0.0;
 
     for (iter = 0; ; iter++) {
 
         if (!have_baseline) {
-            pss_state_set_ic(map, x0);
+            for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
+            pss_state_set_ic(map, icbuf);
+
+            /* card #458 FIFTH pass, task 1: track every native state's
+             * ripple over THIS baseline period -- see
+             * PSSrippleRecordStep()'s header comment. Tracked on every
+             * FRESH baseline (this block), not every Broyden-accepted
+             * trial below -- ripple changes slowly near the converged
+             * orbit, so re-measuring it only when the Jacobian itself is
+             * refreshed is an accepted approximation (documented in the
+             * card #458 fifth-pass report), not a correctness need. */
+            pss_ripple_reset(map, icbuf);
+            PSSrippleRecordActive = 1;
             if (use_analytic) {
                 /* One period run, sensitivity tracking active: this SAME
                  * run is both the baseline P(x0) (x1 below) AND the
@@ -935,6 +1112,9 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
             } else {
                 err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
             }
+            PSSrippleRecordActive = 0;
+            pss_ripple_get(map, ripple_full);
+
             if (err) {
                 fprintf(stderr, "PSS-SHOOT: %s period integration did not "
                         "complete at Newton iteration %d (ngspice error "
@@ -942,38 +1122,61 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
                 result = 0;
                 goto newton_done;
             }
-            pss_state_get(map, ckt, x1);
-            if (use_analytic && getenv("PSS_SHOOT_DEBUG")) {
-                double dbgPhi[64];
-                if (!pss_sens_get_phi(map, dbgPhi)) {
-                    for (k = 0; k < n * n; k++)
-                        fprintf(stderr, "DEBUG analytic Phi[%d]=%.8g\n", k, dbgPhi[k]);
+            pss_state_get(map, ckt, outbuf);
+
+            if (use_analytic) {
+                if (pss_sens_get_phi(map, Phi_full)) {
+                    fprintf(stderr, "PSS-SHOOT: %s analytic sensitivity failed "
+                            "(refactor/solve error, or an integration order "
+                            "outside TRAPEZOIDAL 1-2) at Newton iteration %d; "
+                            "treating as a failed attempt (no FD fallback "
+                            "within one attempt).\n", stage_label, iter);
+                    result = 0;
+                    goto newton_done;
                 }
-            }
-            if (use_analytic && pss_sens_get_phi(map, M)) {
-                fprintf(stderr, "PSS-SHOOT: %s analytic sensitivity failed "
-                        "(refactor/solve error, or an integration order "
-                        "outside TRAPEZOIDAL 1-2) at Newton iteration %d; "
-                        "treating as a failed attempt (no FD fallback "
-                        "within one attempt).\n", stage_label, iter);
-                result = 0;
-                goto newton_done;
+                if (getenv("PSS_SHOOT_DEBUG"))
+                    for (k = 0; k < n_full * n_full; k++)
+                        fprintf(stderr, "DEBUG analytic Phi[%d]=%.8g\n", k, Phi_full[k]);
+                /* card #458 FIFTH pass (task 3): slice the FULL analytic
+                 * monodromy down to the slow-slow block Newton actually
+                 * solves -- PSSsensRecordStep()'s recursion still tracks
+                 * every reactive device's own S_k regardless of
+                 * reduction (every state's history still feeds the
+                 * transient, and a slow state's sensitivity can depend on
+                 * a fast one's along the way); task 2's reduction only
+                 * changes which rows/columns feed the NEWTON solve. */
+                for (k = 0; k < n; k++)
+                    for (j = 0; j < n; j++)
+                        M[k * n + j] = Phi_full[slow_idx[k] * n_full + slow_idx[j]];
             }
 
-            /* Scale/floor: unchanged from the second pass -- see that
-             * pass's comment (kept verbatim in PSSshootDriven's history;
-             * not repeated here) for why a 1 mV floor, not near-zero. */
+            /* card #458 FIFTH pass, task 1: scale/floor now relative to
+             * each state's own RIPPLE (see PSSrippleRecordStep()'s header
+             * comment), not its magnitude -- see ripple_floor's own
+             * comment (function top) for this pass's floor value. */
             residual = 0.0;
             for (k = 0; k < n; k++) {
-                double rng = fabs(x1[k]) > fabs(x0[k]) ? fabs(x1[k]) : fabs(x0[k]);
-                const double ABSTOL_FLOOR = 1e-3;
-                scale[k] = (rng > ABSTOL_FLOOR) ? rng : ABSTOL_FLOOR;
-                F[k] = x1[k] - x0[k];
+                int jf = slow_idx[k];
+                double rip = ripple_full[jf];
+                x0[k] = x_full[jf];
+                x1[k] = outbuf[jf];
+                F[k]  = x1[k] - x0[k];
+                scale[k] = (rip > ripple_floor) ? rip : ripple_floor;
                 {
                     double r = fabs(F[k]) / scale[k];
                     if (r > residual) residual = r;
                 }
             }
+            /* card #458 FIFTH pass, task 2: carry every ELIMINATED (fast)
+             * state forward as this period's own output -- exact, not an
+             * approximation, for a state whose Floquet direction is ~0
+             * (pss_detect_fast_states()'s header comment): its value at
+             * t=T does not depend on where it started, so using that
+             * output as the next period's input is already the
+             * self-consistent fixed point for that coordinate. */
+            for (i = 0; i < n_full; i++)
+                if (!is_slow[i]) x_full[i] = outbuf[i];
+
             have_baseline = 1;
         }
 
@@ -984,48 +1187,49 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
             for (k = 0; k < n; k++)
                 fprintf(stderr, "DEBUG %s iter=%d k=%d %s x0=%.8g x1=%.8g "
                         "F=%.4e scale=%.6g r=%.4e\n", stage_label,
-                        iter, k, map->refs[k].name, x0[k], x1[k], F[k],
+                        iter, k, map->refs[slow_idx[k]].name, x0[k], x1[k], F[k],
                         scale[k], fabs(F[k]) / scale[k]);
         }
 
         if (residual <= tol) {
             /* THIRD-PASS GUARD, added after this pass's OWN testing found
-             * it necessary: reject a "converged" point where EVERY state
-             * is still at (or under) the ABSTOL_FLOOR scale floor -- the
-             * degenerate all-off fixed point this file's top-of-function
-             * comment already warns about (a converter sitting powered
-             * off is itself a self-consistent, non-switching P(0)=0
-             * solution). The original design relied ENTIRELY on the
-             * pre-Newton warm-up already being far from 0 to avoid this;
-             * that is no longer a safe assumption with a SHORT probe
-             * warm-up and a generous iteration budget -- found exactly
-             * this way on the R3 fixture: PSS_SHOOT_WARMUP_MAXITER=10
-             * from a 20-period probe converged (residual 1.1e-10, a
-             * seemingly excellent fit) onto vout~1.2e-7 V, not ~3.3V, a
-             * numerically real but physically wrong answer (and a
-             * telltale near-singular Phi~=I / Floquet dominant
-             * multiplier exactly 1+0i went with it). A real switching
-             * converter's TRUE orbit should not have every single state
-             * sitting at/under a millivolt/milliamp-scale floor at once,
-             * so this is a general, circuit-agnostic check, not a magic
-             * number tuned to R3 -- and it is applied at every stage,
-             * including a full-budget/full-stabtime one, since nothing
-             * before this pass actually proved the old code was immune
-             * to the same trap, only that it never happened to trigger
-             * it. A rejection here is treated exactly like any other
-             * "this attempt did not confirm a steady state" outcome:
-             * the staged caller extends the warm-up (or, on the final
-             * stage, reports the honest FAILED verdict) rather than
-             * silently accepting a wrong answer. */
+             * it necessary: reject a "converged" point where EVERY
+             * Newton-unknown state is still at (or under) the
+             * ABSTOL_FLOOR scale floor -- the degenerate all-off fixed
+             * point this file's top-of-function comment already warns
+             * about (a converter sitting powered off is itself a
+             * self-consistent, non-switching P(0)=0 solution). The
+             * original design relied ENTIRELY on the pre-Newton warm-up
+             * already being far from 0 to avoid this; that is no longer a
+             * safe assumption with a SHORT probe warm-up and a generous
+             * iteration budget -- found exactly this way on the R3
+             * fixture: PSS_SHOOT_WARMUP_MAXITER=10 from a 20-period probe
+             * converged (residual 1.1e-10, a seemingly excellent fit)
+             * onto vout~1.2e-7 V, not ~3.3V, a numerically real but
+             * physically wrong answer (and a telltale near-singular
+             * Phi~=I / Floquet dominant multiplier exactly 1+0i went with
+             * it). A real switching converter's TRUE orbit should not
+             * have every single state sitting at/under a millivolt/
+             * milliamp-scale floor at once, so this is a general,
+             * circuit-agnostic check, not a magic number tuned to R3 --
+             * and it is applied at every stage, including a full-budget/
+             * full-stabtime one, since nothing before this pass actually
+             * proved the old code was immune to the same trap, only that
+             * it never happened to trigger it. A rejection here is
+             * treated exactly like any other "this attempt did not
+             * confirm a steady state" outcome: the staged caller extends
+             * the warm-up (or, on the final stage, reports the honest
+             * FAILED verdict) rather than silently accepting a wrong
+             * answer. */
             int all_at_floor = 1;
             for (k = 0; k < n; k++)
-                if (scale[k] > 1e-3 * (1.0 + 1e-9)) { all_at_floor = 0; break; }
+                if (scale[k] > ripple_floor * (1.0 + 1e-9)) { all_at_floor = 0; break; }
             if (all_at_floor) {
                 fprintf(stderr, "PSS-SHOOT: %s converged (residual=%.3e) "
-                        "but EVERY state is at/under the 1e-3 scale floor "
-                        "-- rejecting this as the degenerate all-off fixed "
-                        "point, not a trustworthy orbit.\n", stage_label,
-                        residual);
+                        "but EVERY Newton-unknown state is at/under the "
+                        "%.3g ripple-floor -- rejecting this as the "
+                        "degenerate all-off fixed point, not a "
+                        "trustworthy orbit.\n", stage_label, residual, ripple_floor);
                 result = 0;
                 goto newton_done;
             }
@@ -1047,44 +1251,50 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
              * straight halvings without ever dipping below it, i.e.
              * essentially no usable descent direction; centred
              * differences cancel the O(h) bias one-sided differences
-             * carry and fixed it. `pert`, not x1, is the scratch buffer
+             * carry and fixed it. `outbuf`, not x1, is the scratch buffer
              * here (see this function's header comment) so the clean
              * baseline x1/F/scale survive for the residual check above on
-             * every iteration, recompute or not. */
+             * every iteration, recompute or not. card #458 FIFTH pass:
+             * `n` (== n_slow) columns/rows now, not every native state
+             * (task 2) -- every OTHER native state (fast/carried, or any
+             * other slow state not currently being perturbed) is held at
+             * its current x_full value via icbuf, exactly like the
+             * un-reduced code held every other state at x0[k]. */
             for (j = 0; j < n; j++) {
+                int jf = slow_idx[j];
                 double h = fabs(x0[j]) * eps;
                 if (h < 1e-6) h = 1e-6;
 
-                for (k = 0; k < n; k++) xtrial[k] = x0[k];
-                xtrial[j] = x0[j] + h;
-                pss_state_set_ic(map, xtrial);
+                for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
+                icbuf[jf] = x0[j] + h;
+                pss_state_set_ic(map, icbuf);
                 err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation +)", 0, 1);
                 if (err) {
                     fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
                             "run for state %s (+h) did not complete at "
                             "Newton iteration %d (ngspice error %d).\n",
-                            stage_label, map->refs[j].name, iter, err);
+                            stage_label, map->refs[jf].name, iter, err);
                     result = 0;
                     goto newton_done;
                 }
-                pss_state_get(map, ckt, pert);
-                for (k = 0; k < n; k++) M[k * n + j] = pert[k];
+                pss_state_get(map, ckt, outbuf);
+                for (k = 0; k < n; k++) M[k * n + j] = outbuf[slow_idx[k]];
 
-                for (k = 0; k < n; k++) xtrial[k] = x0[k];
-                xtrial[j] = x0[j] - h;
-                pss_state_set_ic(map, xtrial);
+                for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
+                icbuf[jf] = x0[j] - h;
+                pss_state_set_ic(map, icbuf);
                 err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation -)", 0, 1);
                 if (err) {
                     fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation "
                             "run for state %s (-h) did not complete at "
                             "Newton iteration %d (ngspice error %d).\n",
-                            stage_label, map->refs[j].name, iter, err);
+                            stage_label, map->refs[jf].name, iter, err);
                     result = 0;
                     goto newton_done;
                 }
-                pss_state_get(map, ckt, pert);
+                pss_state_get(map, ckt, outbuf);
                 for (k = 0; k < n; k++)
-                    M[k * n + j] = (M[k * n + j] - pert[k]) / (2.0 * h);
+                    M[k * n + j] = (M[k * n + j] - outbuf[slow_idx[k]]) / (2.0 * h);
             }
             if (getenv("PSS_SHOOT_DEBUG"))
                 for (k = 0; k < n * n; k++)
@@ -1178,7 +1388,9 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
                     continue;
                 }
 
-                pss_state_set_ic(map, xtrial);
+                for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
+                for (k = 0; k < n; k++) icbuf[slow_idx[k]] = xtrial[k];
+                pss_state_set_ic(map, icbuf);
                 /* NOT forced -- see the second-pass comment (kept
                  * verbatim in this function's git history): a damped
                  * trial point can be a full Newton step away from x0, so
@@ -1186,10 +1398,13 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
                 err = pss_run_period_ex(ckt, T, "PSS shoot (damped-step trial)", 0, 0);
                 if (!err) {
                     double newresidual = 0.0;
-                    pss_state_get(map, ckt, x1trial);
+                    pss_state_get(map, ckt, outbuf);   /* outbuf: this trial's FULL result, incl. carried states */
                     for (k = 0; k < n; k++) {
+                        x1trial[k] = outbuf[slow_idx[k]];
+                        {
                         double r = fabs(x1trial[k] - xtrial[k]) / scale[k];
                         if (r > newresidual) newresidual = r;
+                        }
                     }
                     if (getenv("PSS_SHOOT_DEBUG"))
                         fprintf(stderr, "DEBUG %s iter=%d bt=%d alpha=%g "
@@ -1266,17 +1481,28 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
              * printed correctly shrinking every iteration while the
              * convergence check kept comparing a STALE, never-updated
              * residual and looped for the full 25-iteration budget
-             * without ever seeing it drop below tol. */
+             * without ever seeing it drop below tol.
+             *
+             * card #458 FIFTH pass, task 2: carry the eliminated (fast)
+             * states forward from THIS accepted trial's own full output
+             * too -- `outbuf` here still holds the ACCEPTED trial's full
+             * result (the bt loop broke immediately on acceptance, before
+             * any further trial could overwrite it). Task 1: scale/floor
+             * still uses ripple_full, but that buffer is only refreshed
+             * on the next FRESH baseline (not re-measured every Broyden
+             * step -- see the fresh-baseline block's own comment). */
+            for (i = 0; i < n_full; i++)
+                if (!is_slow[i]) x_full[i] = outbuf[i];
             for (k = 0; k < n; k++) {
                 x0[k] = xtrial[k];
                 x1[k] = x1trial[k];
                 F[k]  = x1trial[k] - xtrial[k];
+                x_full[slow_idx[k]] = xtrial[k];
             }
             residual = 0.0;
             for (k = 0; k < n; k++) {
-                double rng = fabs(x1[k]) > fabs(x0[k]) ? fabs(x1[k]) : fabs(x0[k]);
-                const double ABSTOL_FLOOR = 1e-3;
-                scale[k] = (rng > ABSTOL_FLOOR) ? rng : ABSTOL_FLOOR;
+                double rip = ripple_full[slow_idx[k]];
+                scale[k] = (rip > ripple_floor) ? rip : ripple_floor;
                 {
                     double r = fabs(F[k]) / scale[k];
                     if (r > residual) residual = r;
@@ -1297,15 +1523,11 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
     }
 
  newton_done:
-    if (result) {
-        *iter_out = iter;
-        *residual_out = residual;
-    } else {
-        *iter_out = iter;
-        *residual_out = residual;
-    }
+    *iter_out = iter;
+    *residual_out = residual;
     if (Phi_out && M)
         for (k = 0; k < n * n; k++) Phi_out[k] = M[k];
+    if (x0) tfree(x0);
     if (x1) tfree(x1);
     if (F) tfree(F);
     if (scale) tfree(scale);
@@ -1315,11 +1537,207 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n,
     if (A) tfree(A);
     if (b) tfree(b);
     if (M) tfree(M);
-    if (pert) tfree(pert);
     if (s) tfree(s);
     if (y) tfree(y);
     if (Ms) tfree(Ms);
+    if (icbuf) tfree(icbuf);
+    if (outbuf) tfree(outbuf);
+    if (ripple_full) tfree(ripple_full);
+    if (Phi_full) tfree(Phi_full);
+    if (is_slow) tfree(is_slow);
     return result;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* card #458 FIFTH pass (plan T4.3), task 2: automatic fast-state
+ * detection. HYPOTHESIS (card #458, fifth pass): a state whose own time
+ * constant is much shorter than the period T has, to first order,
+ * forgotten its initial value by t=T -- its Floquet multiplier direction
+ * is ~exp(-T/tau)~0, so perturbing x0 in that direction has ~no effect on
+ * x(T) (this file's own R3 op-amp-output finding, fourth pass: tau~10ns
+ * vs T=2us). Treating such a state as a Newton unknown (a) adds 2 FD
+ * period runs per Newton iteration for a column that carries essentially
+ * no signal, (b) makes that column of the FD Jacobian noise-dominated
+ * (the true derivative is ~0, so eps-scale integration/roundoff noise IS
+ * the whole signal), and (c) can leave it loosely converged under a
+ * magnitude-relative tolerance (task 1's own finding).
+ *
+ * This function measures the ACTUAL criterion the hypothesis describes --
+ * "perturbing x0_j has ~no effect on x(T)" -- directly, with ONE dedicated
+ * full (un-reduced) finite-difference monodromy evaluation at the given
+ * x_full (2*n_full+1 period runs, forced onto the baseline's own accepted
+ * grid exactly like pss_newton_run's own FD sweep): column j's inf-norm
+ * (max |dx_i(T)/dx0_j| over every state i, not just state j itself -- a
+ * state that only "leaks" into some OTHER state by t=T is just as
+ * forgettable a Newton unknown as one that only affects itself) below
+ * PSS_SHOOT_FAST_THRESHOLD (native units -- volts for a cap, amps for an
+ * inductor; default 1e-3, the same order-of-magnitude convention this
+ * file's existing ABSTOL_FLOOR/PSS_SHOOT_MAX_STATE constants already use
+ * for "a small circuit's own native units") marks that state FAST --
+ * eliminated from the Newton unknown set, but NOT from the circuit: it
+ * still gets a device IC every period run (pss_newton_run's icbuf), just
+ * carried forward from the previous period's own output instead of
+ * Newton-solved (see pss_newton_run's own "carry the eliminated states
+ * forward" comments for why that is exact, not an approximation, given
+ * this same near-zero-column property).
+ *
+ * This is a ONE-TIME cost per whole `.pss method=shoot` analysis (paid
+ * once by the caller, PSSshootDriven, right before the Newton phase that
+ * actually spends an iteration budget -- see that function's own comment
+ * for why probe/warm-up stages are NOT reduced this pass), not a per-
+ * Newton-iteration cost -- it pays for itself as soon as it saves even one
+ * full FD Jacobian recompute on the reduced (smaller) system afterwards.
+ * Never reduces to zero Newton unknowns (defensive guard: if every column
+ * looks negligible, the single least-fast state is kept anyway) and never
+ * runs at all for a 1-state circuit (R2 -- nothing to reduce, and the
+ * detection sweep's own cost would not be worth paying there). Falls back
+ * to "no reduction" (every state stays a Newton unknown, byte-for-byte the
+ * fourth pass's own behaviour) on allocation failure, a failed period run
+ * during detection, or PSS_SHOOT_NO_REDUCE (debug/regression-isolation
+ * switch, same pattern as PSS_SHOOT_NO_FORCE) -- never silently skips
+ * logging what it did. Caller owns the returned slow_idx array (tfree()
+ * it when done). */
+static int *
+pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
+                        const double *x_full, double eps, int *n_slow_out)
+{
+    int n = map->n, i, j, k, err;
+    double threshold = 1e-3;
+    double *Phi = NULL, *outbuf = NULL, *icbuf = NULL, *colnorm = NULL;
+    int *is_fast = NULL, *slow_idx;
+    int n_slow;
+
+    if (getenv("PSS_SHOOT_FAST_THRESHOLD"))
+        threshold = atof(getenv("PSS_SHOOT_FAST_THRESHOLD"));
+
+    if (getenv("PSS_SHOOT_NO_REDUCE") || threshold <= 0.0) {
+        fprintf(stdout, "PSS-SHOOT: fast-state reduction disabled "
+                "(PSS_SHOOT_NO_REDUCE set, or a non-positive threshold); "
+                "all %d states remain Newton unknowns.\n", n);
+        goto no_reduce;
+    }
+
+    Phi     = TMALLOC(double, (size_t) n * n);
+    outbuf  = TMALLOC(double, n);
+    icbuf   = TMALLOC(double, n);
+    colnorm = TMALLOC(double, n);
+    is_fast = TMALLOC(int, n);
+    if (!Phi || !outbuf || !icbuf || !colnorm || !is_fast) {
+        fprintf(stderr, "PSS-SHOOT: fast-state detection out of memory; "
+                "skipping reduction, all %d states remain Newton "
+                "unknowns.\n", n);
+        goto cleanup_no_reduce;
+    }
+
+    for (i = 0; i < n; i++) icbuf[i] = x_full[i];
+    pss_state_set_ic(map, icbuf);
+    err = pss_run_period_ex(ckt, T, "PSS shoot (fast-state detection baseline)", 1, 0);
+    if (err) {
+        fprintf(stderr, "PSS-SHOOT: fast-state detection baseline period "
+                "did not complete (ngspice error %d); skipping reduction, "
+                "all %d states remain Newton unknowns.\n", err, n);
+        goto cleanup_no_reduce;
+    }
+
+    for (j = 0; j < n; j++) {
+        double h = fabs(x_full[j]) * eps;
+        if (h < 1e-6) h = 1e-6;
+
+        for (i = 0; i < n; i++) icbuf[i] = x_full[i];
+        icbuf[j] = x_full[j] + h;
+        pss_state_set_ic(map, icbuf);
+        err = pss_run_period_ex(ckt, T, "PSS shoot (fast-state detection perturbation +)", 0, 1);
+        if (err) {
+            fprintf(stderr, "PSS-SHOOT: fast-state detection perturbation "
+                    "run for state %s (+h) did not complete (ngspice error "
+                    "%d); skipping reduction, all %d states remain Newton "
+                    "unknowns.\n", map->refs[j].name, err, n);
+            goto cleanup_no_reduce;
+        }
+        pss_state_get(map, ckt, outbuf);
+        for (k = 0; k < n; k++) Phi[k * n + j] = outbuf[k];
+
+        for (i = 0; i < n; i++) icbuf[i] = x_full[i];
+        icbuf[j] = x_full[j] - h;
+        pss_state_set_ic(map, icbuf);
+        err = pss_run_period_ex(ckt, T, "PSS shoot (fast-state detection perturbation -)", 0, 1);
+        if (err) {
+            fprintf(stderr, "PSS-SHOOT: fast-state detection perturbation "
+                    "run for state %s (-h) did not complete (ngspice error "
+                    "%d); skipping reduction, all %d states remain Newton "
+                    "unknowns.\n", map->refs[j].name, err, n);
+            goto cleanup_no_reduce;
+        }
+        pss_state_get(map, ckt, outbuf);
+        for (k = 0; k < n; k++)
+            Phi[k * n + j] = (Phi[k * n + j] - outbuf[k]) / (2.0 * h);
+    }
+
+    for (j = 0; j < n; j++) {
+        double cn = 0.0;
+        for (i = 0; i < n; i++) {
+            double v = fabs(Phi[i * n + j]);
+            if (v > cn) cn = v;
+        }
+        colnorm[j] = cn;
+        is_fast[j] = (cn < threshold);
+    }
+    {
+        int any_slow = 0;
+        for (k = 0; k < n; k++) if (!is_fast[k]) any_slow = 1;
+        if (!any_slow) {
+            int best = 0; double bestnorm = -1.0;
+            for (k = 0; k < n; k++)
+                if (colnorm[k] > bestnorm) { bestnorm = colnorm[k]; best = k; }
+            is_fast[best] = 0;
+            fprintf(stdout, "PSS-SHOOT: fast-state detection found every "
+                    "state's column under threshold %.3g -- keeping the "
+                    "least-fast state (%s, colnorm=%.3e) as a Newton "
+                    "unknown so at least one remains (defensive guard, "
+                    "should not happen on a real circuit).\n",
+                    threshold, map->refs[best].name, bestnorm);
+        }
+    }
+
+    n_slow = 0;
+    for (k = 0; k < n; k++) if (!is_fast[k]) n_slow++;
+    slow_idx = TMALLOC(int, n_slow);
+    fprintf(stdout, "PSS-SHOOT: fast-state detection (threshold=%.3g native "
+            "units, column inf-norm of a one-time full FD monodromy):\n", threshold);
+    n_slow = 0;
+    for (k = 0; k < n; k++) {
+        fprintf(stdout, "PSS-SHOOT:   %-12s colnorm=%.6e -> %s\n",
+                map->refs[k].name, colnorm[k],
+                is_fast[k] ? "ELIMINATED (carried)" : "kept (Newton unknown)");
+        if (!is_fast[k]) slow_idx[n_slow++] = k;
+    }
+    fprintf(stdout, "PSS-SHOOT: fast-state reduction: %d Newton unknown(s) "
+            "(was %d).\n", n_slow, n);
+    fflush(stdout);
+
+    /* belt-and-braces: restore x_full's own IC (the sweep above left the
+     * device IC fields at the last perturbation trial) -- not load-
+     * bearing, since the caller's very next action always re-sets IC from
+     * x_full itself, but cheap and avoids any window where they disagree. */
+    for (i = 0; i < n; i++) icbuf[i] = x_full[i];
+    pss_state_set_ic(map, icbuf);
+
+    tfree(Phi); tfree(outbuf); tfree(icbuf); tfree(colnorm); tfree(is_fast);
+    *n_slow_out = n_slow;
+    return slow_idx;
+
+ cleanup_no_reduce:
+    if (Phi) tfree(Phi);
+    if (outbuf) tfree(outbuf);
+    if (icbuf) tfree(icbuf);
+    if (colnorm) tfree(colnorm);
+    if (is_fast) tfree(is_fast);
+ no_reduce:
+    slow_idx = TMALLOC(int, n);
+    for (k = 0; k < n; k++) slow_idx[k] = k;
+    *n_slow_out = n;
+    return slow_idx;
 }
 
 
@@ -1340,6 +1758,14 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     double save_reltol, save_abstol, save_volttol;
     PSSfloquet floq;
     PSScomplex *eig = NULL;
+    /* card #458 FIFTH pass (plan T4.3), task 2: the reduced Newton-unknown
+     * set (n_slow of map.n states, slow_idx[0..n_slow) their indices into
+     * map.refs), detected once by pss_detect_fast_states() right before
+     * the final Newton stage -- see that function's header comment and
+     * the staged-warm-up loop below. slow_idx is heap-owned by whichever
+     * pss_detect_fast_states() call set it; freed at shoot_cleanup. */
+    int n_slow = 0;
+    int *slow_idx = NULL;
 
     t_wall_start = SPfrontEnd->IFseconds();
 
@@ -1550,9 +1976,15 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
 
         if (ckt->CKTstabTime <= 0.0) {
             pss_state_get_ic(&map, x0);
+            /* card #458 FIFTH pass, task 2: detect+reduce ONCE, right
+             * before the only Newton attempt this path makes -- see
+             * pss_detect_fast_states()'s header comment for why this is a
+             * one-time cost. */
+            n_slow = n;
+            slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow);
             ckt->CKTreltol = tight_reltol;
-            converged_flag = pss_newton_run(ckt, &map, T, n, x0, maxiter,
-                                             tol, eps, -1.0, broyden_enabled,
+            converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
+                                             maxiter, tol, eps, -1.0, broyden_enabled,
                                              broyden_period, "[no warm-up]",
                                              &iter, &residual, Phi, use_analytic);
             ckt->CKTreltol = save_reltol;
@@ -1600,12 +2032,44 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 pss_state_get(&map, ckt, x0);
                 for (k = 0; k < n; k++) x0_stage_start[k] = x0[k];
 
+                /* card #458 FIFTH pass, task 2: detect+reduce ONCE, right
+                 * after the FIRST warm-up transient (not before it, and
+                 * not per-stage) -- reused for every stage's Newton
+                 * attempt from here on, probe or final. Two things this
+                 * pass's own testing found necessary, both documented in
+                 * the card #458 fifth-pass report:
+                 *   - detecting from the deck's raw COLD start (x0=0,
+                 *     before ANY warm-up) is NOT robust -- tried first,
+                 *     and failed outright on this very fixture ("Timestep
+                 *     too small" perturbing a state right at the
+                 *     degenerate all-off point every cap/inductor's IC=0
+                 *     sits at, this file's own top-of-function comment).
+                 *     One short (stage 1, ~20 periods) warm-up transient
+                 *     is enough to clear that trap while still being a
+                 *     small, early cost.
+                 *   - reducing ONLY the final stage (an earlier version of
+                 *     this pass) left every probe stage on the full state
+                 *     set; measured on the long-settling R3 fixture, that
+                 *     was a REGRESSION (2.5s vs the fourth pass's 0.62s)
+                 *     -- task 1's ripple-relative tolerance correctly
+                 *     stops several probe stages from declaring
+                 *     "converged" too early on opout's magnitude-scale
+                 *     slack, so the staged warm-up needs MORE, LONGER
+                 *     probe stages to reach the same honestly-converged
+                 *     point, and none of those extra probe attempts got
+                 *     task 2's per-iteration cost cut unless reduction
+                 *     applies there too. */
+                if (stage == 1) {
+                    n_slow = n;
+                    slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow);
+                }
+
                 this_maxiter = last_stage ? maxiter : warmup_maxiter;
                 this_trust   = last_stage ? -1.0 : trust_radius;
                 snprintf(label, sizeof label, "[stage %d/%s]", stage,
                          last_stage ? "final" : "probe");
                 ckt->CKTreltol = tight_reltol;
-                converged_flag = pss_newton_run(ckt, &map, T, n, x0,
+                converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
                                                  this_maxiter, tol, eps,
                                                  this_trust, broyden_enabled,
                                                  broyden_period, label,
@@ -1664,54 +2128,80 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * perturbation large enough to shift a forced switch edge"
          * problem eps=1e-2 caused in the Newton loop itself. */
         double eps_floquet = eps;
-        double *Phi2 = TMALLOC(double, n * n);
-        int floquet_ok = (Phi2 != NULL);
+        /* card #458 FIFTH pass, task 2: Floquet re-evaluated on the SAME
+         * reduced (slow_idx, n_slow) set the converged Newton attempt
+         * used -- the eliminated states' own multipliers are, by the
+         * detection criterion itself (pss_detect_fast_states()'s header
+         * comment), near 0 and therefore never the dominant one, so the
+         * reduced matrix's spectral radius is the same physical quantity
+         * the full one would report; computing it on the smaller block is
+         * both cheaper (2*n_slow+1, not 2*n_full+1, period runs) and
+         * avoids re-deriving eigenvalues the detection sweep already
+         * showed to carry no real signal. n_full-sized icbuf/outbuf hold
+         * the full device IC / period-output the same way
+         * pss_newton_run()'s own internals do; x0 here is the Newton
+         * loop's converged FULL state (n_full entries, fast/carried ones
+         * already self-consistent by construction). */
+        int n_full_fl = map.n;
+        double *Phi2 = TMALLOC(double, (size_t) n_slow * n_slow);
+        double *icbuf_fl = TMALLOC(double, n_full_fl);
+        double *outbuf_fl = TMALLOC(double, n_full_fl);
+        int floquet_ok = (Phi2 != NULL && icbuf_fl != NULL && outbuf_fl != NULL);
 
         if (floquet_ok && use_analytic) {
             /* card #458 FOURTH pass: analytic sensitivity, same one-period
              * source as pss_newton_run()'s own analytic baseline -- no FD
              * perturbation runs here either. */
-            pss_state_set_ic(&map, x0);
+            double *Phi_full_fl = TMALLOC(double, (size_t) n_full_fl * n_full_fl);
+            for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
+            pss_state_set_ic(&map, icbuf_fl);
             pss_sens_reset(ckt, &map);
             PSSsensActive = 1;
             if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline, analytic)", 0, 0))
                 floquet_ok = 0;
             PSSsensActive = 0;
-            if (floquet_ok && pss_sens_get_phi(&map, Phi2))
+            if (!Phi_full_fl)
                 floquet_ok = 0;
+            if (floquet_ok && pss_sens_get_phi(&map, Phi_full_fl))
+                floquet_ok = 0;
+            if (floquet_ok)
+                for (k = 0; k < n_slow; k++)
+                    for (j = 0; j < n_slow; j++)
+                        Phi2[k * n_slow + j] = Phi_full_fl[slow_idx[k] * n_full_fl + slow_idx[j]];
+            if (Phi_full_fl) tfree(Phi_full_fl);
         } else {
 
-        pss_state_set_ic(&map, x0);
+        for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
+        pss_state_set_ic(&map, icbuf_fl);
         if (floquet_ok && pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline)", 1, 0))
             floquet_ok = 0;
-        if (floquet_ok)
-            pss_state_get(&map, ckt, x1);
 
-        for (j = 0; floquet_ok && j < n; j++) {
-            double h = fabs(x0[j]) * eps_floquet;
+        for (j = 0; floquet_ok && j < n_slow; j++) {
+            int jf = slow_idx[j];
+            double h = fabs(x0[jf]) * eps_floquet;
             if (h < 1e-6) h = 1e-6;
 
-            for (k = 0; k < n; k++) xtrial[k] = x0[k];
-            xtrial[j] = x0[j] + h;
-            pss_state_set_ic(&map, xtrial);
+            for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
+            icbuf_fl[jf] = x0[jf] + h;
+            pss_state_set_ic(&map, icbuf_fl);
             if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet perturbation +)", 0, 1)) {
                 floquet_ok = 0;
                 break;
             }
-            pss_state_get(&map, ckt, x1trial);
-            for (k = 0; k < n; k++)
-                Phi2[k * n + j] = x1trial[k];
+            pss_state_get(&map, ckt, outbuf_fl);
+            for (k = 0; k < n_slow; k++)
+                Phi2[k * n_slow + j] = outbuf_fl[slow_idx[k]];
 
-            for (k = 0; k < n; k++) xtrial[k] = x0[k];
-            xtrial[j] = x0[j] - h;
-            pss_state_set_ic(&map, xtrial);
+            for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
+            icbuf_fl[jf] = x0[jf] - h;
+            pss_state_set_ic(&map, icbuf_fl);
             if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet perturbation -)", 0, 1)) {
                 floquet_ok = 0;
                 break;
             }
-            pss_state_get(&map, ckt, x1trial);
-            for (k = 0; k < n; k++)
-                Phi2[k * n + j] = (Phi2[k * n + j] - x1trial[k]) / (2.0 * h);
+            pss_state_get(&map, ckt, outbuf_fl);
+            for (k = 0; k < n_slow; k++)
+                Phi2[k * n_slow + j] = (Phi2[k * n_slow + j] - outbuf_fl[slow_idx[k]]) / (2.0 * h);
         }
         }
 
@@ -1723,16 +2213,22 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                         "eigenvalues of the last Newton-step monodromy "
                         "(eps=%g) instead, which may be less accurate.\n",
                         eps_floquet, eps);
-            if (pss_eigenvalues(src, n, eig) != 0) {
+            /* NOTE: Phi (the fallback) was itself filled by the converged
+             * Newton attempt using this SAME n_slow/slow_idx pair (set
+             * once, before that attempt, and unchanged since) -- both
+             * branches size n_slow, never the un-reduced n. */
+            if (pss_eigenvalues(src, n_slow, eig) != 0) {
                 fprintf(stderr, "PSS-SHOOT: WARNING -- the eigenvalue solver "
                         "did not converge on the monodromy matrix; Floquet "
                         "report is NOT trustworthy this run.\n");
                 floq.valid = 0;
             } else {
-                pss_classify_floquet(eig, n, &floq);
+                pss_classify_floquet(eig, n_slow, &floq);
             }
         }
         if (Phi2) tfree(Phi2);
+        if (icbuf_fl) tfree(icbuf_fl);
+        if (outbuf_fl) tfree(outbuf_fl);
         /* restore the baseline transient's data (x1/Phi corrupted as
          * scratch above) is not needed further -- nothing below reads
          * them except the final trajectory re-run, which sets its own
@@ -1741,8 +2237,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     t_wall_end = SPfrontEnd->IFseconds();
 
     if (getenv("PSS_SHOOT_DEBUG") && floq.valid) {
-        fprintf(stderr, "DEBUG Floquet multipliers (%d):", n);
-        for (k = 0; k < n; k++)
+        fprintf(stderr, "DEBUG Floquet multipliers (%d):", n_slow);
+        for (k = 0; k < n_slow; k++)
             fprintf(stderr, " (%.6g%+.6gi)", eig[k].re, eig[k].im);
         fprintf(stderr, "\n");
     }
@@ -1781,6 +2277,9 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     pss_break_free();
     PSSsensActive = 0;
     pss_sens_free();   /* g_sens_map points into &map, about to be freed below */
+    PSSrippleRecordActive = 0;
+    pss_ripple_free();
+    if (slow_idx) tfree(slow_idx);   /* card #458 fifth pass, task 2 */
     if (x0) tfree(x0);
     if (x1) tfree(x1);
     if (F) tfree(F);
