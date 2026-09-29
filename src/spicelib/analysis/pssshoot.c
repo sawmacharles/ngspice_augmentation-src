@@ -1158,8 +1158,8 @@ pss_salt_node_is_stable(CKTcircuit *ckt, int node)
  * function can safely resolve. */
 static int
 pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
-                   double g_prev, int *out_row, double *out_djump, double *out_tau,
-                   const char **out_why)
+                   double g_prev, double dt_actual, int *out_row, double *out_djump,
+                   double *out_tau, const char **out_why)
 {
     int indtype, n_found = 0;
     INDmodel *im;
@@ -1288,16 +1288,54 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
     dV = V_now - V_prev;
     *out_djump = (double) found_sign * dV / found->INDinduct;
     *out_row = found->INDbrEq;
-    /* card #510: L/R settle-window estimate for PSSsaltForceOrder1() below
-     * (the FIFTH pass's L-stable-propagation fix), mirroring tau=C/G for
-     * the capacitor case -- see PSSsaltFindEvents()'s own wiring of this
-     * into tau_max/g_salt_settle_until. Without this, the accepted steps
-     * right after an inductor-routed jump propagate through the
-     * surrounding TRAPEZOIDAL (order 2) recursion instead of L-stable
-     * backward Euler, the same ringing-into-the-slow-states failure mode
-     * the FIFTH pass root-caused for the capacitor case (docs/pss-pac.md's
-     * "FOURTH pass"/"FIFTH pass" sections) -- found to matter here too. */
-    *out_tau = found->INDinduct / (g_prev + Gsum);
+
+    /* card #510 step 2 (accuracy pass, superseding the step-1 L/R-based
+     * *out_tau this comment replaces): settle-window sizing for
+     * PSSsaltForceOrder1() below (the FIFTH pass's L-stable-propagation
+     * fix). Step 1 used the SAME "N_TAU time constants of real elapsed
+     * time" idiom the capacitor case uses, with tau = L/(g_prev+Gsum) (an
+     * L/R time constant) in place of C/G -- dimensionally the obvious
+     * analogue, but WRONG in practice: measured worst-case error against
+     * tools/pac_perturbed.py on pac_sw_ctrl_direct.cir was ~3.6dB/3.1deg
+     * with that tau (PSS_SALT_SETTLE_TAUS=30 * ~0.5us = a ~15us window,
+     * 7.5 SWITCHING PERIODS at this fixture's 2us period -- forcing
+     * backward Euler across most of the recorded trajectory, not a brief
+     * post-event settle). Re-derived: the FIFTH pass's own stiffness
+     * argument (trapezoidal's amplification factor -> -1, not 0, as
+     * |lambda*h|->Inf, so it rings on a mode STIFF relative to the
+     * accepted step h) needs a mode with |lambda|*h large -- an
+     * INDUCTOR's own L/R tau being LARGE (as it almost always is by
+     * converter design -- that is WHY an inductor filters) means
+     * |lambda|=1/tau is SMALL, so |lambda*h|<<1 for this state's OWN
+     * eigenvalue: no genuine L-stability issue on the jumped state
+     * itself, unlike R6o's tiny-Csw node (tau~50ps, genuinely stiff
+     * against a ~10ns step). What the window still measurably helps with
+     * here (scale=0 -- no window at all -- measured WORSE, ~6dB) is
+     * something else: not decaying a stiff ring, but not reusing the
+     * PRE-event order-2 history term (`Tp`) across the jump for the
+     * first step or two -- the same "order 1 for exactly the step(s)
+     * right after a breakpoint" idiom dctran.c's own real-trajectory path
+     * already uses, sized in STEPS, not tau. Fix: size the window
+     * directly off THIS event's own accepted-step size (`dt_actual`,
+     * already computed by the caller -- self-scaling, no L/R/fixture-
+     * specific constant to tune) instead of tau: a fixed small number of
+     * step-widths, found by sweeping PSS_SALT_IND_STEPS against
+     * tools/pac_perturbed.py (1k/10k/50k/100k/200kHz) -- 2 steps met the
+     * 0.5dB/3deg target at every point (worst 0.48dB/2.37deg); see
+     * docs/pss-pac.md's card #510 section for the full sweep table. Env
+     * var kept as a documented, default-off-behaviour-preserving (default
+     * matches the value validated below) diagnostic for any future
+     * re-tuning, same convention as PSS_SALT_TRACE/PSS_SALT_NOFILTER. */
+    {
+        static int n_checked = 0;
+        static double n_steps = 2.0;
+        if (!n_checked) {
+            const char *e = getenv("PSS_SALT_IND_STEPS");
+            if (e) n_steps = atof(e);
+            n_checked = 1;
+        }
+        *out_tau = (n_steps * dt_actual) / PSS_SALT_SETTLE_TAUS;
+    }
 
     /* card #510 step 1 (maintainer decision: MERGE WITH A WARNING, not hold --
      * see the report): this path is genuinely less validated than the
@@ -1423,7 +1461,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 posRow = 0;
                 dfdt_pos = 0.0;
                 indrc = pss_salt_ind_jump(ckt, here, here->SWposNode, here->SWnegNode,
-                                           g_prev, &posRow, &dfdt_pos, &tau_ind_pos, &why);
+                                           g_prev, dt_actual, &posRow, &dfdt_pos, &tau_ind_pos, &why);
                 if (indrc < 0) {
                     fprintf(stderr, "PSS-SALT: REFUSING saltation correction for "
                             "switch %s at t=%.9g (posNode=%d): %s -- this .pss/.pac/"
@@ -1441,7 +1479,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 negRow = 0;
                 dfdt_neg = 0.0;
                 indrc = pss_salt_ind_jump(ckt, here, here->SWnegNode, here->SWposNode,
-                                           g_prev, &negRow, &dfdt_neg, &tau_ind_neg, &why);
+                                           g_prev, dt_actual, &negRow, &dfdt_neg, &tau_ind_neg, &why);
                 if (indrc < 0) {
                     fprintf(stderr, "PSS-SALT: REFUSING saltation correction for "
                             "switch %s at t=%.9g (negNode=%d): %s -- this .pss/.pac/"
