@@ -91,7 +91,7 @@ limit(double nominal_val, double abs_variation)
 static const char *fmathS =     /* all math functions */
     "sqr sqrt sin cos exp ln arctan abs pow pwr max min int log log10 sinh cosh"
     " tanh ternary_fcn agauss sgn gauss unif aunif limit ceil floor"
-    " asin acos atan asinh acosh atanh tan nint"
+    " asin acos atan asinh acosh atanh tan nint once"
     " vec var";
 
 
@@ -99,6 +99,14 @@ enum {
     XFU_SQR = 1, XFU_SQRT, XFU_SIN, XFU_COS, XFU_EXP, XFU_LN, XFU_ARCTAN, XFU_ABS, XFU_POW, XFU_PWR, XFU_MAX, XFU_MIN, XFU_INT, XFU_LOG, XFU_LOG10, XFU_SINH, XFU_COSH,
     XFU_TANH, XFU_TERNARY_FCN, XFU_AGAUSS, XFU_SGN, XFU_GAUSS, XFU_UNIF, XFU_AUNIF, XFU_LIMIT, XFU_CEIL, XFU_FLOOR,
     XFU_ASIN, XFU_ACOS, XFU_ATAN, XFU_ASINH, XFU_ACOSH, XFU_ATANH, XFU_TAN, XFU_NINT,
+    /* once(expr): draw-once marker (card #482). Not evaluated specially by
+     * formula() itself -- it is plain identity (see mathfunction()'s
+     * XFU_ONCE case). Its whole effect is as a syntactic marker that
+     * inp_fix_agauss_in_param() (inpcom.c) recognizes and skips: a .param
+     * line containing "once(" is left as an ordinary single-evaluation
+     * .param instead of being rewritten into a .func that gets a fresh
+     * draw at every textual reference. See docs/mc.md "Draw-once form". */
+    XFU_ONCE,
     XFU_VEC, XFU_VAR // String arguments.
 };
 
@@ -204,6 +212,13 @@ mathfunction(int f, double z, double x)
         break;
     case XFU_TAN:
         y = tan(x);
+        break;
+    case XFU_ONCE:
+        /* identity: once(expr) evaluates expr normally here (already done
+         * by the caller before dispatch). The draw-once effect comes from
+         * inp_fix_agauss_in_param() leaving the enclosing .param as a
+         * single-evaluation line -- see the enum comment above. */
+        y = x;
         break;
     default:
         y = x;

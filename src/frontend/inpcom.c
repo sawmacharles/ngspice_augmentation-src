@@ -8385,6 +8385,21 @@ static void inp_fix_agauss_in_param(struct card *deck, char *fcn)
             if (!temper)
                 continue;
 
+            /* card #482: .param p = once(<expr with agauss/gauss/aunif/unif/
+             * limit>) is the explicit draw-once form -- p must be evaluated
+             * exactly once (a plain single-evaluation .param, like any
+             * ordinary constant .param) instead of being turned into a
+             * .func that gets re-drawn at every textual reference below.
+             * Leave the line untouched here; numparam's normal .param
+             * handling (nupa_assignment(), called once per declaration,
+             * once per deck copy/reset) evaluates "once(...)" as identity
+             * (see XFU_ONCE in numparam/xpressn.c) and caches the single
+             * resulting value, which every reference to p then shares.
+             * Does not change the default per-use re-evaluation of a plain
+             * .param p = agauss(...) -- see docs/mc.md. */
+            if (search_identifier(curr_line, "once", curr_line))
+                continue;
+
             equal_ptr = find_assignment(curr_line);
 
             if (!equal_ptr) {
