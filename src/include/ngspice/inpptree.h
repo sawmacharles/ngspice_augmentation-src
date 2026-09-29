@@ -31,6 +31,29 @@ typedef struct INPparseTree {
     IFparseTree p;
     struct INPparseNode *tree;  /* The real stuff. */
     struct INPparseNode **derivs;   /* The derivative parse trees. */
+    /* accel candidate 0104 (round 3, card #483 T9.3): per-IFeval()-call
+     * memoization cache, kept OUTSIDE INPparseNode on purpose. Round 2's
+     * 0101 (patches-wip/accel/) added two fields directly to
+     * INPparseNode (allocated once per parse-tree NODE -- many per
+     * B-source) and measured a 7-10% wall-clock regression on
+     * a_pex_buck even though the cached function (PTeval) barely runs on
+     * that deck; the leading hypothesis was that growing every node's
+     * struct shifted later heap allocations (research/
+     * transient-acceleration.md section 7.1). This cache instead lives on
+     * INPparseTree, allocated once per ASRC/behavioral-source INSTANCE
+     * (see INPgetTree(), inpptree.c) -- orders of magnitude fewer
+     * allocations for the same circuit, so any heap-layout effect from
+     * growing this struct is far smaller in absolute allocation count.
+     * Lazily allocated on the first IFeval() call for this tree (see
+     * ifeval.c); NULL/0 until then (INPparseTree is TMALLOC'd ==
+     * calloc'd, so this is zero-initialized for free). `cache` is an
+     * opaque pointer to a private array type defined in ifeval.c (an
+     * open-addressing hash table keyed by INPparseNode pointer, table
+     * size cache_mask+1, a power of two); kept opaque here so this header
+     * doesn't need ifeval.c's private slot layout. */
+    unsigned int cache_mask;
+    unsigned long long cache_gen;
+    void *cache;
 } INPparseTree;
 
 /* This is what is passed as the actual parameter value.  The fields will all

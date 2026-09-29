@@ -474,8 +474,12 @@ static INPparseNode *PTdifferentiate(INPparseNode * p, int varnum)
                         mkcon(EXPMAX),
                         mkf(PTF_EXP, p->left)));
             }
-            else {                   /* exp(u) */
-                arg1 = mkf(PTF_EXP, p->left);
+            else {                   /* exp(u): reuse p itself (the value-tree's
+                                        * own exp(u) node, same funcnum/function,
+                                        * same argument p->left) instead of a new,
+                                        * duplicate exp(u) node -- see candidate
+                                        * 0102 note above PTdifferentiate(). */
+                arg1 = p;
             }
 
 #ifdef TRACE1
@@ -501,24 +505,38 @@ static INPparseNode *PTdifferentiate(INPparseNode * p, int varnum)
             arg1 = mkf(PTF_COSH, p->left);
             break;
 
-        case PTF_SQRT:                /* 1 / (2 * sqrt(u)) */
+        case PTF_SQRT:                /* 1 / (2 * sqrt(u)); reuse p (candidate
+                                         * 0102) instead of a duplicate sqrt(u)
+                                         * node -- same funcnum/argument as p. */
             arg1 = mkb(PT_DIVIDE, mkcon(1.0), mkb(PT_TIMES,
                                                          mkcon(2.0),
-                                                         mkf(PTF_SQRT,
-                                                             p->left)));
+                                                         p));
             break;
 
-        case PTF_TAN:                /* 1 + (tan(u) ^ 2) */
+        case PTF_TAN:                /* 1 + (tan(u) ^ 2); reuse p (candidate
+                                         * 0102) instead of a duplicate tan(u)
+                                         * node. */
             arg1 = mkb(PT_PLUS, mkcon(1.0), mkb(PT_POWER,
-                                                         mkf(PTF_TAN,
-                                                             p->left),
+                                                         p,
                                                          mkcon(2.0)));
             break;
 
-        case PTF_TANH:                /* 1 - (tanh(u) ^ 2) */
+        case PTF_TANH:                /* 1 - (tanh(u) ^ 2); reuse p (candidate
+                                         * 0102, card #478 T9.2) instead of a
+                                         * duplicate tanh(u) node -- avoids a
+                                         * second tanh() call entirely once
+                                         * combined with candidate 0101's
+                                         * per-IFeval()-call cache, since the
+                                         * derivative formula's tanh(u) is now
+                                         * literally the same node (same
+                                         * pointer) as the value tree's tanh(u),
+                                         * not just the same math. This is the
+                                         * one the profile flagged: every
+                                         * "smooth switch" B-source in this
+                                         * project's own reference decks uses
+                                         * tanh() for its comparator. */
             arg1 = mkb(PT_MINUS, mkcon(1.0), mkb(PT_POWER,
-                                                         mkf(PTF_TANH,
-                                                             p->left),
+                                                         p,
                                                          mkcon(2.0)));
             break;
 
@@ -1627,6 +1645,10 @@ void INPfreeTree(IFparseTree *ptree)
     txfree(pt->derivs);
     txfree(pt->p.varTypes);
     txfree(pt->p.vars);
+    /* accel candidate 0104: free the per-tree memoization cache (see
+     * inpptree.h's INPparseTree comment / ifeval.c) alongside everything
+     * else this tree owns. */
+    txfree(pt->cache);
     txfree(pt);
 }
 
