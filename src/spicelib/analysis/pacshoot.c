@@ -150,6 +150,8 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 #include "ngspice/fteext.h"
 #include "ngspice/smpdefs.h"
 #include "ngspice/devdefs.h"
+#include "ngspice/noisedef.h"  /* card #509: NOISEAN/Ndata for pac_engine_run_adjoint_noise() */
+#include "ngspice/cpextern.h"  /* card #509: cp_getvar() for the `sqrnoise` flag */
 
 #include "cap/capdefs.h"
 #include "ind/inddefs.h"
@@ -2172,6 +2174,715 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
 }
 
 /* ------------------------------------------------------------------ */
+/* card #509: `.pnoise ... method=shoot solver=td [dev=1]` -- periodic
+ * (cyclostationary) noise on the shooting-PSS orbit, output = the
+ * time-averaged PSD at sideband 0 of one output node (Spectre's own
+ * `pnoise ... noisetype=timeaverage`).
+ *
+ * DERIVATION. pac_engine_run_adjoint() above computes, for a fixed output
+ * row and frequency w, a single Lambda(w) = Sum_k nu_k(w) * e^{+j*w*t_k},
+ * where nu_k(w) is that function's own per-step SMPtSolve() result BEFORE
+ * the e^{+jwt_k} phase multiply -- by its own derivation (see its header),
+ * Y0(w,b) = b^T Lambda(w) for a source forced IDENTICALLY (the same
+ * spatial pattern b, phase-modulated e^{jwt_k}) at every step. Substituting
+ * Lambda(w) = Sum_k nu_k*e^{jwt_k} and regrouping,
+ *
+ *   Y0(w,b) = b^T Sum_k (nu_k * e^{jwt_k}) = Sum_k (b*e^{jwt_k})^T nu_k
+ *
+ * and b*e^{jwt_k} IS this file's own per-step forced-column convention
+ * (the SAME discretisation pac_capture_source_b0's br/bi get phase-
+ * modulated through at every step -- see this file's header, "b(t) =
+ * b*e^{jwt}") -- so nu_k itself is exactly dY0(w)/d(beta_k), the
+ * sensitivity of Y0(w) to a UNIT, UNMODULATED forcing injected into the
+ * per-step RHS at step k ONLY: the discrete-time periodic transfer
+ * function H(t_k,f) this card's own brief calls for ("a noise current
+ * injected over step k has the same stamp as a small-signal source at
+ * step k") -- the SAME per-step RHS convention as a stationary AC source,
+ * just not phase-modulated across steps (a genuinely LOCALISED injection
+ * at ONE step, not a continuous sinusoid).
+ *
+ * For a noise generator g with a FIXED (bias-independent) terminal
+ * incidence pattern b_g (e.g. drain-minus-source for a MOS channel
+ * current -- EXACTLY NevalSrc()'s own posNode/negNode convention) and a
+ * cyclostationary density S_g(t_k,f) (the device's own DEVnoise routine,
+ * evaluated at the step-k operating point), the Telichevesky/Kundert
+ * (1996)/Demir-Roychowdhury cyclostationary-noise integral
+ *
+ *   onoise(f) = (1/T) INT_0^T |H(t,f)|^2 S(t,f) dt
+ *
+ * discretises, on this engine's OWN periodic-trapezoidal grid, to
+ *
+ *   onoise(f) = T * Sum_k (1/w_k) * Sum_g |b_g . nu_k(f)|^2 S_g(t_k,f)
+ *
+ * w_k = 0.5*(h_k+h_next) is the SAME periodic-trapezoidal weight the
+ * boundary term's own "coef" below uses for the OUTPUT side -- used here,
+ * DIVIDED rather than multiplied in, for the INJECTION side (see the
+ * SMPtSolve() call site below, right before dens_k is computed, for the
+ * full white-noise-sample-variance derivation of why: in short, nu_k(f) is
+ * the response to a DETERMINISTIC unit beta_k, but a noise sample n_k
+ * consistent with continuous PSD S_k needs Var(n_k)=S_k/w_k, not S_k, so
+ * the w_k lands in the DENOMINATOR of dens_k = S_k*|nu_k|^2, not as an
+ * extra multiplicative quadrature weight the way it is for the output
+ * tap). Two other candidates were tried and found WRONG by this card's own
+ * pxf_lti.cir-vs-plain-.noise check before this one: "no extra factor at
+ * all" (under-reports by ~N, the accepted-step count) and "multiply by
+ * w_k/T" (the output tap's OWN weight, applied here too by a naive direct
+ * analogy -- under-reports by ~N^2). "T * dens_k/w_k" matches plain .noise
+ * to 6e-6 relative at Points=2000 -- see "Validation" in docs/pss-pac.md's
+ * `.pnoise` section for the full numbers (all three candidates, several
+ * grid resolutions) and the convergence-with-Points table.
+ *
+ * Sum_g |b_g.nu_k(f)|^2 S_g(t_k,f) is EXACTLY what NevalSrc()/DEVnoise()
+ * already compute when ckt->CKTrhs/CKTirhs are loaded with nu_k(f) at the
+ * step-k bias (NevalSrc: gain = |CKTrhs[node1]-CKTrhs[node2]|^2, *noise =
+ * gain*S(bias)) -- so this engine needs NO new device-noise physics: it
+ * reuses pac_engine_run_adjoint()'s OWN backward sweep (Phi/G(w)/M(w)
+ * passes, and the per-step abarS/abarT/Cdiag/beta/gamma recursion --
+ * copied verbatim below, NOT shared by a refactor, so this card touches
+ * ZERO lines of the already-validated .pxf adjoint engine) and, at each
+ * (k,f), loads nu_k into ckt->CKTrhs/CKTirhs with the bias ALREADY at x_k
+ * (pac_adj_refactor_at() -- the SAME CKTload() that rebuilds J_k also
+ * refreshes every device's own bias-dependent noise parameters, e.g.
+ * RESconduct/REScurrent/gm) and calls the ordinary
+ * DEVnoise(N_DENS,N_CALC,...) loop -- EXACTLY the idiom dcpss.c's own
+ * frequency-domain pnoise_sweep()/QPnoiseAnalyze() already use for their
+ * own (different) adjoint vector.
+ *
+ * SCOPE (v1, card #509): restricted to resistor thermal, diode shot, and
+ * MOS1/BSIM4 channel thermal+flicker noise -- the only DEVnoise routines
+ * this derivation has been checked against (pac_noise_check_devices()
+ * below refuses, loudly, rather than silently omitting or mis-scaling,
+ * any OTHER device type with noise-producing instances in the circuit).
+ * Saltation (ideal-switch) events and free-running orbits are refused
+ * (PAC_ADJOINT_REFUSED) exactly like `.pxf ... adjoint=1` -- see that
+ * function's own "SCOPE CUT" -- with NO v1/non-adjoint fallback (unlike
+ * .pxf: there is no meaningful "one pass per source" analogue for noise,
+ * which comes continuously from every device, not a short list of named
+ * sources). Input-referred (inoise) is NOT computed by this engine (v1
+ * scope; the existing frequency-domain `.pnoise` still reports it via
+ * PnInSrc). See docs/pss-pac.md's `.pnoise` section for the full
+ * derivation, validation, and what was skipped. */
+
+/* card #509: restrict this engine to DEVnoise routines this derivation has
+ * actually been checked against -- refuse (loudly) rather than silently
+ * mis-account any other noisy device type. Matched by FUNCTION POINTER
+ * (not device-name string), so an aliased/renamed model table still
+ * refuses correctly. */
+static int
+pac_noise_check_devices(CKTcircuit *ckt)
+{
+    extern int RESnoise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    extern int DIOnoise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    extern int MOS1noise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    extern int BSIM4noise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    int i, bad = 0;
+
+    for (i = 0; i < DEVmaxnum; i++) {
+        if (!DEVices[i] || !DEVices[i]->DEVnoise || !ckt->CKThead[i])
+            continue;
+        if (DEVices[i]->DEVnoise == RESnoise || DEVices[i]->DEVnoise == DIOnoise ||
+            DEVices[i]->DEVnoise == MOS1noise || DEVices[i]->DEVnoise == BSIM4noise)
+            continue;
+        fprintf(stderr, "PNOISE-TD: REFUSED -- device type '%s' has noise-producing "
+                "instances in this circuit but is outside this engine's v1 scope "
+                "(card #509: resistor thermal, diode shot, MOS1/BSIM4 channel "
+                "thermal+flicker only) -- refusing rather than silently omitting or "
+                "mis-scaling its noise contribution. See docs/pss-pac.md's .pnoise "
+                "section.\n",
+                DEVices[i]->DEVpublic.name ? DEVices[i]->DEVpublic.name : "?");
+        bad = 1;
+    }
+    return bad;
+}
+
+static int
+pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
+                              const double *x0, double T,
+                              const double *freqs, int nfreq, int outrow,
+                              int want_table, int trig_idx,
+                              double *onoise_out /* [nfreq], caller-zeroed */,
+                              double **gen_dens_out /* OUT [ngen*nfreq], malloc'd, NULL if !want_table/ngen==0 */,
+                              IFuid **gen_names_out /* OUT [ngen], malloc'd, NULL if !want_table/ngen==0 */,
+                              int *ngen_out)
+{
+    int n = map->n, neq = SMPmatSize(ckt->CKTmatrix);
+    int d, e, f, k, row, err;
+    PACc *Phi = NULL, *G = NULL, *Mw = NULL;
+    double *tdu_re = NULL, *tdu_im = NULL, *scratch = NULL;
+    double *Cdiag = NULL;
+    PACc *abarS = NULL, *abarT = NULL;
+    double save_ag0 = 0.0, save_ag1 = 0.0, save_time = 0.0, save_delta = 0.0;
+    double *save_rhsold = NULL;
+    int have_ckt_saved = 0, have_job_saved = 0;
+    NOISEAN nj;
+    Ndata   nd;
+    JOB    *oldJob = NULL;
+    int     ngen = 0;
+    double *gen_dens = NULL;
+    IFuid  *gen_names = NULL;
+
+    memset(&nd, 0, sizeof(nd));
+    *gen_dens_out = NULL; *gen_names_out = NULL; *ngen_out = 0;
+
+    if (trig_idx >= 0)
+        return PAC_ADJOINT_REFUSED;
+    if (n <= 0 || nfreq <= 0)
+        return PAC_ADJOINT_FAIL;
+
+    /* ---- pass A: Phi (n x n) + trajectory recording -- IDENTICAL design
+     * to pac_engine_run_adjoint()'s own pass A above (duplicated, not
+     * shared -- see this function's header). */
+    {
+        double *omega1 = TMALLOC(double, n);
+        int *useforce1 = TMALLOC(int, n);
+        PACc *ic0_1 = TMALLOC(PACc, (size_t) n * n);
+        if (!omega1 || !useforce1 || !ic0_1) {
+            if (omega1) tfree(omega1); if (useforce1) tfree(useforce1); if (ic0_1) tfree(ic0_1);
+            return PAC_ADJOINT_FAIL;
+        }
+        memset(ic0_1, 0, (size_t) n * n * sizeof(PACc));
+        for (d = 0; d < n; d++) {
+            omega1[d] = 0.0;
+            useforce1[d] = 0;
+            for (e = 0; e < n; e++) {
+                PACc v = { (d == e) ? 1.0 : 0.0, 0.0 };
+                ic0_1[(size_t) e * n + d] = v;
+            }
+        }
+        pac_state_set_ic(map, x0);
+        pac_traj_reset(neq);
+        if (pac_reset(ckt, map, n, NULL, NULL, omega1, useforce1, ic0_1, 0, T)) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_traj_free();
+            return PAC_ADJOINT_FAIL;
+        }
+        PSSpacActive = 1;
+        g_pac_force_exact_jac = 1;
+        err = pac_run_period(ckt, job, T, "TD-shoot NOISE pass A (Phi + trajectory)");
+        g_pac_force_exact_jac = 0;
+        PSSpacActive = 0;
+        g_pac_traj_active = 0;
+
+        if (err || g_pac_failed || g_pac_traj_failed) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_free(); pac_traj_free();
+            return PAC_ADJOINT_FAIL;
+        }
+        if (PSSsaltActive && PSSsaltEventsSeen() > 0) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_free(); pac_traj_free();
+            return PAC_ADJOINT_REFUSED;
+        }
+
+        Phi = TMALLOC(PACc, (size_t) n * n);
+        if (!Phi) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_free(); pac_traj_free();
+            return PAC_ADJOINT_FAIL;
+        }
+        for (d = 0; d < n; d++) {
+            int row_d = pac_state_row(&map->refs[d]);
+            for (e = 0; e < n; e++)
+                Phi[(size_t) d * n + e] = pac_get(g_pac_Cprev, row_d, n, e);
+        }
+        tfree(omega1); tfree(useforce1); tfree(ic0_1);
+        pac_free();
+    }
+
+    if (getenv("PNOISE_DEBUG"))
+        fprintf(stderr, "PNOISE-DEBUG: g_pac_traj_n=%d T=%.9g avg_h=%.9g\n",
+                g_pac_traj_n, T, g_pac_traj_n > 0 ? T / g_pac_traj_n : 0.0);
+
+    if (g_pac_traj_n < 1) {
+        tfree(Phi); pac_traj_free();
+        return PAC_ADJOINT_FAIL;
+    }
+
+    /* ---- pass B: G(w)[d][f] -- IDENTICAL design to
+     * pac_engine_run_adjoint()'s own pass B above. */
+    G = TMALLOC(PACc, (size_t) n * nfreq);
+    if (!G) { tfree(Phi); pac_traj_free(); return PAC_ADJOINT_FAIL; }
+    {
+        int M2 = n * nfreq;
+        double *omega2 = TMALLOC(double, M2);
+        int *useforce2 = TMALLOC(int, M2);
+        PACc *ic0_2 = TMALLOC(PACc, (size_t) n * M2);
+        if (!omega2 || !useforce2 || !ic0_2) {
+            if (omega2) tfree(omega2); if (useforce2) tfree(useforce2); if (ic0_2) tfree(ic0_2);
+            tfree(Phi); tfree(G); pac_traj_free();
+            return PAC_ADJOINT_FAIL;
+        }
+        memset(ic0_2, 0, (size_t) n * M2 * sizeof(PACc));
+        for (d = 0; d < n; d++)
+            for (f = 0; f < nfreq; f++) {
+                int col = d * nfreq + f;
+                omega2[col] = 2.0 * M_PI * freqs[f];
+                useforce2[col] = 0;
+                { PACc v = { 1.0, 0.0 }; ic0_2[(size_t) d * M2 + col] = v; }
+            }
+        pac_state_set_ic(map, x0);
+        if (pac_reset(ckt, map, M2, NULL, NULL, omega2, useforce2, ic0_2, 1, T)) {
+            tfree(omega2); tfree(useforce2); tfree(ic0_2);
+            tfree(Phi); tfree(G); pac_traj_free();
+            return PAC_ADJOINT_FAIL;
+        }
+        PSSpacActive = 1;
+        g_pac_force_exact_jac = 1;
+        err = pac_run_period(ckt, job, T, "TD-shoot NOISE pass B (G(w))");
+        g_pac_force_exact_jac = 0;
+        PSSpacActive = 0;
+        if (err || g_pac_failed) {
+            tfree(omega2); tfree(useforce2); tfree(ic0_2);
+            pac_free(); tfree(Phi); tfree(G); pac_traj_free();
+            return PAC_ADJOINT_FAIL;
+        }
+        pac_finish_demod_wraparound();
+        {
+            double invT = 1.0 / T;
+            for (d = 0; d < n; d++)
+                for (f = 0; f < nfreq; f++) {
+                    PACc v = g_pac_demod[(size_t) (outrow - 1) * M2 + (d * nfreq + f)];
+                    G[(size_t) d * nfreq + f] = pc_scale(v, invT);
+                }
+        }
+        pac_free();
+        tfree(omega2); tfree(useforce2); tfree(ic0_2);
+    }
+
+    /* ---- M(w) -- IDENTICAL design to pac_engine_run_adjoint()'s own
+     * boundary solve above. */
+    Mw = TMALLOC(PACc, (size_t) n * nfreq);
+    if (!Mw) { tfree(Phi); tfree(G); pac_traj_free(); return PAC_ADJOINT_FAIL; }
+    {
+        PACc *AT = TMALLOC(PACc, (size_t) n * n);
+        PACc *rhs = TMALLOC(PACc, n);
+        PACc *sol = TMALLOC(PACc, n);
+        if (!AT || !rhs || !sol) {
+            if (AT) tfree(AT); if (rhs) tfree(rhs); if (sol) tfree(sol);
+            tfree(Phi); tfree(G); tfree(Mw); pac_traj_free();
+            return PAC_ADJOINT_FAIL;
+        }
+        for (f = 0; f < nfreq; f++) {
+            double w = 2.0 * M_PI * freqs[f];
+            double wT = w * T;
+            PACc ephase = { cos(wT), sin(wT) };
+            for (d = 0; d < n; d++)
+                for (e = 0; e < n; e++) {
+                    PACc v = pc_scale(Phi[(size_t) e * n + d], -1.0);
+                    if (e == d) v = pc_add(v, ephase);
+                    AT[(size_t) d * n + e] = v;
+                }
+            for (d = 0; d < n; d++) rhs[d] = G[(size_t) d * nfreq + f];
+            if (pac_complex_solve(AT, rhs, n, sol)) {
+                fprintf(stderr, "PNOISE-TD: WARNING -- transposed boundary solve "
+                        "singular at f=%.6g Hz; result at this frequency skipped.\n",
+                        freqs[f]);
+                for (d = 0; d < n; d++) { PACc nan = { strtod("NaN", NULL), strtod("NaN", NULL) }; sol[d] = nan; }
+            }
+            for (d = 0; d < n; d++)
+                Mw[(size_t) d * nfreq + f] = sol[d];
+        }
+        tfree(AT); tfree(rhs); tfree(sol);
+    }
+    tfree(Phi); tfree(G);
+
+    /* ---- minimal NOISEAN context for the device noise routines (they
+     * cast ckt->CKTcurJob to NOISEAN* and read NStpsSm) -- same idiom
+     * dcpss.c's pnoise_sweep() uses. */
+    memset(&nj, 0, sizeof(nj));
+    nj.output = job->PnOutNode;
+    nj.outputRef = job->PnOutNode;
+    nj.NstartFreq = freqs[0];
+    nj.NstopFreq = freqs[nfreq - 1];
+    nj.NnumSteps = nfreq;
+    nj.NstpType = job->PACstepType;
+    nj.NStpsSm = want_table ? 1 : 0;
+    nj.JOBname = "pnoise-td";
+    nd.prtSummary = 0;
+    oldJob = ckt->CKTcurJob;
+    ckt->CKTcurJob = (JOB *) &nj;
+    have_job_saved = 1;
+
+    /* ---- backward-sweep buffers (same sizes pac_engine_run_adjoint()
+     * allocates for its own backward sweep). */
+    Cdiag  = TMALLOC(double, n);
+    abarS  = TMALLOC(PACc, (size_t) n * nfreq);
+    abarT  = TMALLOC(PACc, (size_t) n * nfreq);
+    tdu_re = TMALLOC(double, (size_t) (neq + 1));
+    tdu_im = TMALLOC(double, (size_t) (neq + 1));
+    scratch = TMALLOC(double, (size_t) (neq + 1));
+    save_rhsold = TMALLOC(double, (size_t) (neq + 1));
+    if (!Cdiag || !abarS || !abarT || !tdu_re || !tdu_im || !scratch || !save_rhsold) {
+        err = PAC_ADJOINT_FAIL; goto done;
+    }
+    memset(abarS, 0, (size_t) n * nfreq * sizeof(PACc));
+    memset(abarT, 0, (size_t) n * nfreq * sizeof(PACc));
+
+    memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+    save_time = ckt->CKTtime; save_delta = ckt->CKTdelta;
+    save_ag0 = ckt->CKTag[0]; save_ag1 = ckt->CKTag[1];
+    have_ckt_saved = 1;
+
+    /* ---- naming pass: one summary slot per noise generator, only if a
+     * per-device table was requested (same as dcpss.c's own
+     * pnoise_sweep()/NStpsSm=0 default when it isn't). Bias: the trajectory's
+     * own first recorded step -- a naming pass names generators by
+     * instance/model (RESnoise/DIOnoise/MOS1noise/BSIM4noise's own N_OPEN
+     * cases all confirmed bias-independent), so any valid in-circuit
+     * operating point works; step 0 is the cheapest one already at hand. */
+    if (want_table) {
+        double dummy = 0.0;
+        if (pac_adj_refactor_at(ckt, &g_pac_traj[0])) {
+            fprintf(stderr, "PNOISE-TD: naming-pass refactor failed\n");
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        for (d = 0; d < DEVmaxnum; d++)
+            if (DEVices[d] && DEVices[d]->DEVnoise && ckt->CKThead[d])
+                DEVices[d]->DEVnoise(N_DENS, N_OPEN, ckt->CKThead[d], ckt, &nd, &dummy);
+        ngen = nd.numPlots;
+        if (ngen > 0) {
+            gen_dens = TMALLOC(double, (size_t) ngen * nfreq);
+            memset(gen_dens, 0, (size_t) ngen * nfreq * sizeof(double));
+            nd.outpVector = TMALLOC(double, ngen);
+            nd.prtSummary = 1;
+            gen_names = nd.namelist;   /* transfer ownership from nd */
+            nd.namelist = NULL;
+        }
+    }
+
+    /* ---- backward adjoint sweep -- Phi/G/M(w) reuse aside, the per-step
+     * recursion below (Cdiag/abarS/abarT/beta/gamma, the SMPtSolve() pair,
+     * the M(w)/output-tap scatter into tdu_re/tdu_im) is copied VERBATIM
+     * from pac_engine_run_adjoint()'s own backward sweep above -- see that
+     * function's header for the derivation of every term; this function
+     * does not re-derive them, it only reuses nu_k = (tdu_re,tdu_im) (the
+     * per-(k,f) SMPtSolve() result, BEFORE any e^{+jwt_k} phase multiply)
+     * as this card's own H(t_k,f) -- see THIS function's header above for
+     * why that (not Lambda(w)) is the quantity card #509 needs. */
+    for (k = g_pac_traj_n - 1; k >= 0; k--) {
+        const PACtrajStep *step = &g_pac_traj[k];
+        int is_last = (k == g_pac_traj_n - 1);
+        double h_next = is_last ? g_pac_traj[0].h : g_pac_traj[k + 1].h;
+        double ag1eff = (step->order == 2) ? step->ag1 : 0.0;
+
+        if (pac_adj_refactor_at(ckt, step)) {
+            fprintf(stderr, "PNOISE-TD: refactor failed at t=%.9g (backward step %d)\n",
+                    step->t, k);
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+
+        for (e = 0; e < n; e++) {
+            const PACstateRef *ref = &map->refs[e];
+            Cdiag[e] = ref->isCap ? step->ag0 * ref->dev.cap->CAPcapac
+                                   : step->ag0 * ref->dev.ind->INDinduct;
+        }
+
+        for (f = 0; f < nfreq; f++) {
+            double w = 2.0 * M_PI * freqs[f];
+            PACc ph2 = pc_conjexp(w * step->t);
+            PACc coef = pc_scale(ph2, 0.5 * (step->h + h_next) / T);
+
+            memset(tdu_re, 0, (size_t) (neq + 1) * sizeof(double));
+            memset(tdu_im, 0, (size_t) (neq + 1) * sizeof(double));
+            tdu_re[outrow] += coef.re; tdu_im[outrow] += coef.im;
+
+            if (is_last) {
+                for (e = 0; e < n; e++) {
+                    const PACstateRef *ref = &map->refs[e];
+                    PACc Mv = Mw[(size_t) e * nfreq + f];
+                    int row2 = pac_state_row(ref);
+                    if (row2 > 0) { tdu_re[row2] += Mv.re; tdu_im[row2] += Mv.im; }
+                }
+            }
+
+            for (e = 0; e < n; e++) {
+                const PACstateRef *ref = &map->refs[e];
+                PACc abT = abarT[(size_t) e * nfreq + f];
+                PACc abS_ext = abarS[(size_t) e * nfreq + f];
+                PACc abS_tot = pc_add(abS_ext, pc_scale(abT, Cdiag[e]));
+                if (ref->isCap) {
+                    int p = ref->dev.cap->CAPposNode, ngc = ref->dev.cap->CAPnegNode;
+                    if (p > 0)   { tdu_re[p] += abS_tot.re; tdu_im[p] += abS_tot.im; }
+                    if (ngc > 0) { tdu_re[ngc] -= abS_tot.re; tdu_im[ngc] -= abS_tot.im; }
+                } else {
+                    int ibr = ref->dev.ind->INDbrEq;
+                    tdu_re[ibr] += abS_tot.re; tdu_im[ibr] += abS_tot.im;
+                }
+            }
+
+            SMPtSolve(ckt->CKTmatrix, tdu_re, scratch);
+            SMPtSolve(ckt->CKTmatrix, tdu_im, scratch);
+            /* tdu_re/tdu_im now hold nu_k(f) = dY0(w)/d(beta_k) -- card
+             * #509's own per-step DETERMINISTIC transfer, exactly as
+             * pac_engine_run_adjoint() computes for Lambda(w) (before that
+             * function's own e^{+jwt_k} phase multiply, which a stationary
+             * source's per-step forcing needs and an isolated noise sample
+             * does not -- see this function's header).
+             *
+             * White noise, unlike a deterministic AC source, cannot be
+             * "sampled" as beta_k = i_n(t_k) directly (continuous white
+             * noise has a Dirac-delta autocorrelation -- no well-defined
+             * pointwise sample). The physically consistent discretisation
+             * (same one ngspice's OWN trnoise white generator and the
+             * TK96/Demir-Roychowdhury discrete-noise literature use):
+             * represent i_n(t) over step k as a ZERO-ORDER-HOLD value n_k
+             * (entering the per-step recursion exactly like a deterministic
+             * beta_k -- "same stamp as a small-signal source at step k",
+             * this card's own brief), with Var(n_k) = S_k / w_k so that the
+             * CHARGE n_k*w_k over the step reproduces the true continuous
+             * process's own charge variance S_k*w_k (a white process
+             * integrated over an interval of length w_k has variance
+             * S_k*w_k) -- w_k = 0.5*(h_k+h_next) is the SAME periodic-
+             * trapezoidal weight "coef" above already uses for the OUTPUT
+             * side, used here symmetrically for the INJECTION side. Since
+             * the n_k are independent across k (white/uncorrelated), the
+             * output sideband-0 response Y0_random(f) = Sum_k nu_k(f)*n_k
+             * has variance Sum_k |nu_k(f)|^2 * Var(n_k) = Sum_k
+             * S_k*|nu_k(f)|^2 / w_k -- this is dens_k/w_k below (dens_k =
+             * S_k*|nu_k|^2, via the ORDINARY NevalSrc "gain*S" formula with
+             * gain from nu_k -- w_k has NOT been folded into nu_k itself,
+             * see the SMPtSolve() calls above). The remaining T is this
+             * card's own empirically-confirmed normalisation, found by the
+             * LTI-vs-plain-.noise check below (an EARLIER version of this
+             * loop tried BOTH "no extra weight at all" and "multiply by
+             * w_k/T (mirroring the output tap's own coef)" -- both wrong,
+             * off by ~N and ~N^2 respectively, N = accepted-step count;
+             * "T * dens_k/w_k", below, matches plain .noise to 6e-6
+             * relative on pxf_lti.cir at Points=2000, see docs/pss-pac.md's
+             * `.pnoise` section for the full derivation and the numbers all
+             * three candidates gave). */
+
+            {
+                double dens = 0.0;
+                double wk = 0.5 * (step->h + h_next);
+                for (row = 0; row <= neq; row++) {
+                    ckt->CKTrhs[row]  = tdu_re[row];
+                    ckt->CKTirhs[row] = tdu_im[row];
+                }
+                nd.freq = freqs[f];
+                nd.delFreq = 0.0;
+                if (ngen > 0) {
+                    nd.outNumber = 0;
+                    for (d = 0; d < DEVmaxnum; d++)
+                        if (DEVices[d] && DEVices[d]->DEVnoise && ckt->CKThead[d])
+                            DEVices[d]->DEVnoise(N_DENS, N_CALC, ckt->CKThead[d], ckt, &nd, &dens);
+                    for (d = 0; d < ngen; d++)
+                        gen_dens[(size_t) d * nfreq + f] += nd.outpVector[d] * T / wk;
+                } else {
+                    for (d = 0; d < DEVmaxnum; d++)
+                        if (DEVices[d] && DEVices[d]->DEVnoise && ckt->CKThead[d])
+                            DEVices[d]->DEVnoise(N_DENS, N_CALC, ckt->CKThead[d], ckt, &nd, &dens);
+                }
+                onoise_out[f] += dens * T / wk;
+                if (f == 0 && getenv("PNOISE_DEBUG_STEPS"))
+                    fprintf(stderr, "PNOISE-STEP: k=%d t=%.9g h=%.9g hnext=%.9g dens=%.17g nu0_re=%.9g nu0_im=%.9g running=%.17g\n",
+                            k, step->t, step->h, h_next, dens, tdu_re[outrow], tdu_im[outrow], onoise_out[f]);
+            }
+
+            for (e = 0; e < n; e++) {
+                const PACstateRef *ref = &map->refs[e];
+                PACc beta, gamma;
+                if (ref->isCap) {
+                    int p = ref->dev.cap->CAPposNode, ngc = ref->dev.cap->CAPnegNode;
+                    PACc nup = (p > 0)   ? (PACc){ tdu_re[p], tdu_im[p] }     : (PACc){ 0.0, 0.0 };
+                    PACc nun = (ngc > 0) ? (PACc){ tdu_re[ngc], tdu_im[ngc] } : (PACc){ 0.0, 0.0 };
+                    PACc diffnu = pc_sub(nup, nun);
+                    beta  = pc_scale(diffnu, step->ag0 * ref->dev.cap->CAPcapac);
+                    gamma = pc_scale(diffnu, ag1eff);
+                } else {
+                    int ibr = ref->dev.ind->INDbrEq;
+                    PACc nub = { tdu_re[ibr], tdu_im[ibr] };
+                    beta  = pc_scale(nub, -step->ag0 * ref->dev.ind->INDinduct);
+                    gamma = pc_scale(nub, -ag1eff);
+                }
+                {
+                    PACc abT_old = abarT[(size_t) e * nfreq + f];
+                    PACc new_abS = pc_sub(beta, pc_scale(abT_old, Cdiag[e]));
+                    PACc new_abT = pc_add(gamma, pc_scale(abT_old, -ag1eff));
+                    abarS[(size_t) e * nfreq + f] = new_abS;
+                    abarT[(size_t) e * nfreq + f] = new_abT;
+                }
+            }
+        }
+    }
+
+    memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+    ckt->CKTtime = save_time; ckt->CKTdelta = save_delta;
+    ckt->CKTag[0] = save_ag0; ckt->CKTag[1] = save_ag1;
+    have_ckt_saved = 0;
+
+    err = PAC_ADJOINT_OK;
+    *ngen_out = ngen;
+    *gen_dens_out = gen_dens;  gen_dens = NULL;
+    *gen_names_out = gen_names; gen_names = NULL;
+
+ done:
+    if (have_ckt_saved) {
+        memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+        ckt->CKTtime = save_time; ckt->CKTdelta = save_delta;
+        ckt->CKTag[0] = save_ag0; ckt->CKTag[1] = save_ag1;
+    }
+    if (have_job_saved) ckt->CKTcurJob = oldJob;
+    if (Mw) tfree(Mw);
+    pac_traj_free();
+    if (Cdiag) tfree(Cdiag);
+    if (abarS) tfree(abarS);
+    if (abarT) tfree(abarT);
+    if (tdu_re) tfree(tdu_re);
+    if (tdu_im) tfree(tdu_im);
+    if (scratch) tfree(scratch);
+    if (save_rhsold) tfree(save_rhsold);
+    if (nd.outpVector) tfree(nd.outpVector);
+    if (nd.namelist) tfree(nd.namelist);
+    if (gen_dens) tfree(gen_dens);
+    if (gen_names) tfree(gen_names);
+    return err;
+}
+
+/* card #509: `.pnoise ... method=shoot solver=td` entry point, called from
+ * pac_pstb_run_ex() below -- always the ordinary driven case (trig_idx
+ * resolved from trig_node_num, exactly like pac_td_pxf()); free-running is
+ * refused by pac_engine_run_adjoint_noise() itself if ever reached (see
+ * that function's header -- "SCOPE"). */
+static int
+pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
+              const double *fT, int trig_node_num)
+{
+    PACstateMap map;
+    int nfreq, outrow, err, trig_idx, want_table = job->PSSpnDevTable;
+    double *freqs, *onoise;
+    double *gen_dens = NULL; IFuid *gen_names = NULL; int ngen = 0;
+    IFuid freqUid, *nameList = NULL;
+    runDesc *plot = NULL;
+    double t0, t1;
+    int pn_sqr;
+
+    NG_IGNORE(fT);
+
+    if (!job->PnOutNode) {
+        fprintf(stderr, "PNOISE-TD: no output node given -- skipped\n");
+        return E_PARMVAL;
+    }
+    outrow = job->PnOutNode->number;
+    if (outrow <= 0) {
+        fprintf(stderr, "PNOISE-TD: output node '%s' is not in the matrix "
+                "(literal ground?) -- skipped\n", job->PnOutNode->name);
+        return E_PARMVAL;
+    }
+    if (job->PACfStart <= 0.0 || job->PACfStop < job->PACfStart || job->PACpoints < 1) {
+        fprintf(stderr, "PNOISE-TD: bad frequency sweep -- skipped\n");
+        return E_PARMVAL;
+    }
+    if (pac_noise_check_devices(ckt))
+        return E_UNSUPP;
+
+    map.n = n; map.refs = NULL;
+    if (pac_build_map(ckt, &map) || map.n != n) {
+        fprintf(stderr, "PNOISE-TD: internal state-map mismatch -- skipped\n");
+        if (map.refs) tfree(map.refs);
+        return E_INTERN;
+    }
+    trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    if (trig_node_num >= 0 && trig_idx < 0) {
+        fprintf(stderr, "PNOISE-TD: REFUSED -- free-running (trigger=) orbit, no "
+                "period-variation-aware adjoint noise engine (same scope cut as "
+                ".pxf adjoint=1) -- see docs/pss-pac.md.\n");
+        tfree(map.refs);
+        return E_UNSUPP;
+    }
+
+    nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
+    if (nfreq < 1) { tfree(map.refs); return E_PARMVAL; }
+    freqs = TMALLOC(double, nfreq);
+    pac_sweep_fill(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop, freqs, nfreq);
+    onoise = TMALLOC(double, nfreq);
+    memset(onoise, 0, (size_t) nfreq * sizeof(double));
+
+    fprintf(stderr, "PNOISE-TD: time-domain shooting-based periodic noise, %d "
+                    "frequency point%s from %.6g to %.6g Hz, n=%d reduced state%s, "
+                    "output node '%s' (row %d)%s\n",
+            nfreq, nfreq == 1 ? "" : "s", job->PACfStart, job->PACfStop, n,
+            n == 1 ? "" : "s", job->PnOutNode->name, outrow,
+            want_table ? ", per-device table" : "");
+
+    t0 = SPfrontEnd->IFseconds();
+    err = pac_engine_run_adjoint_noise(ckt, job, &map, x0, T, freqs, nfreq, outrow,
+                                        want_table, trig_idx, onoise,
+                                        &gen_dens, &gen_names, &ngen);
+    t1 = SPfrontEnd->IFseconds();
+
+    if (err == PAC_ADJOINT_REFUSED) {
+        fprintf(stderr, "PNOISE-TD: REFUSED -- saltation (ideal-switch) events seen "
+                "on this orbit; this engine needs the smooth-switch-only adjoint "
+                "(card #504's own scope cut) -- no fallback engine exists for "
+                "pnoise (unlike .pxf's adjoint=0). See docs/pss-pac.md.\n");
+        tfree(map.refs); tfree(freqs); tfree(onoise);
+        if (gen_dens) tfree(gen_dens);
+        if (gen_names) tfree(gen_names);
+        return E_UNSUPP;
+    }
+    if (err != PAC_ADJOINT_OK) {
+        fprintf(stderr, "PNOISE-TD: engine failed\n");
+        tfree(map.refs); tfree(freqs); tfree(onoise);
+        if (gen_dens) tfree(gen_dens);
+        if (gen_names) tfree(gen_names);
+        return E_INTERN;
+    }
+    fprintf(stderr, "PNOISE-TD: done, wall_time=%.3fs\n", t1 - t0);
+
+    /* card #193 convention (same as .noise / the frequency-domain
+     * .pnoise): default reports sqrt(density) (V or A per sqrt(Hz)); `set
+     * sqrnoise` reports the squared density (V^2/Hz or A^2/Hz) instead. */
+    pn_sqr = cp_getvar("sqrnoise", CP_BOOL, NULL, 0);
+
+    {
+        int nvec = 1 + (want_table ? ngen : 0);
+        int g, e3;
+
+        nameList = TMALLOC(IFuid, nvec);
+        SPfrontEnd->IFnewUid(ckt, &nameList[0], NULL, "onoise_spectrum", UID_OTHER, NULL);
+        for (g = 0; g < (want_table ? ngen : 0); g++)
+            nameList[1 + g] = gen_names[g];
+
+        SPfrontEnd->IFnewUid(ckt, &freqUid, NULL, "frequency", UID_OTHER, NULL);
+        e3 = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob,
+                        "PNoise Analysis (time domain, sideband 0)",
+                        freqUid, IF_REAL, nvec, nameList, IF_REAL, &plot);
+        if (!e3) {
+            int i;
+            if (job->PACstepType != 0)
+                SPfrontEnd->OUTattributes(plot, NULL, OUT_SCALE_LOG, NULL);
+            for (i = 0; i < nfreq; i++) {
+                IFvalue freqData, valueData;
+                double *rowv = TMALLOC(double, nvec);
+                int j;
+                double v0 = onoise[i] > 0.0 ? onoise[i] : 0.0;
+                rowv[0] = pn_sqr ? v0 : sqrt(v0);
+                for (j = 0; j < (want_table ? ngen : 0); j++) {
+                    double v = gen_dens[(size_t) j * nfreq + i];
+                    if (v < 0.0) v = 0.0;
+                    rowv[1 + j] = pn_sqr ? v : sqrt(v);
+                }
+                freqData.rValue = freqs[i];
+                valueData.v.numValue = nvec;
+                valueData.v.vec.rVec = rowv;
+                SPfrontEnd->OUTpData(plot, &freqData, &valueData);
+                FREE(rowv);
+            }
+            SPfrontEnd->OUTendPlot(plot);
+        } else {
+            err = 1;
+        }
+        tfree(nameList);
+    }
+
+    tfree(map.refs); tfree(freqs); tfree(onoise);
+    if (gen_dens) tfree(gen_dens);
+    if (gen_names) tfree(gen_names);
+    return err ? E_INTERN : OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* `.pac ... method=shoot solver=td`: sideband-0 response at every node,
  * forcing = the netlist AC-source stimulus B0. fT/trig_node_num: card #489
  * second pass, see pacshoot.h's pac_pstb_run_ex() comment -- NULL/-1 for
@@ -2912,6 +3623,10 @@ pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     }
     if (job->PSSdoPXF && job->PACsolver == PAC_SOLVER_TD) {
         int e = pac_td_pxf(ckt, job, x0, n, T, fT, trig_node_num);
+        if (e) err = e;
+    }
+    if (job->PSSdoPnoise && job->PACsolver == PAC_SOLVER_TD) {
+        int e = pac_td_pnoise(ckt, job, x0, n, T, fT, trig_node_num);
         if (e) err = e;
     }
     return err;

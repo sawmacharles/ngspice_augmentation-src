@@ -129,6 +129,12 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->PSSpnCyclo = value->iValue;
         break;
 
+    /* card #509: `.pnoise ... dev=1` -- per-device contribution table,
+     * time-domain (solver=td) engine only. */
+    case PNOISE_DEVTBL:
+        job->PSSpnDevTable = value->iValue;
+        break;
+
     /* Enhancement-132: periodic S-parameters flag */
     case PSP_DOPSP:
         job->PSSdoPSP = value->iValue;
@@ -224,7 +230,8 @@ static IFparm PSSparms[] = {
     { "trigval",      TRIG_VAL,	IF_SET|IF_REAL,		"card #489: trigger threshold voltage (default 0.5)" },
     { "trigdir",      TRIG_DIR,	IF_SET|IF_STRING,	"card #489: trigger crossing direction, rise (default) or fall" },
     { "driven",       PSS_FORCE_DRIVEN, IF_SET|IF_INTEGER,	"card #494: force driven-mode shooting at fguess even if no native V/I source has a time function (XSPICE-clocked decks, e.g. d_pwm)" },
-    { "adjoint",      PXF_ADJOINT,	IF_SET|IF_INTEGER,	"card #504: .pxf true adjoint/transposed engine (1=force on, 0=force off, unset=auto by source count)" }
+    { "adjoint",      PXF_ADJOINT,	IF_SET|IF_INTEGER,	"card #504: .pxf true adjoint/transposed engine (1=force on, 0=force off, unset=auto by source count)" },
+    { "dev",          PNOISE_DEVTBL,	IF_SET|IF_INTEGER,	"card #509: .pnoise (solver=td) per-device noise contribution table (1=on, default off)" }
 };
 
 SPICEanalysis PSSinfo  = {

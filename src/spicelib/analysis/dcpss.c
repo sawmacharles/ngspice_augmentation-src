@@ -4583,8 +4583,18 @@ shootingexit:
 
                 /* Enhancement-124: for a .pnoise card, fold each device's noise
                  * through the conversion matrix to get the output noise spectrum. */
-                if (job->PSSdoPnoise)
+                if (job->PSSdoPnoise) {
+                    /* card #509: solver=td needs method=shoot (the time-domain
+                     * engine hooks into PSSshootDriven(), which this brute-force
+                     * driven-mode path never reaches) -- warn rather than
+                     * silently running the (still fully supported, unchanged)
+                     * frequency-domain engine instead. */
+                    if (job->PACsolver == PAC_SOLVER_TD)
+                        fprintf (stderr, "PNOISE: solver=td needs method=shoot (card #509) -- "
+                                 "this .pnoise card used the default driven-mode PSS, so the "
+                                 "existing frequency-domain pnoise engine ran instead.\n") ;
                     pnoise_sweep (ckt, job) ;
+                }
 
                 /* Enhancement-125: for a .pxf card, solve the conversion adjoint and
                  * report the input->output transfer at each sideband. */

@@ -92,6 +92,17 @@ typedef struct {
                               * bias + time-domain transfer, averaged over the period);
                               * 0 = stationary (noise PSD at one operating point) */
 
+    /* card #509: `.pnoise ... method="shoot" solver="td" [dev=1]` -- the
+     * shooting-PSS-orbit true-adjoint noise engine (pacshoot.c's
+     * pac_td_pnoise()/pac_engine_run_adjoint_noise()), in place of the
+     * frequency-domain harmonic-conversion-matrix engine above (unchanged,
+     * still the default -- same additive PACsolver-gated pattern as
+     * .pac/.pstb/.pxf solver=td). `dev=1` additionally emits a per-device
+     * noise-generator contribution table (onoise_<inst><suffix> vectors,
+     * same naming as plain .noise's own summary report) alongside
+     * onoise_spectrum; 0/unset (default) emits onoise_spectrum only. */
+    int      PSSpnDevTable;
+
     /* Enhancement-125: periodic transfer function (.pxf). The ADJOINT counterpart of
      * PAC: solve Hᵀ Ψ = e_{out,0} and dot Ψ with the netlist AC-source pattern to get
      * the transfer from the input to a fixed output at each sideband. Reuses the PAC
@@ -231,6 +242,7 @@ enum {
     PSS_FORCE_DRIVEN,
     PXF_SOURCES,
     PXF_ADJOINT,
+    PNOISE_DEVTBL,
 };
 
 #endif

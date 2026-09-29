@@ -1707,20 +1707,58 @@ dot_pnoise(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
     GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
 
-    {   /* Enhancement-126: optional trailing "cyclo" keyword */
-        char *p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p) {
+    /* card #509: trailing tokens, in any order --
+     *   cyclo                 (Enhancement-126: bare keyword, existing
+     *                          frequency-domain cyclostationary-noise flag)
+     *   method shoot|driven    (same keyword/value split as .pac/.pxf's own
+     *                          tail -- selects PSS's shooting-Newton engine;
+     *                          `.pnoise` itself still needs solver=td below
+     *                          to actually pick the time-domain pnoise
+     *                          engine, same two-flag gating .pxf uses)
+     *   solver td|fd           (card #509: time-domain shooting-based
+     *                          pnoise, built on pacshoot.c's true-adjoint
+     *                          PAC/PXF engine, in place of the existing
+     *                          frequency-domain harmonic-conversion-matrix
+     *                          engine above; td needs method=shoot, same
+     *                          as .pac/.pxf)
+     *   dev 0|1                (card #509: per-device noise-generator
+     *                          contribution table, solver=td only)
+     *   pacpoints=N            (card #509: same recording-pass grid
+     *                          override as .pac/.pstb/.pxf's own
+     *                          pacpoints=, solver=td only) */
+    {
+        while (*line) {
             char *word;
             INPgetTok(&line, &word, 1);
+            if (!*word) { tfree(word); break; }
             if (strcmp(word, "cyclo") == 0) {
+                tfree(word);
                 ptemp.iValue = 1;
                 GCA(INPapName, (ckt, which, foo, "pnoise_cyclo", &ptemp));
+            } else if (strcmp(word, "method") == 0) {
+                char *mword;
+                tfree(word);
+                INPgetTok(&line, &mword, 1);
+                ptemp.sValue = mword;
+                GCA(INPapName, (ckt, which, foo, "method", &ptemp));
+            } else if (strcmp(word, "solver") == 0) {
+                char *sword;
+                tfree(word);
+                INPgetTok(&line, &sword, 1);
+                ptemp.sValue = sword;
+                GCA(INPapName, (ckt, which, foo, "solver", &ptemp));
+            } else if (strcmp(word, "dev") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "dev", parm));
+            } else if (strcmp(word, "pacpoints") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
             } else {
-                fprintf(stderr, "Error: unknown parameter %s on .pnoise - ignored\n", word);
+                fprintf(stderr, "Error: unknown trailing token '%s' on .pnoise - ignored\n", word);
+                tfree(word);
             }
-            tfree(word);
         }
     }
 
