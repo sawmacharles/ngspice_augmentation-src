@@ -1233,6 +1233,46 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         double w = 2.0 * M_PI * freqs[f];
         double wT = w * T;
         PACc ephase = { cos(wT), sin(wT) };
+        /* card #494 sixth pass (plan T6.1): VALIDATED-BAND GUARD. A
+         * saltation-corrected result (ideal sw/csw, PSSsaltActive with
+         * real events found this run -- PSSsaltEventsSeen(), an exact
+         * no-op/0 for every existing fixture with no such event) is
+         * cross-validated against tools/pac_perturbed.py, an independent
+         * nonlinear perturbed-periodic-steady-state reference sharing no
+         * code with this engine, to 0.5dB/3deg from 100Hz up to at least
+         * 99.5% of the switching Nyquist frequency fs/2 (T here is the
+         * deck's own switching period, the driven .pss's native clock --
+         * see docs/pss-pac.md's "SIXTH pass" section for the full
+         * cross-check table). The disagreement grows sharply in the last
+         * few percent below fs/2 and becomes structural (a genuine
+         * sideband-0 vs sideband-(-1) aliasing degeneracy for a REAL
+         * system probed at exactly half the switching frequency, common
+         * to every sideband-0-only method -- this engine's own general
+         * "Known limits" already flag it for smooth-switch decks too, not
+         * new to saltation) AT fs/2 itself (measured: 3.2dB/41deg off at
+         * f=fs/2 exactly on the reference fixture). 0.90 (not 0.995) is
+         * used as the trigger ratio for margin: only two points near the
+         * edge were actually measured this pass (0.9877 clean, 0.9950
+         * already at 0.29dB of the 0.5dB budget), and this correction has
+         * only been validated on ONE fixture (pac_r6o_ctrl2out.cir) --
+         * warn well before the measured budget is actually exhausted
+         * rather than assume the margin generalises. Never silent: one
+         * print per affected frequency point, matching this file's other
+         * per-point WARNING convention (boundary-solve-singular, just
+         * below). */
+        if (PSSsaltActive && PSSsaltEventsSeen() > 0 && T > 0.0) {
+            double fs_nyquist = 0.5 / T;
+            double ratio = freqs[f] / fs_nyquist;
+            if (ratio >= 0.90)
+                fprintf(stderr, "PAC-TD: WARNING -- saltation-corrected result at f=%.6g Hz "
+                        "is inside the UNVALIDATED margin near the switching Nyquist "
+                        "frequency (fs/2=%.6g Hz, f/(fs/2)=%.4f >= 0.90); cross-validated "
+                        "to 0.5dB/3deg only up to ~99.5%% of fs/2 on the reference fixture, "
+                        "a structural sideband-0 aliasing breakdown is expected approaching "
+                        "and at fs/2 itself -- see docs/pss-pac.md's saltation section, "
+                        "SIXTH pass, and patches-wip/salt/README.md.\n",
+                        freqs[f], fs_nyquist, ratio);
+        }
         if (!A || !rhs || !sol) {
             if (A) tfree(A); if (rhs) tfree(rhs); if (sol) tfree(sol);
             if (PhiCorr) tfree(PhiCorr); if (zCorr) tfree(zCorr);

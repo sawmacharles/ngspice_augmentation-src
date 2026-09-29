@@ -900,6 +900,7 @@ int PSSsaltActive = 1;   /* PSS_SALTATION=0 env var disables (red-proof toggle) 
 static int g_salt_first_step_pending = 0;   /* card #494 third pass: restart filter */
 static double g_salt_prev_time = -1.0;      /* card #494 fifth pass: h_dot's true-elapsed-time tracker */
 static double g_salt_settle_until = -1.0;   /* card #494 fifth pass: force-order-1 window deadline */
+static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
 
 void
 PSSsaltReset(void)
@@ -907,6 +908,13 @@ PSSsaltReset(void)
     g_salt_first_step_pending = 1;
     g_salt_prev_time = -1.0;
     g_salt_settle_until = -1.0;
+    g_salt_events_seen = 0;
+}
+
+int
+PSSsaltEventsSeen(void)
+{
+    return g_salt_events_seen;
 }
 
 /* card #494 fifth pass: is ckt->CKTtime still inside the post-event
@@ -1096,6 +1104,8 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             n++;
         }
     }
+    if (n > 0)
+        g_salt_events_seen += n;   /* card #494 sixth pass: see PSSsaltEventsSeen() */
     if (n > 0 && tau_max > 0.0) {
         double deadline = ckt->CKTtime + PSS_SALT_SETTLE_TAUS * tau_max;
         if (deadline > g_salt_settle_until)

@@ -197,4 +197,18 @@ void PSSsaltReset(void);
  * event has been seen this run or the window has already closed. */
 int PSSsaltForceOrder1(CKTcircuit *ckt);
 
+/* card #494 SIXTH pass (plan T6.1): VALIDATED-BAND GUARD. Returns the
+ * number of real saltation events PSSsaltFindEvents() has reported (n>0
+ * calls, summed) since the last PSSsaltReset() -- i.e. whether THIS run's
+ * circuit actually has an ideal-switch event a perturbation reaches at
+ * all (0 for every existing fixture with no `sw`/`csw` event on the
+ * perturbed path -- exact no-op for those, same as PSSsaltForceOrder1()).
+ * Used by pacshoot.c's per-frequency-point loop to gate the near-fs/2
+ * unvalidated-margin warning to saltation-affected decks only -- see
+ * docs/pss-pac.md's "SIXTH pass" section for the cross-validated band
+ * this threshold is drawn from (0.5dB/3deg to >=99.5% of fs/2 on
+ * pac_r6o_ctrl2out.cir against tools/pac_perturbed.py, an independent
+ * nonlinear reference sharing no code with this engine). */
+int PSSsaltEventsSeen(void);
+
 #endif
