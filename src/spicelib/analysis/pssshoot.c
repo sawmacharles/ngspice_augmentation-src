@@ -3645,7 +3645,17 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
 
     tol     = (job->steady_coeff > 0.0) ? job->steady_coeff : 1e-6;
     maxiter = (job->sc_iter > 0) ? job->sc_iter : 50;
-    eps     = 1e-6;
+    /* card #503 SECOND pass: PSS_FREERUN_FD_EPS overrides the relative FD
+     * step used for the Newton monodromy below (default unchanged, 1e-6)
+     * -- experiment only, gated behind PSS_FREERUN_PAC_EXPERIMENTAL's own
+     * general "not for production" status via this file's existing env-var
+     * convention. See docs/pss-pac.md's card #503 SECOND pass section:
+     * this was added to test whether the trigger-crossing FD monodromy is
+     * noise-dominated at the default eps (tightening steady_coeff alone
+     * was already shown NOT to help, and in fact to destabilise the
+     * Floquet report -- a LARGER eps trades truncation bias for less FD
+     * noise, the opposite direction). */
+    eps     = getenv("PSS_FREERUN_FD_EPS") ? atof(getenv("PSS_FREERUN_FD_EPS")) : 1e-6;
 
     t_wall_start = SPfrontEnd->IFseconds();
 
