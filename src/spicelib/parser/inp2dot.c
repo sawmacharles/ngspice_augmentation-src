@@ -1280,6 +1280,15 @@ dot_pac(char *line, void *ckt, INPtables *tab, struct card *current,
                 INPgetTok(&line, &sword, 1);
                 ptemp.sValue = sword;
                 GCA(INPapName, (ckt, which, foo, "solver", &ptemp));
+            } else if (strcmp(word, "pacpoints") == 0) {
+                /* card #465 THIRD pass, task 2: `pacpoints=N` -- same
+                 * "keyword" / "value" two-token split as method=/solver=
+                 * above (INPgetTok() treats '=' as a plain separator, so
+                 * "pacpoints=20000" and "pacpoints 20000" both already
+                 * come back as two independent tokens here). */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
             } else {
                 fprintf(stderr, "Error: unknown trailing token '%s' on .pac - ignored\n", word);
                 tfree(word);
@@ -1396,6 +1405,12 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
             INPgetTok(&line, &mword, 1);
             ptemp.sValue = mword;
             GCA(INPapName, (ckt, which, foo, "method", &ptemp));
+        } else if (strcmp(word, "pacpoints") == 0) {
+            /* card #465 THIRD pass, task 2: `pacpoints=N` on `.pstb` --
+             * see dot_pac()'s identical branch for the token-split note. */
+            tfree(word);
+            parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+            GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
         } else {
             fprintf(stderr, "Error: unknown trailing token '%s' on .pstb - ignored\n", word);
             tfree(word);

@@ -106,6 +106,19 @@ typedef struct {
      * (PACfStart/Stop/points/stepType/maxSideband). For a time-invariant circuit
      * the sideband-0 result reduces to the ordinary .sp S-matrix. */
     int      PSSdoPSP;       /* 1 if this job runs a periodic S-parameter sweep */
+
+    /* card #465 THIRD pass, task 2: `pacpoints=N` on `.pac`/`.pstb` -- a card
+     * parameter for pacshoot.c's own recording-pass time grid (pac_run_period()
+     * OVERRIDES ckt->CKTmaxStep/CKTstep/CKTdelmin to T/pacpoints for just its
+     * two recording-period reruns), replacing the PAC_RECORD_POINTS env var
+     * (second pass) as the primary way to ask for it. 0 = unset (default):
+     * pac_run_period() then falls back to the deprecated PAC_RECORD_POINTS
+     * env var if set, else to job->PSSpoints (the same grid PSS's own
+     * convergence phase already uses by default -- so an old deck with
+     * neither the card parameter nor the env var sees byte-identical
+     * behaviour to before this field existed). See pacshoot.c's
+     * pac_run_period() for the resolution order. */
+    long int PACrecordPoints;
 } PSSan;
 
 enum {
@@ -144,6 +157,7 @@ enum {
     PAC_SOLVER,
     PSTB_DO,
     PSTB_PROBE,
+    PAC_RECPOINTS,
 };
 
 #endif

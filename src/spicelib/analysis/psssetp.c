@@ -133,6 +133,12 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->PSTBprobeName = value->uValue;
         break;
 
+    /* card #465 THIRD pass, task 2: `pacpoints=N` on `.pac`/`.pstb` -- see
+     * pssdefs.h's PACrecordPoints comment and pacshoot.c's pac_run_period(). */
+    case PAC_RECPOINTS:
+        job->PACrecordPoints = value->iValue;
+        break;
+
     default:
         return(E_BADPARM);
     }
@@ -165,7 +171,8 @@ static IFparm PSSparms[] = {
     { "psp",          PSP_DOPSP,	IF_SET|IF_INTEGER,	"run a periodic S-parameter sweep after PSS (needs RF ports)" },
     { "solver",       PAC_SOLVER,	IF_SET|IF_STRING,	"PAC solver: fd (default, frequency-domain) or td (card #465, time-domain shooting-based)" },
     { "pstb",         PSTB_DO,		IF_SET|IF_INTEGER,	"run a .pstb periodic loop-gain sweep (card #465)" },
-    { "pstb_probe",   PSTB_PROBE,	IF_SET|IF_STRING,	"pstb probe V-source instance name" }
+    { "pstb_probe",   PSTB_PROBE,	IF_SET|IF_STRING,	"pstb probe V-source instance name" },
+    { "pacpoints",    PAC_RECPOINTS,	IF_SET|IF_INTEGER,	"card #465: PAC/PSTB recording-pass time points per period (0/unset = deprecated PAC_RECORD_POINTS env var, else PSS's own points=)" }
 };
 
 SPICEanalysis PSSinfo  = {

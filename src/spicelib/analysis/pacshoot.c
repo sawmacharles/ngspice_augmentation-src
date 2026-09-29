@@ -292,26 +292,39 @@ pac_state_row(const PACstateRef *ref)
  * make ITS OWN convergence phase run at a coarser grid than the deck's
  * Points= asks for.
  *
- * FIX (in scope: this file only): when PAC_RECORD_POINTS is set (a
- * positive integer, same convention as pssshoot.c's PSS_SHOOT_* debug env
- * vars), pac_run_period() OVERRIDES ckt->CKTmaxStep/CKTstep/CKTdelmin to
- * T/PAC_RECORD_POINTS for JUST this one recording-period call, restoring
- * the PSS-converged values immediately after. This is safe: (1) BOTH of
+ * FIX (in scope: this file only): pac_run_period() OVERRIDES
+ * ckt->CKTmaxStep/CKTstep/CKTdelmin to T/recPoints for JUST this one
+ * recording-period call, restoring the PSS-converged values immediately
+ * after. recPoints is resolved in this order (card #465 THIRD pass, task
+ * 2 -- see pssdefs.h's PACrecordPoints comment):
+ *   1. job->PACrecordPoints, if a `.pac`/`.pstb` card set `pacpoints=N`
+ *      (N > 0) -- the primary way to ask for this now;
+ *   2. else the PAC_RECORD_POINTS env var, if set (DEPRECATED: kept only
+ *      as an override for scripts/decks written before pacpoints=
+ *      existed -- see this project's docs for the deprecation note);
+ *   3. else job->PSSpoints -- the SAME points= a deck already gave PSS's
+ *      own convergence phase, so a deck that sets neither `pacpoints=`
+ *      nor the env var gets an EXPLICIT override that is numerically
+ *      identical to the second pass's "no override, inherit whatever
+ *      ckt->CKTmaxStep PSS's Newton phase last left behind" default
+ *      (PSS's own pssshoot.c also derives CKTmaxStep from T/PSSpoints),
+ *      so old decks see byte-identical behaviour, now for a documented
+ *      reason instead of by inheritance.
+ * This is safe regardless of which source wins: (1) BOTH of
  * pac_engine_run's two recording passes for a given (br,bi,freqs) sweep
- * use the SAME override consistently, so their step grids still match
- * each other exactly (the property PSSpacRecordStep's per-step recursion
- * needs -- see this file's header -- is "pass 1 and pass 2 use the same
- * grid as EACH OTHER", not "the same grid PSS's Newton phase used"); (2)
- * x0 (the converged orbit) and T (the converged period) are UNCHANGED --
- * only the recording reruns' internal step density changes; (3) default
- * (env var unset) is BYTE-IDENTICAL to the first pass's behaviour --
- * zero risk to any existing passing check. Lets a deck ask PSS for a
- * COARSE, fast-converging Points= (job->PSSpoints drives only the
- * Newton/Floquet reruns) while PAC_RECORD_POINTS independently asks for
- * the fine grid task 2's demodulation accuracy needs -- see the card
- * #465 report for the measured before/after on pac_lti.cir. */
+ * resolve recPoints the SAME way (same job, same call site pattern), so
+ * their step grids still match each other exactly (the property
+ * PSSpacRecordStep's per-step recursion needs -- see this file's header
+ * -- is "pass 1 and pass 2 use the same grid as EACH OTHER", not "the
+ * same grid PSS's Newton phase used"); (2) x0 (the converged orbit) and T
+ * (the converged period) are UNCHANGED -- only the recording reruns'
+ * internal step density changes. Lets a deck ask PSS for a COARSE, fast-
+ * converging Points= (job->PSSpoints drives only the Newton/Floquet
+ * reruns) while pacpoints= independently asks for the fine grid task 2's
+ * demodulation accuracy needs -- see the card #465 report for the
+ * measured before/after on pac_lti.cir. */
 static int
-pac_run_period(CKTcircuit *ckt, double T, const char *jobname)
+pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
 {
     JOB *saveJob = ckt->CKTcurJob;
     TRANan localjob;
@@ -319,9 +332,27 @@ pac_run_period(CKTcircuit *ckt, double T, const char *jobname)
     int err;
     double saveMaxStep = ckt->CKTmaxStep, saveStep = ckt->CKTstep,
            saveDelmin = ckt->CKTdelmin;
-    const char *rpEnv = getenv("PAC_RECORD_POINTS");
-    long recPoints = rpEnv ? atol(rpEnv) : 0;
-    int overriding = (recPoints > 0);
+    long recPoints;
+    int overriding;
+
+    if (job->PACrecordPoints > 0) {
+        recPoints = job->PACrecordPoints;
+    } else {
+        const char *rpEnv = getenv("PAC_RECORD_POINTS");
+        if (rpEnv && atol(rpEnv) > 0) {
+            static int warned = 0;
+            recPoints = atol(rpEnv);
+            if (!warned) {
+                fprintf(stderr, "PAC-TD: PAC_RECORD_POINTS is deprecated -- "
+                        "use `pacpoints=%ld` on the .pac/.pstb card instead.\n",
+                        recPoints);
+                warned = 1;
+            }
+        } else {
+            recPoints = job->PSSpoints;
+        }
+    }
+    overriding = (recPoints > 0);
 
     memset(&localjob, 0, sizeof localjob);
     strncpy(namebuf, jobname, sizeof namebuf - 1);
@@ -844,7 +875,7 @@ pac_sweep_fill(int stepType, int np, double fstart, double fstop, double *freqs,
  * Y0. Runs exactly 2 period re-runs total (batched over ALL frequencies),
  * per this file's header design. Returns 0 on success. */
 static int
-pac_engine_run(CKTcircuit *ckt, PACstateMap *map, const double *x0, double T,
+pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, double T,
                 const double *br, const double *bi,
                 const double *freqs, int nfreq,
                 const int *outrows, int nout,
@@ -894,7 +925,7 @@ pac_engine_run(CKTcircuit *ckt, PACstateMap *map, const double *x0, double T,
         err = 1; goto cleanup;
     }
     PSSpacActive = 1;
-    err = pac_run_period(ckt, T, "TD-shoot recording pass 1 (monodromy + forced)");
+    err = pac_run_period(ckt, job, T, "TD-shoot recording pass 1 (monodromy + forced)");
     PSSpacActive = 0;
     if (err || g_pac_failed) { err = 1; goto cleanup; }
 
@@ -959,7 +990,7 @@ pac_engine_run(CKTcircuit *ckt, PACstateMap *map, const double *x0, double T,
             err = 1; goto cleanup;
         }
         PSSpacActive = 1;
-        err = pac_run_period(ckt, T, "TD-shoot recording pass 2 (re-propagate)");
+        err = pac_run_period(ckt, job, T, "TD-shoot recording pass 2 (re-propagate)");
         PSSpacActive = 0;
         if (!err && !g_pac_failed) {
             for (f = 0; f < nfreq; f++) {
@@ -1042,7 +1073,7 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
             numNames, numNames == 1 ? "" : "s", "netlist AC-flagged source(s)");
 
     t0 = SPfrontEnd->IFseconds();
-    err = pac_engine_run(ckt, &map, x0, T, br, bi, freqs, nfreq, outrows, numNames, NULL, Y0);
+    err = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq, outrows, numNames, NULL, Y0);
     t1 = SPfrontEnd->IFseconds();
     fprintf(stderr, "PAC-TD: %s, wall_time=%.3fs (%.4fs/point)\n",
             err ? "FAILED" : "done", t1 - t0, nfreq > 0 ? (t1 - t0) / nfreq : 0.0);
@@ -1194,9 +1225,9 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T)
             n, n == 1 ? "" : "s");
 
     t0 = SPfrontEnd->IFseconds();
-    err = pac_engine_run(ckt, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, Phi, Y1);
+    err = pac_engine_run(ckt, job, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, Phi, Y1);
     if (!err)
-        err = pac_engine_run(ckt, &map, x0, T, br2, bi2, freqs, nfreq, outrows, 2, NULL, Y2);
+        err = pac_engine_run(ckt, job, &map, x0, T, br2, bi2, freqs, nfreq, outrows, 2, NULL, Y2);
     t1 = SPfrontEnd->IFseconds();
     fprintf(stderr, "PSTB: %s, wall_time=%.3fs (%.4fs/point, 2 forcing patterns)\n",
             err ? "FAILED" : "done", t1 - t0, nfreq > 0 ? (t1 - t0) / (2 * nfreq) : 0.0);
