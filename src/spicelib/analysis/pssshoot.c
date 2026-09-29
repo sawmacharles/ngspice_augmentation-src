@@ -735,14 +735,6 @@ PSSeventLocate(CKTcircuit *ckt, double *newdelta)
                 i++;
             }
     }
-    if (getenv("PSS_EVENT_DEBUG")) {
-        char sb[256]; int sl = 0;
-        for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
-            for (here = SWinstances(model); here; here = SWnextInstance(here))
-                sl += snprintf(sb + sl, sizeof sb - sl - 1, " %s[st=%g c=%.6g]", here->SWname, ckt->CKTstate0[here->SWswitchstate], ckt->CKTstate0[here->SWctrlvalue]);
-        fprintf(stderr, "EVT trial t=%.17g tacc=%.17g tlo=%.17g have_hi=%d thi=%.17g cross=%d acc=%d ord=%d%s\n", t, tacc, g_ev_tlo, g_ev_have_hi, g_ev_thi, any_cross, accept, ckt->CKTorder, sb);
-    }
-
     if (!any_cross) {
         if (t > g_ev_tlo) {
             i = 0;
@@ -892,7 +884,7 @@ pss_ckt_has_switch(CKTcircuit *ckt)
  * PSSshootFreerun(), and every switch-free driven deck) is completely
  * unaffected. */
 static double g_pss_loose_reltol = 0.0;
-static int g_dbg_jf = -1; static double g_dbg_h = 0.0;
+static int g_dbg_jf = -1; static double g_dbg_h = 0.0;   /* debug context for the PSS_SHOOT_DEBUG retry message */
 /* card #498 2nd pass: set by pss_run_period_ex_safe() when the LAST run it
  * made needed the looser-reltol retry; a converged verdict must never rest
  * on such a run (the deck's own tolerance is the only honest one). */
