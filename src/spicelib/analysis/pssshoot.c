@@ -3865,6 +3865,63 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                     map.refs[kk].isCap ? "cap" : "ind", x0[kk]);
     }
 
+    /* card #503 THIRD pass: PSS_FREERUN_X0_OVERRIDE (n whitespace-separated
+     * doubles, SAME order as pss_build_state_map()'s own canonical
+     * native-capacitor/inductor scan order -- the order PSS_FREERUN_DEBUG
+     * just printed above, "DEBUG x0[k]") / PSS_FREERUN_T_OVERRIDE (one
+     * double, seconds) replace this Newton loop's own converged x0/T with
+     * caller-supplied values for EVERYTHING downstream (the emitted
+     * trajectory AND the .pac/.pstb block below) -- test-only, to decide
+     * the "hand-off precision" hypothesis directly: feed in an
+     * independently, much more precisely converged x0/T (e.g. from a
+     * tight-reltol .tran started at this Newton loop's own x0, run past
+     * cycle-to-cycle stability) and see whether .pac/.pstb's own
+     * disagreement against tools/pac_perturbed.py --freerun closes. If it
+     * does, the cause is this Newton loop's own x0/T precision (fixable
+     * inside this function); if it does not, the cause is in how the
+     * free-running small-signal problem itself is posed (the period-
+     * variation/phase-condition boundary condition in pacshoot.c), not in
+     * hand-off precision. Never silent -- loud stderr line, exactly like
+     * this file's other test-only overrides (PSS_FREERUN_FT_BACKWARD/
+     * PSS_FREERUN_FT_DT). Only takes effect at all when
+     * PSS_FREERUN_PAC_EXPERIMENTAL=1 is ALSO set (checked again below,
+     * same gate the whole .pac/.pstb block already requires) -- this does
+     * not change default (gated) behaviour either way, and does not touch
+     * the CONVERGED/FLOQUET report already printed above (which reflects
+     * this Newton loop's own x0/T, unmodified, so the large-signal
+     * orbit/stability report stays honest even when the small-signal
+     * .pac/.pstb input below is overridden). */
+    if (getenv("PSS_FREERUN_X0_OVERRIDE") && getenv("PSS_FREERUN_PAC_EXPERIMENTAL")) {
+        char *buf = strdup(getenv("PSS_FREERUN_X0_OVERRIDE"));
+        char *tok = strtok(buf, " \t,");
+        int kk = 0;
+        while (tok && kk < n) {
+            x0[kk] = atof(tok);
+            kk++;
+            tok = strtok(NULL, " \t,");
+        }
+        free(buf);
+        if (kk != n) {
+            fprintf(stderr, "PSS-FREERUN: WARNING -- PSS_FREERUN_X0_OVERRIDE "
+                    "gave %d value(s), need exactly n=%d -- override NOT "
+                    "fully applied, remaining components keep the Newton "
+                    "loop's own converged value.\n", kk, n);
+        }
+        fprintf(stderr, "PSS-FREERUN: PSS_FREERUN_X0_OVERRIDE=1 -- x0 "
+                "REPLACED by caller-supplied values (card #503 THIRD pass "
+                "hand-off-precision test; NOT for production use):");
+        for (kk = 0; kk < n; kk++)
+            fprintf(stderr, " %.10g", x0[kk]);
+        fprintf(stderr, "\n");
+    }
+    if (getenv("PSS_FREERUN_T_OVERRIDE") && getenv("PSS_FREERUN_PAC_EXPERIMENTAL")) {
+        double T_new = atof(getenv("PSS_FREERUN_T_OVERRIDE"));
+        fprintf(stderr, "PSS-FREERUN: PSS_FREERUN_T_OVERRIDE=1 -- T REPLACED "
+                "%.12g -> %.12g (card #503 THIRD pass hand-off-precision "
+                "test; NOT for production use)\n", T, T_new);
+        T = T_new;
+    }
+
     /* Emit the converged trajectory as an ordinary time-domain plot -- now
      * that T is converged/known, this is a single plain period run (same
      * mechanism as the driven engine's own emission), not another
@@ -3918,6 +3975,118 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         double *fT = TMALLOC(double, n);
         double *x_prev = TMALLOC(double, n);
         double t_prev = 0.0, T_meas2 = 0.0;
+        /* card #503 THIRD pass: POLISH x0/T for .pac/.pstb ONLY (a local
+         * x0_pac/T_pac -- the trajectory emission just above and the
+         * CONVERGED/FLOQUET report already printed both keep using the
+         * plain Newton x0/T, untouched, so nothing already validated
+         * changes). Root cause this pass: an independent, much more
+         * precisely converged reference orbit (a tight-reltol .tran seeded
+         * at this Newton loop's own x0, run to cycle-to-cycle stability --
+         * see docs/pss-pac.md's card #503 THIRD pass section) differs from
+         * this Newton loop's own x0/T by ~0.05% (T) and up to ~0.02% (the
+         * inductor-current state) -- small in absolute terms, but feeding
+         * that independent, high-precision x0/T into pac_pstb_run_ex()
+         * below (PSS_FREERUN_X0_OVERRIDE/PSS_FREERUN_T_OVERRIDE, this same
+         * pass) cuts the .pac disagreement against tools/pac_perturbed.py
+         * --freerun by roughly 5-8x at every frequency tested (20-200kHz)
+         * -- the DOMINANT cause is this hand-off precision, not the
+         * period-variation formula itself (unchanged, still pacshoot.c's
+         * card #489 derivation). Tightening THIS loop's own Newton
+         * tolerance was already shown (card #503 first/second pass) to be
+         * counterproductive (noise-dominated, sometimes non-convergent) --
+         * but the orbit is heavily damped (spectral_radius ~0.05, ALL
+         * non-trivial Floquet multipliers small), so a few PLAIN period-
+         * map (successive-substitution, NO finite-difference Jacobian at
+         * all) iterations starting from the Newton-converged x0 converge
+         * geometrically at roughly that same ~0.05x-per-iteration rate --
+         * cheap (each iteration is one more pss_run_until_trigger() call,
+         * the SAME machinery Newton's own probe/monodromy steps already
+         * use) and needs no new numerics. PSS_FREERUN_POLISH_ITERS
+         * (default 5, 0 disables) controls the iteration count;
+         * PSS_FREERUN_X0_OVERRIDE (above) takes precedence when given
+         * (explicit external reference for testing) -- polish is skipped
+         * in that case, not stacked on top of it. */
+        double *x0_pac = x0;
+        double T_pac = T;
+        double *x0_polished = NULL;
+        double save_reltol_polish = ckt->CKTreltol;
+        int reltol_tightened = 0;
+        if (!getenv("PSS_FREERUN_X0_OVERRIDE")) {
+            int polish_iters = getenv("PSS_FREERUN_POLISH_ITERS") ?
+                atoi(getenv("PSS_FREERUN_POLISH_ITERS")) : 5;
+            if (polish_iters > 0) {
+                int pk, polish_ok = 1;
+                /* card #503 THIRD pass, refinement: the polish iterations
+                 * below reuse pss_run_until_trigger(), which runs at
+                 * WHATEVER ckt->CKTreltol this function's own top-of-
+                 * function tightening left in place -- capped at 1e-5 even
+                 * when the deck's own reltol was looser (see save_reltol
+                 * above). On R5 that 1e-5 cap was found this pass to be
+                 * the dominant source of x0/T imprecision (an independent
+                 * tight-reltol reference orbit differs from the capped-at-
+                 * 1e-5 Newton x0/T by ~0.05% in T) -- but simply running
+                 * the WHOLE shooting (Newton AND the recording pass
+                 * pac_engine_run() uses) at a tight reltol throughout was
+                 * measured to help less, and sometimes hurt, at higher
+                 * frequency (a confound: the recording pass's own
+                 * per-step-reused-Jacobian floor, docs/pss-pac.md
+                 * "Accuracy", behaves differently at a very different
+                 * step-size regime). Tightening reltol ONLY for these
+                 * polish period-map evaluations -- restored to whatever it
+                 * was immediately after, before pac_pstb_run_ex() runs the
+                 * (unchanged-environment) recording pass -- isolates just
+                 * the x0/T precision improvement, matching what actually
+                 * closed most of the gap in this pass's own experiments
+                 * (see docs/pss-pac.md). PSS_FREERUN_POLISH_RELTOL
+                 * (default 1e-9) sets the target; never loosens (same
+                 * "only tighten" convention as the existing save_reltol
+                 * cap just above). Left in effect (see reltol_tightened,
+                 * restored just before pac_pstb_run_ex() below) through
+                 * the fT/f(T) estimation that follows this block too --
+                 * that re-locates the SAME trigger crossing from x0_pac
+                 * via the SAME pss_run_until_trigger(), so it benefits
+                 * from the SAME tightened precision the polish loop just
+                 * established, rather than dropping back to the coarser
+                 * cap for that one call. */
+                double polish_reltol = getenv("PSS_FREERUN_POLISH_RELTOL") ?
+                    atof(getenv("PSS_FREERUN_POLISH_RELTOL")) : 1e-9;
+                if (polish_reltol > 0.0 && polish_reltol < ckt->CKTreltol) {
+                    ckt->CKTreltol = polish_reltol;
+                    reltol_tightened = 1;
+                }
+                x0_polished = TMALLOC(double, n);
+                for (k = 0; k < n; k++) x0_polished[k] = x0[k];
+                for (pk = 0; pk < polish_iters; pk++) {
+                    double *xnext = TMALLOC(double, n);
+                    double Tnext = 0.0;
+                    if (!xnext || pss_run_until_trigger(ckt, &map, x0_polished,
+                                                         node_num, trigval, dir,
+                                                         max_period, xnext,
+                                                         &Tnext, NULL, NULL)) {
+                        if (xnext) tfree(xnext);
+                        polish_ok = 0;
+                        break;
+                    }
+                    for (k = 0; k < n; k++) x0_polished[k] = xnext[k];
+                    T_pac = Tnext;
+                    tfree(xnext);
+                }
+                if (polish_ok) {
+                    fprintf(stderr, "PSS-FREERUN: polished x0/T for .pac/"
+                            ".pstb with %d extra plain period-map "
+                            "(successive-substitution, no FD Jacobian) "
+                            "iteration(s) (card #503 THIRD pass): "
+                            "T %.12g -> %.12g\n", polish_iters, T, T_pac);
+                    x0_pac = x0_polished;
+                } else {
+                    fprintf(stderr, "PSS-FREERUN: WARNING -- polish "
+                            "iteration lost the trigger crossing; using "
+                            "the plain Newton-converged x0/T for .pac/"
+                            ".pstb instead (unpolished).\n");
+                    T_pac = T;
+                }
+            }
+        }
         fprintf(stderr, "PSS-FREERUN: PSS_FREERUN_PAC_EXPERIMENTAL=1 -- running "
                 ".pac/.pstb on this free-running orbit with the UNVALIDATED "
                 "(above ~60kHz on R5; root cause not identified) period-"
@@ -3925,7 +4094,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                 "file's own card #489 SECOND pass comment and docs/"
                 "pss-pac.md's free-running section.\n");
         if (fT && x_prev &&
-            !pss_run_until_trigger(ckt, &map, x0, node_num, trigval, dir,
+            !pss_run_until_trigger(ckt, &map, x0_pac, node_num, trigval, dir,
                                     max_period, x1trial, &T_meas2,
                                     x_prev, &t_prev)) {
             double dt = T_meas2 - t_prev;
@@ -4013,7 +4182,11 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                         fprintf(stderr, "DEBUG fT[%d]=%.9g x_T=%.9g x_prev=%.9g\n",
                                 kk, fT[kk], x1trial[kk], x_prev[kk]);
                 }
-                pac_err = pac_pstb_run_ex(ckt, job, x0, n, T, fT, node_num);
+                if (reltol_tightened) {
+                    ckt->CKTreltol = save_reltol_polish;
+                    reltol_tightened = 0;
+                }
+                pac_err = pac_pstb_run_ex(ckt, job, x0_pac, n, T_pac, fT, node_num);
                 if (pac_err)
                     fprintf(stderr, "PSS-FREERUN: .pac/.pstb on the "
                             "free-running orbit did not complete (see "
@@ -4030,8 +4203,14 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                     "the trigger crossing from the converged x0 to estimate "
                     "the period-variation term; .pac/.pstb skipped.\n");
         }
+        if (reltol_tightened)
+            ckt->CKTreltol = save_reltol_polish;   /* catch-all: any early-exit
+                                                     * branch above that skipped
+                                                     * the restore right before
+                                                     * pac_pstb_run_ex() */
         if (fT) tfree(fT);
         if (x_prev) tfree(x_prev);
+        if (x0_polished) tfree(x0_polished);
     } else if (job->PSSdoPAC || job->PSSdoPSTB) {
         fprintf(stderr, "PSS-FREERUN: WARNING -- .pac/.pstb on a free-"
                 "running (trigger=) orbit is REFUSED by default (card #489 "
