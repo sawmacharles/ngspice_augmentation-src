@@ -174,6 +174,8 @@ com_resume(wordlist *wl)
 void
 com_rset(wordlist *wl)
 {
+    struct variable *saved_vars, *v, *next;
+
     NG_IGNORE(wl);
 
     if (ft_curckt == NULL) {
@@ -181,8 +183,67 @@ com_rset(wordlist *wl)
         fprintf(cp_err, "    Command 'reset' is ignored.\n");
         return;
     }
+
+    /* card #492: an interactive 'option name=val' (e.g. the
+     * alterparam/option temp/reset per-point idiom this project's own
+     * bench/gen_pvt.py and tools/campaign.py mode (b) loop use) is applied
+     * to the LIVE circuit immediately (cp_vset() -> cp_usrset() ->
+     * if_option(ft_curckt->ci_ckt, ...), src/frontend/options.c) and also
+     * cached onto ft_curckt->ci_vars so a later circuit (re)load can replay
+     * it (inp_dodeck()'s "for (eev = ct->ci_vars...)" loop,
+     * src/frontend/inp.c). com_remcirc() below unconditionally frees
+     * ci_vars, and inp_dodeck() is -- at its one call site -- always
+     * invoked with reuse=FALSE, so 'reset' always builds a brand new
+     * circuit with an EMPTY ci_vars: any 'option ...=...' set since the
+     * circuit was first loaded is silently discarded, and the new
+     * circuit's task falls back to CKTnewTask()'s hard-coded defaults
+     * (temp=300.15K/27C in particular) instead of the value the caller
+     * asked for -- no error, no warning. Root cause of card #491's mode
+     * (b) PVT-loop finding (docs/campaign.md): 'option temp = {temp}' +
+     * 'reset' silently reverts to 27C every point, confirmed with a
+     * direct '@dev[temp]' probe (research/reset-leak.md) and reproduced
+     * identically on stock /usr/local/bin/ngspice 45.2 and the unpatched
+     * pin -- upstream, not introduced by this fork's patches.
+     *
+     * Fix: detach ci_vars here (so com_remcirc()'s own free loop finds
+     * nothing to discard) and replay each variable through cp_vset() --
+     * the exact mechanism the interactive 'option' command itself uses --
+     * onto the freshly (re)loaded circuit once inp_source_recent() has
+     * finished, instead of losing it. Plain 'remcirc' (bound directly to
+     * com_remcirc(), commands.c) is untouched: there is no reload after a
+     * bare remcirc for a lost option to matter to. */
+    saved_vars = ft_curckt->ci_vars;
+    ft_curckt->ci_vars = NULL;
+
     com_remcirc(NULL);
     inp_source_recent();
+
+    for (v = saved_vars; v; v = next) {
+        next = v->va_next;
+        switch (v->va_type) {
+        case CP_BOOL:
+            cp_vset(v->va_name, v->va_type, &v->va_bool);
+            break;
+        case CP_NUM:
+            cp_vset(v->va_name, v->va_type, &v->va_num);
+            break;
+        case CP_REAL:
+            cp_vset(v->va_name, v->va_type, &v->va_real);
+            break;
+        case CP_STRING:
+            cp_vset(v->va_name, v->va_type, v->va_string);
+            break;
+        case CP_LIST:
+            cp_vset(v->va_name, v->va_type, v->va_vlist);
+            break;
+        default:
+            break;
+        }
+        tfree(v->va_name);
+        if (v->va_type == CP_STRING)
+            tfree(v->va_string);
+        tfree(v);
+    }
 }
 
 
