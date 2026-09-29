@@ -99,13 +99,15 @@ CKTsetup(CKTcircuit *ckt)
      * that itself needs the matrix built first -- circular, and the
      * reason round 5/6 judged that fuller version too large for one
      * round); close enough for a coarse, defensive, opt-in threshold. */
-    if (ckt->CKTautoklu && !ckt->CKTkluExplicit && !ckt->CKTkluMODE) {
+    if (ckt->CKTautoklu && !ckt->CKTkluExplicit && !ckt->CKTkluMODE
+            && ckt->CKTlastNode) {
         double CKTautokluThresh =
             (ckt->CKTautokluThreshold > 0) ? ckt->CKTautokluThreshold : 2000.0;
-        if ((double)ckt->CKTlastNode >= CKTautokluThresh) {
+        int CKTautokluNodes = ckt->CKTlastNode->number;
+        if ((double)CKTautokluNodes >= CKTautokluThresh) {
             fprintf(stdout,
                 "Note: .options autoklu switching to KLU (%d nodes >= "
-                "autoklu_threshold=%g)\n", ckt->CKTlastNode, CKTautokluThresh);
+                "autoklu_threshold=%g)\n", CKTautokluNodes, CKTautokluThresh);
             ckt->CKTkluMODE = 1;
         }
     }
