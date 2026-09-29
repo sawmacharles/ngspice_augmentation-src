@@ -412,6 +412,9 @@ pss_break_free(void)
     g_break_times = NULL;
     g_break_is_event = NULL;
     g_break_count = g_break_cap = 0;
+    if (g_rp_t) tfree(g_rp_t);
+    if (g_rp_ord) tfree(g_rp_ord);
+    g_rp_t = NULL; g_rp_ord = NULL; g_rp_n = g_rp_cap = g_rp_idx = 0;
 }
 
 /* card #498 SECOND pass (root cause of the plateau the first pass's
@@ -2905,6 +2908,17 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                 double h_plus, h_minus;
                 int err_plus, err_minus;
                 if (h < 1e-6) h = 1e-6;
+                /* card #505: a state whose magnitude is below its own ripple
+                 * (a comparator-reset latch node, the foot of a dead-time RC
+                 * swing) has period-map noise (~1e-5..3e-5, exponential in
+                 * the comparator on-time) far above the 1e-6 floor step, so
+                 * its FD column is noise/h ~ 5-30 (garbage diagonal ->
+                 * bogus Floquet multipliers). Difference it with 1% of its
+                 * ripple instead. Every state with |x| >= ripple keeps the
+                 * old step exactly. PSS_SHOOT_NO_BIGH disables. */
+                if (ripple_full[jf] > 0.0 && fabs(x0[j]) < ripple_full[jf] &&
+                    0.01 * ripple_full[jf] > h && getenv("PSS_SHOOT_NO_BIGH") == NULL)
+                    h = 0.01 * ripple_full[jf];
                 h_plus = h_minus = h;
 
                 /* card #498: each side gets its OWN shrink-retry (see
@@ -2931,6 +2945,58 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                                                      outbuf, &h_minus);
                 } else {
                     err_minus = 0;   /* -h not even attempted; err_plus alone triggers fallback below */
+                }
+
+                /* card #505: ONE-SIDED difference rung. A single failing side
+                 * (a corrector collapse inside ONE perturbed period run --
+                 * "Timestep too small", see docs/pss-pac.md "card #505",
+                 * root cause (a)) no longer kills the whole Newton attempt
+                 * for a switch-free deck: the surviving side is differenced
+                 * against a FORCED run at x0 itself (same forced grid as the
+                 * perturbed run, so the free-baseline-vs-forced mismatch that
+                 * a naive (x1_free - forced) difference would divide by h
+                 * cancels), giving an O(h) one-sided column. Only reached
+                 * when a side FAILED, so every column that succeeds on both
+                 * sides is computed exactly as before. */
+                if ((err_plus || err_minus) && !g_pss_has_switch &&
+                    getenv("PSS_NO_ONESIDED") == NULL) {
+                    int have_plus = !err_plus, err_x0;
+                    double *side = TMALLOC(double, n);
+                    double h_x0 = 0.0;
+                    if (side) {
+                        if (have_plus) {
+                            for (k = 0; k < n; k++) side[k] = plus_raw[k];
+                        } else {
+                            /* +h failed: try -h alone (it was not attempted above) */
+                            err_minus = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
+                                                             x0[j], -1.0, h,
+                                                             "PSS shoot (monodromy perturbation -)",
+                                                             outbuf, &h_minus);
+                            if (!err_minus)
+                                for (k = 0; k < n; k++) side[k] = outbuf[slow_idx[k]];
+                        }
+                        if (have_plus || !err_minus) {
+                            err_x0 = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
+                                                          x0[j], 0.0, h,
+                                                          "PSS shoot (monodromy forced baseline at x0)",
+                                                          outbuf, &h_x0);
+                            if (!err_x0) {
+                                double hh = have_plus ? h_plus : h_minus;
+                                for (k = 0; k < n; k++)
+                                    M[k * n + j] = (have_plus ? (side[k] - outbuf[slow_idx[k]])
+                                                              : (outbuf[slow_idx[k]] - side[k])) / hh;
+                                fprintf(stderr, "PSS-SHOOT: %s monodromy perturbation %s run for state %s "
+                                        "did not complete; used a one-sided difference for this column "
+                                        "at Newton iteration %d (card #505).\n", stage_label,
+                                        have_plus ? "-h" : "+h", map->refs[jf].name, iter);
+                                err_plus = err_minus = 0;
+                                tfree(side);
+                                continue;
+                            }
+                        }
+                        tfree(side);
+                    }
+                    /* fall through: could not rescue this column */
                 }
 
                 if (err_plus || err_minus) {
@@ -3409,7 +3475,10 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
 
     for (i = 0; i < n; i++) icbuf[i] = x_full[i];
     pss_state_set_ic(map, icbuf);
+    pss_ripple_reset(map, icbuf);   /* card #505: ripple per state, for the large-step recheck below */
+    PSSrippleRecordActive = 1;
     err = pss_run_period_ex_safe(ckt, T, "PSS shoot (fast-state detection baseline)", 1, 0);
+    PSSrippleRecordActive = 0;
     if (err) {
         fprintf(stderr, "PSS-SHOOT: fast-state detection baseline period "
                 "did not complete (ngspice error %d); skipping reduction, "
@@ -3459,6 +3528,71 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
         }
         colnorm[j] = cn;
         is_fast[j] = (cn < threshold);
+    }
+    /* card #505: NOISE-ROBUST detection. A tiny-magnitude state (a latch node
+     * that a comparator resets to ~1e-2, a dead-time RC node at the foot of
+     * its swing) is differenced with h = max(eps*|x|, 1e-6) ~ 1e-6, but the
+     * period map's own corrector/event noise on such a state is ~1e-5..3e-5
+     * (its end value depends exponentially on the comparator's on-time), so
+     * the "column" it produces is noise/h ~ 5-30 instead of the ~0 a
+     * forgetful state really has. Such a state is kept as a Newton unknown,
+     * and its garbage diagonal entry then poisons both the Newton Jacobian
+     * and the Floquet verdict (spectral radius 2..14 "UNSTABLE" on an orbit
+     * whose true multiplier is 0.994; measured on the R4d fixtures, card
+     * #505). For every state whose small-step column is above the
+     * threshold, re-measure it with a step of 5% of its own ripple
+     * (>> the noise) and keep the SMALLER of the two: a genuinely sensitive
+     * state is above the threshold at both step sizes, a noisy one only at
+     * the small step. Never makes a column larger, so it can only ever
+     * reclassify noisy columns as fast. PSS_SHOOT_NO_BIGH disables. */
+    if (getenv("PSS_SHOOT_NO_BIGH") == NULL) {
+        double *ripple_d = TMALLOC(double, n);
+        double *phi_small_save = TMALLOC(double, (size_t) n * n);
+        if (ripple_d && phi_small_save) {
+            memcpy(phi_small_save, Phi, (size_t) n * n * sizeof(double));
+            pss_ripple_get(map, ripple_d);
+            for (j = 0; j < n; j++) {
+                double h_small = fabs(x_full[j]) * eps, h2, cn2 = 0.0;
+                int ok = 1;
+                if (h_small < 1e-6) h_small = 1e-6;
+                h2 = 0.05 * ripple_d[j];
+                if (colnorm[j] < threshold || h2 < 5.0 * h_small)
+                    continue;
+                for (i = 0; i < n; i++) icbuf[i] = x_full[i];
+                icbuf[j] = x_full[j] + h2;
+                pss_state_set_ic(map, icbuf);
+                if (pss_run_period_ex_safe(ckt, T, "PSS shoot (fast-state large-step recheck +)", 0, 1)) ok = 0;
+                else {
+                    pss_state_get(map, ckt, outbuf);
+                    for (k = 0; k < n; k++) Phi[k * n + j] = outbuf[k];
+                }
+                if (ok) {
+                    icbuf[j] = x_full[j] - h2;
+                    pss_state_set_ic(map, icbuf);
+                    if (pss_run_period_ex_safe(ckt, T, "PSS shoot (fast-state large-step recheck -)", 0, 1)) ok = 0;
+                    else {
+                        pss_state_get(map, ckt, outbuf);
+                        for (k = 0; k < n; k++) {
+                            double v = fabs((Phi[k * n + j] - outbuf[k]) / (2.0 * h2));
+                            if (v > cn2) cn2 = v;
+                        }
+                    }
+                }
+                /* restore the small-step column into Phi (the seed Jacobian
+                 * must stay exactly what it was): recomputed below from the
+                 * saved copy */
+                if (ok && cn2 < colnorm[j]) {
+                    if (cn2 < threshold)
+                        fprintf(stdout, "PSS-SHOOT:   %-12s small-step colnorm=%.3e is finite-difference noise "
+                                "(large-step colnorm=%.3e at h=%.3g) -> fast\n", map->refs[j].name, colnorm[j], cn2, h2);
+                    colnorm[j] = cn2;
+                    is_fast[j] = (cn2 < threshold);
+                }
+                for (k = 0; k < n; k++) Phi[k * n + j] = phi_small_save[k * n + j];
+            }
+        }
+        if (ripple_d) tfree(ripple_d);
+        if (phi_small_save) tfree(phi_small_save);
     }
     {
         int any_slow = 0;
@@ -4043,6 +4177,36 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                     fprintf(stderr, "PROFILE: stage %d newton attempt (%d iters) "
                             "took %.4fs\n", stage, iter, SPfrontEnd->IFseconds() - _pnt0);
                 }
+                /* card #505: replay rung. The classic forced-grid map (every
+                 * recorded time forced as a breakpoint => backward-Euler
+                 * restart + LTE re-derivation per gap) is not the same
+                 * function as the free baseline run, so on a sharp-edged
+                 * deck the trial residual bottoms out at that mismatch
+                 * (R3d: 3e-4 plateau). Retry the final stage once with the
+                 * exact step/order replay, which makes P(x0) reproduce the
+                 * baseline. Only reached when the classic attempt FAILED,
+                 * so every deck that converged before is untouched. */
+                if (!converged_flag && last_stage && !pss_replay_enabled() &&
+                    getenv("PSS_REPLAY") == NULL && g_rp_n > 0) {
+                    int seed_dummy = 0;
+                    fprintf(stdout, "PSS-SHOOT: [stage %d/final] the forced-grid Newton attempt did not "
+                            "converge (residual %.3e); retrying once with exact step-sequence replay "
+                            "(card #505).\n", stage, residual);
+                    fflush(stdout);
+                    for (k = 0; k < n; k++) x0[k] = x0_stage_start[k];
+                    g_replay_mode = 1;
+                    snprintf(label, sizeof label, "[stage %d/final+replay]", stage);
+                    ckt->CKTreltol = tight_reltol;
+                    converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
+                                                     this_maxiter, tol, eps,
+                                                     this_trust, broyden_enabled,
+                                                     broyden_period, label,
+                                                     &iter, &residual, Phi, use_analytic,
+                                                     NULL, &seed_dummy);
+                    ckt->CKTreltol = save_reltol;
+                    if (!converged_flag)
+                        g_replay_mode = -1;   /* back to the env/default choice */
+                }
                 if (converged_flag || last_stage)
                     break;
 
@@ -4330,6 +4494,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     g_pss_has_switch = 0;
     g_pss_lag_enabled = 1;
     PSSbreakRecordActive = PSSbreakInstallActive = 0;
+    PSSreplayActive = 0;
+    g_replay_mode = -1;   /* card #505: replay choice is per analysis */
     pss_break_free();
     PSSsensActive = 0;
     pss_sens_free();   /* g_sens_map points into &map, about to be freed below */
