@@ -69,6 +69,16 @@ void SMPcaSolve(SMPmatrix *Matrix, double RHS[], double iRHS[],
 		double Spare[], double iSpare[]);
 void SMPcSolve( SMPmatrix *, double [], double [], double [], double []);
 void SMPsolve( SMPmatrix *, double [], double []);
+/* card #504: REAL transposed solve (A^T x = b, A the currently-factored
+ * REAL matrix) -- the real-matrix analogue of SMPcaSolve (which is the
+ * COMPLEX adjoint/transposed solve already used by docs/sens.md's card
+ * #475 adjoint sensitivity). Dispatches Sparse (spSolveTransposed with
+ * iRHS/iSolution NULL -- safe because Matrix->Complex is off whenever this
+ * project's own transient/PAC code calls SMPsolve, so spSolveTransposed
+ * takes its real-only branch, see spsolve.c) vs KLU (klu_tsolve, the real
+ * counterpart of SMPcaSolve's klu_z_tsolve) exactly like SMPsolve/
+ * SMPcaSolve already dispatch on Matrix->CKTkluMODE. */
+void SMPtSolve( SMPmatrix *, double [], double []);
 int SMPmatSize( SMPmatrix *);
 int SMPnewMatrix( SMPmatrix *, int );
 void SMPdestroy( SMPmatrix *);

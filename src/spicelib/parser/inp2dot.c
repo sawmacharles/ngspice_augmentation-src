@@ -1813,6 +1813,16 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
      *                          (sources= omitted entirely) is "all".)
      *   pacpoints=N           (card #499: same recording-pass grid override
      *                          as .pac/.pstb's pacpoints=)
+     *   adjoint 0|1            (card #504: `.pxf ... adjoint=1` selects the
+     *                          true backward/transposed engine
+     *                          (pac_engine_run_adjoint(), pacshoot.c) in
+     *                          place of the card #499 batched-forward-per-
+     *                          source loop; `adjoint=0` forces the v1
+     *                          engine explicitly; omitted (default) is
+     *                          "auto" -- see pssdefs.h's PxfAdjoint/
+     *                          PxfAdjointSet comment. Same keyword/value
+     *                          two-token split as pacpoints=/method=
+     *                          above.)
      * A bare integer is accepted only once, and only where the existing
      * Enhancement-125 maxsideband token could appear -- old decks with just
      * a trailing maxsideband are completely unaffected. */
@@ -1825,6 +1835,7 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
             if (!*word) { tfree(word); break; }
             if (!maxsb_seen && strcmp(word, "method") != 0 && strcmp(word, "solver") != 0 &&
                 strcmp(word, "sources") != 0 && strcmp(word, "pacpoints") != 0 &&
+                strcmp(word, "adjoint") != 0 &&
                 (isdigit((unsigned char) word[0]) ||
                  ((word[0] == '+' || word[0] == '-') && isdigit((unsigned char) word[1])))) {
                 line = save;
@@ -1865,6 +1876,12 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
                 INPinsert(&sname, tab);
                 ptemp.uValue = sname;
                 GCA(INPapName, (ckt, which, foo, "sources", &ptemp));
+            } else if (strcmp(word, "adjoint") == 0) {
+                /* card #504: adjoint 0|1 -- see pssdefs.h's PxfAdjoint/
+                 * PxfAdjointSet comment. */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "adjoint", parm));
             } else {
                 fprintf(stderr, "Error: unknown trailing token '%s' on .pxf - ignored\n", word);
                 tfree(word);

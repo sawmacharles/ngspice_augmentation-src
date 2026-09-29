@@ -1023,6 +1023,57 @@ SMPsolve (SMPmatrix *Matrix, double RHS[], double Spare[])
     }
 }
 
+/*
+ * SMPtSolve() -- card #504: REAL transposed solve (A.'x = b), the real-
+ * matrix analogue of SMPcaSolve() above (which is the COMPLEX adjoint/
+ * transposed solve klu_z_tsolve already uses for docs/sens.md's card #475
+ * adjoint sensitivity -- see that function's own comment on why plain
+ * klu_z_solve was wrong for an asymmetric matrix). Same node-collapsing
+ * remap as SMPsolve() just above, klu_tsolve (real) in place of
+ * klu_solve.
+ */
+void
+SMPtSolve (SMPmatrix *Matrix, double RHS[], double Spare[])
+{
+    int ret ;
+    unsigned int i ;
+
+    NG_IGNORE (Spare) ;
+
+    if (Matrix->CKTkluMODE)
+    {
+        if (CircuitIsDigital() && Matrix->SMPkluMatrix->KLUmatrixN == 0) {
+          return ;
+        }
+
+        for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixN ; i++) {
+            if (Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1] != 0) {
+                Matrix->SMPkluMatrix->KLUmatrixIntermediate [i] = RHS [Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1]] ;
+            }
+        }
+
+        ret = klu_tsolve (Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, (int)Matrix->SMPkluMatrix->KLUmatrixN, 1,
+                          Matrix->SMPkluMatrix->KLUmatrixIntermediate, Matrix->SMPkluMatrix->KLUmatrixCommon) ;
+
+        if (ret == 0) {
+            if (ft_ngdebug)
+                fprintf(stderr, "Warning (SMPtSolve): klu_tsolve returned failure\n");
+        }
+
+        for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixNrhs ; i++) {
+            RHS [i] = 0 ;
+        }
+
+        for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixN ; i++) {
+            if (Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1] != 0) {
+                RHS [Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1]] = Matrix->SMPkluMatrix->KLUmatrixIntermediate [i] ;
+            }
+        }
+    } else {
+        spSolveTransposed (Matrix->SPmatrix, RHS, RHS, NULL, NULL) ;
+    }
+}
+
 #ifdef CIDER
 void
 SMPsolveKLUforCIDER (SMPmatrix *Matrix, double RHS[], double RHSsolution[], double iRHS[], double iRHSsolution[])

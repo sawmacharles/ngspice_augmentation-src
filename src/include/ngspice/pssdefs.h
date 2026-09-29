@@ -117,6 +117,22 @@ typedef struct {
     IFuid   *PxfSourceNames;  /* [PxfSourceCount], repeated sources="Vname" */
     int      PxfSourceCount;
 
+    /* card #504: `.pxf ... adjoint=1|0` -- selects pac_td_pxf_adjoint()
+     * (src/spicelib/analysis/pacshoot.c) in place of the card #499
+     * batched-forward-per-source engine above (pac_td_pxf()'s own loop
+     * over pac_engine_run(), still the default/fallback -- see that
+     * function's "SHIPPED DESIGN" comment, now superseded for the common
+     * case by pac_td_pxf_adjoint()'s true backward/transposed sweep,
+     * amortising every requested source behind ONE extra period
+     * traversal instead of K). PxfAdjointSet distinguishes "not given on
+     * this card" (0, auto: pac_td_pxf() picks the engine itself from the
+     * requested source count, PXF_ADJOINT_AUTO_THRESHOLD in pacshoot.c)
+     * from an explicit `adjoint=0` (force the v1 forward engine, e.g. for
+     * A/B comparison) -- PxfAdjoint alone can't carry that distinction
+     * since 0 is also PxfAdjoint's own zero-initialised default. */
+    int      PxfAdjoint;      /* explicit value, only meaningful if PxfAdjointSet */
+    int      PxfAdjointSet;   /* 1 if `adjoint=` appeared on this card at all */
+
     /* Enhancement-132: periodic S-parameters (.psp). Runs PSS, then for each RF
      * port injects a unit current in sideband 0 through the conversion matrix and
      * reads the per-sideband port waves, building the periodic scattering matrix
@@ -214,6 +230,7 @@ enum {
     TRIG_DIR,
     PSS_FORCE_DRIVEN,
     PXF_SOURCES,
+    PXF_ADJOINT,
 };
 
 #endif

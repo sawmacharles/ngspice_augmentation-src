@@ -117,6 +117,13 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         }
         break;
 
+    /* card #504: `.pxf ... adjoint=1|0` -- see pssdefs.h's PxfAdjoint/
+     * PxfAdjointSet comment. */
+    case PXF_ADJOINT:
+        job->PxfAdjoint = value->iValue;
+        job->PxfAdjointSet = 1;
+        break;
+
     /* Enhancement-126: cyclostationary-noise flag */
     case PNOISE_CYCLO:
         job->PSSpnCyclo = value->iValue;
@@ -216,7 +223,8 @@ static IFparm PSSparms[] = {
     { "trigger",      TRIG_NODE,	IF_SET|IF_STRING,	"card #489: free-running shooting Poincare-section trigger node (given = selects PSSshootFreerun)" },
     { "trigval",      TRIG_VAL,	IF_SET|IF_REAL,		"card #489: trigger threshold voltage (default 0.5)" },
     { "trigdir",      TRIG_DIR,	IF_SET|IF_STRING,	"card #489: trigger crossing direction, rise (default) or fall" },
-    { "driven",       PSS_FORCE_DRIVEN, IF_SET|IF_INTEGER,	"card #494: force driven-mode shooting at fguess even if no native V/I source has a time function (XSPICE-clocked decks, e.g. d_pwm)" }
+    { "driven",       PSS_FORCE_DRIVEN, IF_SET|IF_INTEGER,	"card #494: force driven-mode shooting at fguess even if no native V/I source has a time function (XSPICE-clocked decks, e.g. d_pwm)" },
+    { "adjoint",      PXF_ADJOINT,	IF_SET|IF_INTEGER,	"card #504: .pxf true adjoint/transposed engine (1=force on, 0=force off, unset=auto by source count)" }
 };
 
 SPICEanalysis PSSinfo  = {

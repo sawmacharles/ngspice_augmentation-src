@@ -441,6 +441,16 @@ static PACc *g_pac_demod = NULL;                         /* [neq*M], sideband-0 
 static double g_pac_T = 0.0;                              /* period, for the 1/T normalisation */
 static double *g_pac_rhs_re = NULL, *g_pac_rhs_im = NULL, *g_pac_scratch = NULL; /* [neq+1] */
 static int g_pac_exact_jac = 0;   /* card #465 THIRD pass, task 1: see pac_refactor_at_accepted() */
+/* card #504: the true-adjoint engine's OWN forward Phi/G passes need the
+ * SAME per-step J_k convention its backward sweep rebuilds (J_k at the
+ * TRUE accepted x_k, not the legacy default's stale x_{k-1} -- see
+ * pac_engine_run_adjoint()'s design comment for why this is NOT optional
+ * the way PAC_EXACT_JACOBIAN is for v1). Independent of g_pac_exact_jac
+ * (which pac_reset() unconditionally re-reads from the env var on every
+ * call, so a plain assignment before pac_reset() would just be
+ * overwritten) -- OR'd in at PSSpacRecordStep()'s own check, set/cleared
+ * ONLY around the adjoint engine's own forward pac_run_period() calls. */
+static int g_pac_force_exact_jac = 0;
 
 /* card #465 FOURTH pass, task 1: the true y(0) at a NON-state row (any row
  * that is not a capacitor/inductor terminal the reduced state tracks, e.g.
@@ -453,6 +463,99 @@ static int g_pac_exact_jac = 0;   /* card #465 THIRD pass, task 1: see pac_refac
 static PACc *g_pac_first_y = NULL;
 static double g_pac_first_t = 0.0;
 static int g_pac_have_first = 0;
+
+/* ------------------------------------------------------------------ */
+/* card #504: TRAJECTORY RECORDER for the true-adjoint `.pxf ... adjoint=1`
+ * engine (pac_engine_run_adjoint() below). Independent of g_pac_Cprev/etc
+ * above (own reset/free, own lifetime -- spans MULTIPLE pac_reset()/
+ * pac_free() cycles: the adjoint engine's own "Phi+trajectory" forward
+ * pass uses the ordinary g_pac_* column machinery for Phi exactly like
+ * pac_engine_run()'s pass 1 homogeneous columns, and ADDITIONALLY records
+ * one entry here per accepted step -- see PSSpacRecordStep()'s own
+ * g_pac_traj_active check, added right after order/t_new/h are computed).
+ *
+ * What is stored per accepted step k: the accepted point x_k itself
+ * (ckt->CKTrhs, the TRUE just-accepted iterate -- SAME array
+ * pac_refactor_at_accepted() already trusts is correct at this exact call
+ * site, see that function's header) plus t_k/h_k/ag0_k/ag1_k/order_k --
+ * everything pac_adj_refactor_at() (below, near the backward sweep) needs
+ * to rebuild J_k = G(x_k)+ag0_k*C(x_k) LATER, in REVERSE order, via a
+ * fresh CKTload()+SMPluFac() outside any live transient (no
+ * save/restore-for-the-ongoing-transient's-sake concern the live-
+ * interleaved pac_refactor_at_accepted() has -- there is no ongoing
+ * transient by the time the backward sweep runs; pac_engine_run_adjoint()
+ * itself saves/restores the handful of ckt-global scalars this touches,
+ * see that function).
+ *
+ * Memory: O(N*(neq+2)) doubles, N = accepted steps in ONE period at
+ * whatever recording resolution (PACrecordPoints/pacpoints=, same knob
+ * pac_run_period() already uses) -- see the card #504 report's own
+ * measured numbers on the three test_pxf.py fixtures. Grown by doubling;
+ * never shrunk mid-job (freed only by pac_traj_free()). */
+typedef struct {
+    double t, h, ag0, ag1;
+    int order;
+    double *x;   /* [neq+1], 1-based, OWNED (malloc'd) copy of ckt->CKTrhs */
+} PACtrajStep;
+
+static int g_pac_traj_active = 0;     /* PSSpacRecordStep() appends when set */
+static PACtrajStep *g_pac_traj = NULL;
+static int g_pac_traj_n = 0, g_pac_traj_cap = 0;
+static int g_pac_traj_neq = 0;        /* neq at record time, for x[] sizing */
+static int g_pac_traj_failed = 0;
+
+static void
+pac_traj_free(void)
+{
+    int i;
+    if (g_pac_traj) {
+        for (i = 0; i < g_pac_traj_n; i++)
+            if (g_pac_traj[i].x) tfree(g_pac_traj[i].x);
+        tfree(g_pac_traj);
+    }
+    g_pac_traj = NULL;
+    g_pac_traj_n = g_pac_traj_cap = 0;
+    g_pac_traj_neq = 0;
+    g_pac_traj_active = 0;
+    g_pac_traj_failed = 0;
+}
+
+static void
+pac_traj_reset(int neq)
+{
+    pac_traj_free();
+    g_pac_traj_neq = neq;
+    g_pac_traj_active = 1;
+}
+
+/* Called from PSSpacRecordStep() at every accepted step (t>0) while
+ * g_pac_traj_active -- appends (t,h,ag0,ag1,order, a COPY of ckt->CKTrhs)
+ * to g_pac_traj[]. Sets g_pac_traj_failed on OOM (checked by the adjoint
+ * engine before trusting the buffer). */
+static void
+pac_traj_append(CKTcircuit *ckt, double t, double h, double ag0, double ag1, int order)
+{
+    double *xcopy;
+    if (g_pac_traj_failed)
+        return;
+    if (g_pac_traj_n >= g_pac_traj_cap) {
+        int newcap = g_pac_traj_cap ? g_pac_traj_cap * 2 : 256;
+        PACtrajStep *nu = TREALLOC(PACtrajStep, g_pac_traj, newcap);
+        if (!nu) { g_pac_traj_failed = 1; return; }
+        g_pac_traj = nu;
+        g_pac_traj_cap = newcap;
+    }
+    xcopy = TMALLOC(double, g_pac_traj_neq + 1);
+    if (!xcopy) { g_pac_traj_failed = 1; return; }
+    memcpy(xcopy, ckt->CKTrhs, (size_t) (g_pac_traj_neq + 1) * sizeof(double));
+    g_pac_traj[g_pac_traj_n].t = t;
+    g_pac_traj[g_pac_traj_n].h = h;
+    g_pac_traj[g_pac_traj_n].ag0 = ag0;
+    g_pac_traj[g_pac_traj_n].ag1 = ag1;
+    g_pac_traj[g_pac_traj_n].order = order;
+    g_pac_traj[g_pac_traj_n].x = xcopy;
+    g_pac_traj_n++;
+}
 
 static PACc
 pac_get(const PACc *C, int row, int M, int m)
@@ -702,6 +805,13 @@ PSSpacRecordStep(CKTcircuit *ckt)
     order = (fabs(ag1 + ag0) < 1e-6 * fabs(ag0)) ? 1 : 2;
     t_new = ckt->CKTtime;
     h = t_new - g_pac_tprev;
+
+    /* card #504: adjoint-engine trajectory recording, independent of the
+     * M-column machinery below -- see g_pac_traj_active's own comment.
+     * Uses ckt->CKTrhs (the true accepted x_k, untouched by anything in
+     * this function), not g_pac_Cprev/Cnew. */
+    if (g_pac_traj_active)
+        pac_traj_append(ckt, t_new, h, ag0, ag1, order);
     /* card #465 THIRD pass, task 1 investigation: debug trace (PAC_ORDER_TRACE,
      * no-op unless set) used to rule out "order pinned at 1" as the cause of
      * pstb_linear.cir's O(1/Points) error -- it is NOT: on a 20000-point
@@ -724,7 +834,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
      * pac_refactor_at_accepted()'s header for why this is needed and why
      * it is safe to do here (unlike pssshoot.c's Newton-loop-scoped
      * case). No-op unless PAC_EXACT_JACOBIAN is set. */
-    if (g_pac_exact_jac) {
+    if (g_pac_exact_jac || g_pac_force_exact_jac) {
         if (pac_refactor_at_accepted(ckt)) {
             fprintf(stderr, "PAC-TD: exact-Jacobian refactor failed at "
                     "t=%g; abandoning this pass.\n", ckt->CKTtime);
@@ -1285,6 +1395,15 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
             }
     }
     if (Phi_out) memcpy(Phi_out, Phi, (size_t) n * n * sizeof(PACc));
+    if (getenv("PXF_ADJ_DEBUG")) {
+        fprintf(stderr, "PAC-V1-DEBUG: n=%d exact_jac=%d\n", n, g_pac_exact_jac);
+        for (d = 0; d < n; d++) {
+            for (j = 0; j < n; j++)
+                fprintf(stderr, "  Phi[%d][%d]=%.6g%+.6gi", d, j,
+                        Phi[(size_t) d * n + j].re, Phi[(size_t) d * n + j].im);
+            fprintf(stderr, "\n");
+        }
+    }
     pac_free();
 
     /* card #489 SECOND pass (plan T6.2, task 5): free-running period-
@@ -1512,6 +1631,529 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
 
  cleanup:
     tfree(omega1); tfree(useforce1); tfree(ic0_1); tfree(Phi); tfree(z); tfree(xi);
+    return err;
+}
+
+/* ------------------------------------------------------------------ */
+/* card #504: TRUE ADJOINT `.pxf ... adjoint=1` engine.
+ *
+ * DERIVATION (full working kept in the card #504 report; summary here).
+ * pac_engine_run()'s TWO forward period passes, for one source's forcing
+ * pattern b (br/bi), compute:
+ *   pass 1: Phi (n x n, homogeneous columns, b=0) and z(w) = E_read(u_N(b))
+ *           (the b-forced, ZERO-IC trajectory's final state at the n
+ *           reduced-state rows, E_read = pac_state_row()'s OWN
+ *           posNode/branch-only convention -- NOT the Delta=p-n difference
+ *           the INTERNAL per-step recursion below uses; the two coincide
+ *           for every fixture here since every capacitor's negNode is
+ *           ground, see the design note by pac_state_row() itself.)
+ *   boundary solve: xi(w) = (e^{jwT}I - Phi)^{-1} z(w)
+ *   pass 2: re-propagate from y0=xi WITH the SAME b forcing, demodulate at
+ *           the output row -> Y0(w) = xi^T G(w) + h(w,b), where G(w)[d] is
+ *           "the Y0 a homogeneous-IC=e_d, b=0 pass 2 would give" and h(w,b)
+ *           is pass 2's OWN b-forced (zero-IC) demodulated contribution.
+ *
+ * Since pass 1's z(w) IS "the b-forced zero-IC trajectory's E_read(u_N)"
+ * and pass 2's h(w,b) IS "the SAME b-forced zero-IC trajectory's
+ * demodulated output" -- both read off the literal SAME trajectory u(b)
+ * (b appears identically, at every step, in both -- this file's own
+ * header notes re-running from the converged x0 reproduces the transient
+ * bit for bit) -- superposition gives, for the SAME output row and SAME w:
+ *
+ *   Y0(w,b) = [E_read(u_N(b))]^T M(w)  +  (1/T) sum_k alpha_k[out] u_k(b)[out]
+ *
+ * where M(w) := ((e^{jwT}I - Phi)^T)^{-1} G(w) (the TASK'S "transpose of
+ * the periodic boundary condition") and alpha_k[out] is the RAW (pre-1/T)
+ * trapezoidal-plus-wraparound demodulation weight PSSpacRecordStep()/
+ * pac_finish_demod_wraparound() already compute (see their own headers;
+ * re-derived in closed periodic form below, coef_k = ph2_k * 0.5*(h_k +
+ * h_{k+1 mod N}), h_{N+1}:=h_1 -- the expected periodic-trapezoidal
+ * quadrature weight).
+ *
+ * u_k(b) is itself generated by ONE linear per-step recursion (b entering
+ * identically, phase-modulated, at every step) -- Y0(w,.) as a function of
+ * b is therefore a single COMPLEX-LINEAR functional, representable as
+ * Y0(w,b) = b^T Lambda(w) for one Lambda(w) in C^neq that does NOT depend
+ * on b at all. Lambda(w) is computed by a BACKWARD (reverse-time) sweep of
+ * the per-step recursion's adjoint, folding in M(w) at the LAST step only
+ * (k=N) and the alpha_k[out] demod weight at EVERY step -- the "transposed
+ * per-step solve" (SMPtSolve, new this card) and "transpose of the
+ * per-step history operator" (the trapezoidal order-2 two-term T_k
+ * recursion, transposed below into beta/gamma "gather" formulas that are
+ * the EXACT mirror of PSSpacRecordStep()'s own dceq/dveq/T_k "scatter"
+ * formulas -- re-derived directly from that code, not from physics
+ * intuition, to avoid a docs/sens.md-style transpose-or-sign bug) the
+ * card's brief calls for. Once Lambda(w) is known, EVERY requested
+ * source's PXF is a single dot product b_source^T Lambda(w) -- the "K
+ * sources for the cost of ~1 sweep" payoff.
+ *
+ * J_k (needed at arbitrary, REVERSE order): RECOMPUTED on demand from a
+ * recorded trajectory (g_pac_traj[], card #504 above -- x_k plus
+ * t_k/h_k/ag0_k/ag1_k/order_k, captured during this function's OWN
+ * "Phi + trajectory" forward pass) via a fresh CKTload()+SMPluFac() per
+ * backward step, mirroring pac_refactor_at_accepted()'s existing,
+ * validated "put x_k where devices read node voltages from, reload,
+ * refactor" recipe -- NOT deep-cloned/stored factorizations (memory: see
+ * the card #504 report's measured numbers; O(N*(neq+2)) doubles for the
+ * trajectory alone was judged the simpler, safer choice for one session,
+ * not proven the ONLY viable one -- storing factorizations remains valid
+ * future work if per-step refactor cost ever dominates for a much larger
+ * circuit than this project's own fixtures). Because this recompute-based
+ * J_k is INTERNALLY CONSISTENT only with itself (x_k, not the live
+ * transient's possibly-stale x_{k-1} the DEFAULT, non-PAC_EXACT_JACOBIAN
+ * v1 path uses -- see pac_refactor_at_accepted()'s own header), this
+ * engine's OWN forward Phi/G passes ALSO force the exact-Jacobian
+ * convention (g_pac_force_exact_jac, independent of the PAC_EXACT_JACOBIAN
+ * env var) so its own forward and backward halves use the IDENTICAL J_k
+ * sequence -- a genuine, well-defined adjoint of ONE map, not an
+ * accidental mix of two. Consequence: comparing this engine against v1's
+ * OWN DEFAULT (stale-Jacobian, O(1/Points)-accurate) output is only
+ * accurate to O(1/Points), NOT floating-point noise; tests/test_pxf.py's
+ * adjoint checks therefore run v1 ALSO under PAC_EXACT_JACOBIAN=1 for the
+ * comparison (both sides then mathematically exact, agreement limited
+ * only by roundoff) -- see that script and the card #504 report's
+ * "validation" section for the numbers either way.
+ *
+ * SCOPE CUT (refused, not silently wrong): saltation (ideal-switch/event)
+ * corrections and the free-running (trigger=) period-variation projection
+ * are NOT transposed by this engine -- see "what was skipped" in the card
+ * #504 report. Detected via PSSsaltEventsSeen()>0 (after the Phi pass) or
+ * trig_idx>=0 (free-running caller) and returned as PAC_ADJOINT_REFUSED
+ * (2) so pac_td_pxf() falls back to the v1 per-source engine transparently
+ * -- correctness is preserved on every fixture (pxf_r2_switched_rc.cir,
+ * the one test_pxf.py fixture with real saltation events, is answered by
+ * v1 even when `adjoint=1`/auto picks this engine, so the done-when's "==
+ * v1" is trivially true there by construction, not because saltation was
+ * actually transposed). */
+
+#define PAC_ADJOINT_OK       0
+#define PAC_ADJOINT_FAIL     1
+#define PAC_ADJOINT_REFUSED  2
+
+/* card #504: `.pxf` without an explicit `adjoint=` picks the adjoint
+ * engine automatically once the requested source count exceeds this --
+ * "default when K is above a small number" per the card's own brief. A
+ * small K is cheap enough either way that the v1 per-source engine (no
+ * new machinery in the request path) stays the default. */
+#define PXF_ADJOINT_AUTO_THRESHOLD 4
+
+/* Rebuild J_k = G(x_k)+ag0_k*C(x_k) into ckt->CKTmatrix (factored, ready
+ * for SMPtSolve) from one recorded trajectory step -- the backward-sweep
+ * analogue of pac_refactor_at_accepted(), but standalone (no live
+ * transient to protect -- caller saves/restores the handful of ckt-global
+ * scalars this touches, see pac_engine_run_adjoint()). */
+static int
+pac_adj_refactor_at(CKTcircuit *ckt, const PACtrajStep *step)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix);
+
+    memcpy(ckt->CKTrhsOld, step->x, (size_t) (neq + 1) * sizeof(double));
+    ckt->CKTtime  = step->t;
+    ckt->CKTdelta = step->h;
+    ckt->CKTag[0] = step->ag0;
+    ckt->CKTag[1] = step->ag1;
+
+    if (CKTload(ckt))
+        return 1;
+    return SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin) ? 1 : 0;
+}
+
+static int
+pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, double T,
+                        const double *freqs, int nfreq, int outrow,
+                        PACsrcRef *srclist, int nsrc_total, const int *use_idx, int nsrc_use,
+                        PACc *Y0_out /* [nsrc_use * nfreq] */,
+                        int trig_idx)
+{
+    int n = map->n, neq = SMPmatSize(ckt->CKTmatrix);
+    int d, e, f, k, s, row, err;
+    double *br_all = NULL, *bi_all = NULL;    /* [nsrc_use*(neq+1)] */
+    PACc *Phi = NULL, *G = NULL, *Mw = NULL;
+    PACc *Lambda = NULL;                       /* [nfreq*(neq+1)] */
+    PACc *abarS = NULL, *abarT = NULL;          /* [n*nfreq] */
+    double *tdu_re = NULL, *tdu_im = NULL, *scratch = NULL;   /* [neq+1] */
+    double *Cdiag = NULL;
+    double save_ag0 = 0.0, save_ag1 = 0.0, save_time = 0.0, save_delta = 0.0;
+    double *save_rhsold = NULL;
+    int have_ckt_saved = 0;
+
+    if (trig_idx >= 0)
+        return PAC_ADJOINT_REFUSED;   /* free-running: not transposed (see header) */
+    if (n <= 0 || nfreq <= 0 || nsrc_use <= 0)
+        return PAC_ADJOINT_FAIL;
+
+    /* ---- capture every requested source's isolated unit stamp FIRST,
+     * before this function's own pac_reset()/pac_run_period() calls touch
+     * ckt any further -- SAME timing v1's per-source loop uses (capture,
+     * then propagate), just batched over every source up front instead of
+     * interleaved one source at a time. */
+    br_all = TMALLOC(double, (size_t) nsrc_use * (neq + 1));
+    bi_all = TMALLOC(double, (size_t) nsrc_use * (neq + 1));
+    if (!br_all || !bi_all) { err = PAC_ADJOINT_FAIL; goto done; }
+    memset(br_all, 0, (size_t) nsrc_use * (neq + 1) * sizeof(double));
+    memset(bi_all, 0, (size_t) nsrc_use * (neq + 1) * sizeof(double));
+    pac_state_set_ic(map, x0);
+    for (s = 0; s < nsrc_use; s++) {
+        if (pac_capture_source_b0(ckt, srclist, nsrc_total, use_idx[s],
+                                   br_all + (size_t) s * (neq + 1),
+                                   bi_all + (size_t) s * (neq + 1), neq)) {
+            fprintf(stderr, "PXF-TD-ADJ: failed to isolate source '%s'\n",
+                    (char *) srclist[use_idx[s]].name);
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+    }
+
+    /* ---- pass A: Phi (n x n) + trajectory recording, ONE period run,
+     * homogeneous columns only (b=0), no demod. */
+    {
+        double *omega1 = TMALLOC(double, n);
+        int *useforce1 = TMALLOC(int, n);
+        PACc *ic0_1 = TMALLOC(PACc, (size_t) n * n);
+        if (!omega1 || !useforce1 || !ic0_1) {
+            if (omega1) tfree(omega1); if (useforce1) tfree(useforce1); if (ic0_1) tfree(ic0_1);
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        memset(ic0_1, 0, (size_t) n * n * sizeof(PACc));
+        for (d = 0; d < n; d++) {
+            omega1[d] = 0.0;
+            useforce1[d] = 0;
+            for (e = 0; e < n; e++) {
+                PACc v = { (d == e) ? 1.0 : 0.0, 0.0 };
+                ic0_1[(size_t) e * n + d] = v;
+            }
+        }
+        pac_state_set_ic(map, x0);
+        pac_traj_reset(neq);
+        if (pac_reset(ckt, map, n, NULL, NULL, omega1, useforce1, ic0_1, 0, T)) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_traj_free();
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        PSSpacActive = 1;
+        g_pac_force_exact_jac = 1;
+        err = pac_run_period(ckt, job, T, "TD-shoot ADJOINT pass A (Phi + trajectory)");
+        g_pac_force_exact_jac = 0;
+        PSSpacActive = 0;
+        g_pac_traj_active = 0;   /* stop recording -- buffer itself kept */
+
+        if (err || g_pac_failed || g_pac_traj_failed) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_free(); pac_traj_free();
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+
+        /* saltation/free-running scope cut (see header) -- refuse
+         * gracefully, caller falls back to v1. */
+        if (PSSsaltActive && PSSsaltEventsSeen() > 0) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_free(); pac_traj_free();
+            err = PAC_ADJOINT_REFUSED; goto done;
+        }
+
+        Phi = TMALLOC(PACc, (size_t) n * n);
+        if (!Phi) {
+            tfree(omega1); tfree(useforce1); tfree(ic0_1);
+            pac_free(); pac_traj_free();
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        for (d = 0; d < n; d++) {
+            int row_d = pac_state_row(&map->refs[d]);
+            for (e = 0; e < n; e++)
+                Phi[(size_t) d * n + e] = pac_get(g_pac_Cprev, row_d, n, e);
+        }
+        tfree(omega1); tfree(useforce1); tfree(ic0_1);
+        pac_free();   /* g_pac_traj_* is independent, survives this */
+    }
+
+    if (g_pac_traj_n < 1) {
+        tfree(Phi); pac_traj_free();
+        err = PAC_ADJOINT_FAIL; goto done;
+    }
+
+    /* ---- pass B: G(w)[d][f] for every (homogeneous column d, frequency
+     * f), batched M=n*nfreq, demod active. */
+    G = TMALLOC(PACc, (size_t) n * nfreq);
+    if (!G) { tfree(Phi); pac_traj_free(); err = PAC_ADJOINT_FAIL; goto done; }
+    {
+        int M2 = n * nfreq;
+        double *omega2 = TMALLOC(double, M2);
+        int *useforce2 = TMALLOC(int, M2);
+        PACc *ic0_2 = TMALLOC(PACc, (size_t) n * M2);
+        if (!omega2 || !useforce2 || !ic0_2) {
+            if (omega2) tfree(omega2); if (useforce2) tfree(useforce2); if (ic0_2) tfree(ic0_2);
+            tfree(Phi); tfree(G); pac_traj_free();
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        memset(ic0_2, 0, (size_t) n * M2 * sizeof(PACc));
+        for (d = 0; d < n; d++)
+            for (f = 0; f < nfreq; f++) {
+                int col = d * nfreq + f;
+                omega2[col] = 2.0 * M_PI * freqs[f];
+                useforce2[col] = 0;
+                { PACc v = { 1.0, 0.0 }; ic0_2[(size_t) d * M2 + col] = v; }
+            }
+        pac_state_set_ic(map, x0);
+        if (pac_reset(ckt, map, M2, NULL, NULL, omega2, useforce2, ic0_2, 1, T)) {
+            tfree(omega2); tfree(useforce2); tfree(ic0_2);
+            tfree(Phi); tfree(G); pac_traj_free();
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        PSSpacActive = 1;
+        g_pac_force_exact_jac = 1;
+        err = pac_run_period(ckt, job, T, "TD-shoot ADJOINT pass B (G(w), homogeneous+demod)");
+        g_pac_force_exact_jac = 0;
+        PSSpacActive = 0;
+        if (err || g_pac_failed) {
+            tfree(omega2); tfree(useforce2); tfree(ic0_2);
+            pac_free(); tfree(Phi); tfree(G); pac_traj_free();
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        pac_finish_demod_wraparound();
+        {
+            double invT = 1.0 / T;
+            for (d = 0; d < n; d++)
+                for (f = 0; f < nfreq; f++) {
+                    PACc v = g_pac_demod[(size_t) (outrow - 1) * M2 + (d * nfreq + f)];
+                    G[(size_t) d * nfreq + f] = pc_scale(v, invT);
+                }
+        }
+        pac_free();
+        tfree(omega2); tfree(useforce2); tfree(ic0_2);
+    }
+
+    /* ---- M(w) = ((e^{jwT}I - Phi)^T)^{-1} G(w), one small dense complex
+     * solve per frequency using the EXPLICIT TRANSPOSE of the boundary
+     * matrix pac_engine_run() itself builds ((e^{jwT}I-Phi), not
+     * transposed there). */
+    Mw = TMALLOC(PACc, (size_t) n * nfreq);
+    if (!Mw) { tfree(Phi); tfree(G); pac_traj_free(); err = PAC_ADJOINT_FAIL; goto done; }
+    {
+        PACc *AT = TMALLOC(PACc, (size_t) n * n);
+        PACc *rhs = TMALLOC(PACc, n);
+        PACc *sol = TMALLOC(PACc, n);
+        if (!AT || !rhs || !sol) {
+            if (AT) tfree(AT); if (rhs) tfree(rhs); if (sol) tfree(sol);
+            tfree(Phi); tfree(G); tfree(Mw); pac_traj_free();
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+        for (f = 0; f < nfreq; f++) {
+            double w = 2.0 * M_PI * freqs[f];
+            double wT = w * T;
+            PACc ephase = { cos(wT), sin(wT) };
+            for (d = 0; d < n; d++)
+                for (e = 0; e < n; e++) {
+                    /* AT[d][e] = A[e][d] = (e==d?ephase:0) - Phi[e][d] */
+                    PACc v = pc_scale(Phi[(size_t) e * n + d], -1.0);
+                    if (e == d) v = pc_add(v, ephase);
+                    AT[(size_t) d * n + e] = v;
+                }
+            for (d = 0; d < n; d++) rhs[d] = G[(size_t) d * nfreq + f];
+            if (pac_complex_solve(AT, rhs, n, sol)) {
+                fprintf(stderr, "PXF-TD-ADJ: WARNING -- transposed boundary solve "
+                        "singular at f=%.6g Hz; result at this frequency skipped.\n",
+                        freqs[f]);
+                for (d = 0; d < n; d++) { PACc nan = { strtod("NaN", NULL), strtod("NaN", NULL) }; sol[d] = nan; }
+            }
+            for (d = 0; d < n; d++)
+                Mw[(size_t) d * nfreq + f] = sol[d];
+        }
+        tfree(AT); tfree(rhs); tfree(sol);
+    }
+    if (getenv("PXF_ADJ_DEBUG")) {
+        fprintf(stderr, "PXF-ADJ-DEBUG: n=%d nfreq=%d traj_n=%d\n", n, nfreq, g_pac_traj_n);
+        for (d = 0; d < n; d++) {
+            for (e = 0; e < n; e++)
+                fprintf(stderr, "  Phi[%d][%d]=%.6g%+.6gi", d, e,
+                        Phi[(size_t) d * n + e].re, Phi[(size_t) d * n + e].im);
+            fprintf(stderr, "\n");
+        }
+        for (d = 0; d < n; d++)
+            fprintf(stderr, "  G[%d][f0]=%.6g%+.6gi  Mw[%d][f0]=%.6g%+.6gi\n", d,
+                    G[(size_t) d * nfreq + 0].re, G[(size_t) d * nfreq + 0].im,
+                    d, Mw[(size_t) d * nfreq + 0].re, Mw[(size_t) d * nfreq + 0].im);
+    }
+    tfree(Phi); tfree(G);
+
+    /* ---- backward adjoint sweep over the recorded trajectory, batched
+     * over every frequency (ONE CKTload()+SMPluFac() refactor per step,
+     * reused for all nfreq transposed solves at that step -- mirrors the
+     * forward passes' own "one factorization per accepted step, many
+     * columns" reuse). */
+    Lambda = TMALLOC(PACc, (size_t) nfreq * (neq + 1));
+    abarS  = TMALLOC(PACc, (size_t) n * nfreq);
+    abarT  = TMALLOC(PACc, (size_t) n * nfreq);
+    tdu_re = TMALLOC(double, (size_t) (neq + 1));
+    tdu_im = TMALLOC(double, (size_t) (neq + 1));
+    scratch = TMALLOC(double, (size_t) (neq + 1));
+    Cdiag  = TMALLOC(double, n);
+    save_rhsold = TMALLOC(double, (size_t) (neq + 1));
+    if (!Lambda || !abarS || !abarT || !tdu_re || !tdu_im || !scratch || !Cdiag || !save_rhsold) {
+        err = PAC_ADJOINT_FAIL; goto done;
+    }
+    memset(Lambda, 0, (size_t) nfreq * (neq + 1) * sizeof(PACc));
+    memset(abarS, 0, (size_t) n * nfreq * sizeof(PACc));
+    memset(abarT, 0, (size_t) n * nfreq * sizeof(PACc));
+
+    memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+    save_time = ckt->CKTtime; save_delta = ckt->CKTdelta;
+    save_ag0 = ckt->CKTag[0]; save_ag1 = ckt->CKTag[1];
+    have_ckt_saved = 1;
+
+    for (k = g_pac_traj_n - 1; k >= 0; k--) {
+        const PACtrajStep *step = &g_pac_traj[k];
+        int is_last = (k == g_pac_traj_n - 1);
+        double h_next = is_last ? g_pac_traj[0].h : g_pac_traj[k + 1].h;
+        double ag1eff = (step->order == 2) ? step->ag1 : 0.0;
+
+        if (pac_adj_refactor_at(ckt, step)) {
+            fprintf(stderr, "PXF-TD-ADJ: refactor failed at t=%.9g (backward step %d)\n",
+                    step->t, k);
+            err = PAC_ADJOINT_FAIL; goto done;
+        }
+
+        for (e = 0; e < n; e++) {
+            const PACstateRef *ref = &map->refs[e];
+            Cdiag[e] = ref->isCap ? step->ag0 * ref->dev.cap->CAPcapac
+                                   : step->ag0 * ref->dev.ind->INDinduct;
+        }
+
+        for (f = 0; f < nfreq; f++) {
+            double w = 2.0 * M_PI * freqs[f];
+            PACc ph1 = { cos(w * step->t), sin(w * step->t) };       /* e^{+jwt_k} */
+            PACc ph2 = pc_conjexp(w * step->t);                       /* e^{-jwt_k} */
+            /* the (1/T) normalisation pac_engine_run()'s own pass 2 applies
+             * ONCE, at the very end, to the whole raw demod sum (Y0_out =
+             * pc_scale(g_pac_demod[...], invT)) -- G(w) above already has
+             * it baked in (it is read off exactly that way), so the SAME
+             * raw-weight formula here needs it applied explicitly, or this
+             * term is 1/T too large relative to the M(w) contribution. */
+            PACc coef = pc_scale(ph2, 0.5 * (step->h + h_next) / T);
+
+            memset(tdu_re, 0, (size_t) (neq + 1) * sizeof(double));
+            memset(tdu_im, 0, (size_t) (neq + 1) * sizeof(double));
+            tdu_re[outrow] += coef.re; tdu_im[outrow] += coef.im;
+
+            if (is_last) {
+                /* card #504 bug fix (found validating pac_r3_ctrl2out.cir,
+                 * which -- unlike pxf_lti.cir/pxf_r2_switched_rc.cir -- has
+                 * a capacitor whose negNode is NOT ground, C1f between
+                 * compin and opout): M(w) is dual to z(w) = E_read(u_N(b))
+                 * (pac_engine_run()'s own z[d][f] = pac_get(Cprev, row_d,
+                 * ...), row_d = pac_state_row() = posNode/branch ONLY --
+                 * the SAME convention Phi and G(w) above are read off with,
+                 * NOT the posNode-minus-negNode difference the INTERNAL
+                 * per-step recursion's rhs/T_k formulas use just below and
+                 * in PSSpacRecordStep() itself. The two conventions
+                 * coincide whenever a capacitor's negNode is ground (every
+                 * cap in pxf_lti.cir/pxf_r2_switched_rc.cir -- why this bug
+                 * passed those two fixtures) but NOT in general -- z(w)
+                 * itself never reads the negNode, so M(w)'s own scatter
+                 * here must not either. */
+                for (e = 0; e < n; e++) {
+                    const PACstateRef *ref = &map->refs[e];
+                    PACc Mv = Mw[(size_t) e * nfreq + f];
+                    int row = pac_state_row(ref);
+                    if (row > 0) { tdu_re[row] += Mv.re; tdu_im[row] += Mv.im; }
+                }
+            }
+
+            for (e = 0; e < n; e++) {
+                const PACstateRef *ref = &map->refs[e];
+                PACc abT = abarT[(size_t) e * nfreq + f];
+                PACc abS_ext = abarS[(size_t) e * nfreq + f];
+                PACc abS_tot = pc_add(abS_ext, pc_scale(abT, Cdiag[e]));
+                if (ref->isCap) {
+                    int p = ref->dev.cap->CAPposNode, ngc = ref->dev.cap->CAPnegNode;
+                    if (p > 0)   { tdu_re[p] += abS_tot.re; tdu_im[p] += abS_tot.im; }
+                    if (ngc > 0) { tdu_re[ngc] -= abS_tot.re; tdu_im[ngc] -= abS_tot.im; }
+                } else {
+                    int ibr = ref->dev.ind->INDbrEq;
+                    tdu_re[ibr] += abS_tot.re; tdu_im[ibr] += abS_tot.im;
+                }
+            }
+
+            SMPtSolve(ckt->CKTmatrix, tdu_re, scratch);
+            SMPtSolve(ckt->CKTmatrix, tdu_im, scratch);
+            /* tdu_re/tdu_im now hold nu_k (this step's, this frequency's
+             * transposed-solve result), for EVERY row 1..neq. */
+
+            for (row = 1; row <= neq; row++) {
+                PACc nu = { tdu_re[row], tdu_im[row] };
+                PACc contrib = pc_mul(nu, ph1);
+                size_t idx = (size_t) f * (neq + 1) + row;
+                Lambda[idx] = pc_add(Lambda[idx], contrib);
+            }
+
+            for (e = 0; e < n; e++) {
+                const PACstateRef *ref = &map->refs[e];
+                PACc beta, gamma;
+                if (ref->isCap) {
+                    int p = ref->dev.cap->CAPposNode, ngc = ref->dev.cap->CAPnegNode;
+                    PACc nup = (p > 0)   ? (PACc){ tdu_re[p], tdu_im[p] }     : (PACc){ 0.0, 0.0 };
+                    PACc nun = (ngc > 0) ? (PACc){ tdu_re[ngc], tdu_im[ngc] } : (PACc){ 0.0, 0.0 };
+                    PACc diffnu = pc_sub(nup, nun);
+                    beta  = pc_scale(diffnu, step->ag0 * ref->dev.cap->CAPcapac);
+                    gamma = pc_scale(diffnu, ag1eff);
+                } else {
+                    int ibr = ref->dev.ind->INDbrEq;
+                    PACc nub = { tdu_re[ibr], tdu_im[ibr] };
+                    beta  = pc_scale(nub, -step->ag0 * ref->dev.ind->INDinduct);
+                    gamma = pc_scale(nub, -ag1eff);
+                }
+                {
+                    PACc abT_old = abarT[(size_t) e * nfreq + f];
+                    PACc new_abS = pc_sub(beta, pc_scale(abT_old, Cdiag[e]));
+                    PACc new_abT = pc_add(gamma, pc_scale(abT_old, -ag1eff));
+                    abarS[(size_t) e * nfreq + f] = new_abS;
+                    abarT[(size_t) e * nfreq + f] = new_abT;
+                }
+            }
+        }
+    }
+
+    memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+    ckt->CKTtime = save_time; ckt->CKTdelta = save_delta;
+    ckt->CKTag[0] = save_ag0; ckt->CKTag[1] = save_ag1;
+    have_ckt_saved = 0;
+
+    /* ---- every requested source's PXF: a plain dot product against
+     * Lambda(w), b^T Lambda (bilinear, NOT conjugated -- see docs/sens.md's
+     * own "Y instead of Y^T" red-proof note; the SAME convention). */
+    for (s = 0; s < nsrc_use; s++) {
+        const double *br = br_all + (size_t) s * (neq + 1);
+        const double *bi = bi_all + (size_t) s * (neq + 1);
+        for (f = 0; f < nfreq; f++) {
+            double sre = 0.0, sim = 0.0;
+            for (row = 1; row <= neq; row++) {
+                if (br[row] == 0.0 && bi[row] == 0.0) continue;
+                PACc L = Lambda[(size_t) f * (neq + 1) + row];
+                sre += br[row] * L.re - bi[row] * L.im;
+                sim += br[row] * L.im + bi[row] * L.re;
+            }
+            Y0_out[(size_t) s * nfreq + f].re = sre;
+            Y0_out[(size_t) s * nfreq + f].im = sim;
+        }
+    }
+
+    tfree(Mw); pac_traj_free();
+    err = PAC_ADJOINT_OK;
+
+ done:
+    if (have_ckt_saved) {
+        memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+        ckt->CKTtime = save_time; ckt->CKTdelta = save_delta;
+        ckt->CKTag[0] = save_ag0; ckt->CKTag[1] = save_ag1;
+    }
+    if (br_all) tfree(br_all);
+    if (bi_all) tfree(bi_all);
+    if (Lambda) tfree(Lambda);
+    if (abarS) tfree(abarS);
+    if (abarT) tfree(abarT);
+    if (tdu_re) tfree(tdu_re);
+    if (tdu_im) tfree(tdu_im);
+    if (scratch) tfree(scratch);
+    if (Cdiag) tfree(Cdiag);
+    if (save_rhsold) tfree(save_rhsold);
     return err;
 }
 
@@ -2110,53 +2752,100 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
             n == 1 ? "" : "s", job->PxOutNode->name, outrow,
             nsrc_use, nsrc_use == 1 ? "" : "s");
 
-    t0 = SPfrontEnd->IFseconds();
-    err = OK;
-    for (s = 0; s < nsrc_use; s++) {
-        double *br = TMALLOC(double, neq + 1);
-        double *bi = TMALLOC(double, neq + 1);
-        int one_out[1];
-        char nm[160];
+    /* card #504: adjoint=1 (explicit), adjoint=0 (explicit, force v1), or
+     * unset (auto: adjoint once nsrc_use is "above a small number" -- see
+     * PXF_ADJOINT_AUTO_THRESHOLD). Free-running (trig_idx>=0) always
+     * forces v1 -- pac_engine_run_adjoint() would refuse it anyway (see
+     * that function's header), checked here too just to skip the attempt
+     * and its own log line. */
+    {
+        int want_adjoint = job->PxfAdjointSet ? (job->PxfAdjoint != 0)
+                                               : (nsrc_use > PXF_ADJOINT_AUTO_THRESHOLD);
+        int adj_err = PAC_ADJOINT_REFUSED;
 
-        one_out[0] = outrow;
-        if (!br || !bi) {
-            if (br) tfree(br);
-            if (bi) tfree(bi);
-            err = 1;
-            break;
-        }
-        memset(br, 0, (size_t) (neq + 1) * sizeof(double));
-        memset(bi, 0, (size_t) (neq + 1) * sizeof(double));
+        if (trig_idx >= 0)
+            want_adjoint = 0;
 
-        if (pac_capture_source_b0(ckt, srclist, nsrc_total, use_idx[s], br, bi, neq)) {
-            fprintf(stderr, "PXF-TD: failed to isolate source '%s' -- "
-                    "skipped\n", (char *) srclist[use_idx[s]].name);
-            err = 1;
-        } else {
-            PACc *Ycol = TMALLOC(PACc, nfreq);
-            int e2 = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq,
-                                     one_out, 1, NULL, Ycol, fT, trig_idx);
-            if (e2) {
-                fprintf(stderr, "PXF-TD: engine failed for source '%s'\n",
-                        (char *) srclist[use_idx[s]].name);
-                err = 1;
+        t0 = SPfrontEnd->IFseconds();
+        err = OK;
+
+        if (want_adjoint) {
+            fprintf(stderr, "PXF-TD: adjoint=1 (%s) -- true backward/transposed engine, "
+                    "one sweep for all %d source%s\n",
+                    job->PxfAdjointSet ? "explicit" : "auto: source count > threshold",
+                    nsrc_use, nsrc_use == 1 ? "" : "s");
+            adj_err = pac_engine_run_adjoint(ckt, job, &map, x0, T, freqs, nfreq, outrow,
+                                              srclist, nsrc_total, use_idx, nsrc_use, Y0, trig_idx);
+            if (adj_err == PAC_ADJOINT_OK) {
+                for (s = 0; s < nsrc_use; s++) {
+                    char nm[160];
+                    (void) snprintf(nm, sizeof(nm), "pxf_%s", (char *) srclist[use_idx[s]].name);
+                    SPfrontEnd->IFnewUid(ckt, &nameList[s], NULL, nm, UID_OTHER, NULL);
+                }
+                t1 = SPfrontEnd->IFseconds();
+                fprintf(stderr, "PXF-TD: adjoint done, wall_time=%.3fs "
+                        "(%d source%s, %d frequenc%s -- one backward sweep, not %d)\n",
+                        t1 - t0, nsrc_use, nsrc_use == 1 ? "" : "s",
+                        nfreq, nfreq == 1 ? "y" : "ies", nsrc_use);
+            } else if (adj_err == PAC_ADJOINT_REFUSED) {
+                fprintf(stderr, "PXF-TD: adjoint engine REFUSED this circuit (saltation "
+                        "events seen, or a free-running orbit -- see pacshoot.c's "
+                        "pac_engine_run_adjoint() header) -- falling back to the v1 "
+                        "per-source engine.\n");
             } else {
-                int f;
-                for (f = 0; f < nfreq; f++)
-                    Y0[(size_t) s * nfreq + f] = Ycol[f];
+                fprintf(stderr, "PXF-TD: adjoint engine FAILED -- falling back to the v1 "
+                        "per-source engine.\n");
             }
-            tfree(Ycol);
         }
 
-        (void) snprintf(nm, sizeof(nm), "pxf_%s", (char *) srclist[use_idx[s]].name);
-        SPfrontEnd->IFnewUid(ckt, &nameList[s], NULL, nm, UID_OTHER, NULL);
+        if (!want_adjoint || adj_err != PAC_ADJOINT_OK) {
+            for (s = 0; s < nsrc_use; s++) {
+                double *br = TMALLOC(double, neq + 1);
+                double *bi = TMALLOC(double, neq + 1);
+                int one_out[1];
+                char nm[160];
 
-        tfree(br); tfree(bi);
+                one_out[0] = outrow;
+                if (!br || !bi) {
+                    if (br) tfree(br);
+                    if (bi) tfree(bi);
+                    err = 1;
+                    break;
+                }
+                memset(br, 0, (size_t) (neq + 1) * sizeof(double));
+                memset(bi, 0, (size_t) (neq + 1) * sizeof(double));
+
+                if (pac_capture_source_b0(ckt, srclist, nsrc_total, use_idx[s], br, bi, neq)) {
+                    fprintf(stderr, "PXF-TD: failed to isolate source '%s' -- "
+                            "skipped\n", (char *) srclist[use_idx[s]].name);
+                    err = 1;
+                } else {
+                    PACc *Ycol = TMALLOC(PACc, nfreq);
+                    int e2 = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq,
+                                             one_out, 1, NULL, Ycol, fT, trig_idx);
+                    if (e2) {
+                        fprintf(stderr, "PXF-TD: engine failed for source '%s'\n",
+                                (char *) srclist[use_idx[s]].name);
+                        err = 1;
+                    } else {
+                        int f;
+                        for (f = 0; f < nfreq; f++)
+                            Y0[(size_t) s * nfreq + f] = Ycol[f];
+                    }
+                    tfree(Ycol);
+                }
+
+                (void) snprintf(nm, sizeof(nm), "pxf_%s", (char *) srclist[use_idx[s]].name);
+                SPfrontEnd->IFnewUid(ckt, &nameList[s], NULL, nm, UID_OTHER, NULL);
+
+                tfree(br); tfree(bi);
+            }
+            t1 = SPfrontEnd->IFseconds();
+            fprintf(stderr, "PXF-TD: %s, wall_time=%.3fs (%.4fs/source)\n",
+                    err ? "completed with errors" : "done", t1 - t0,
+                    nsrc_use > 0 ? (t1 - t0) / nsrc_use : 0.0);
+        }
     }
-    t1 = SPfrontEnd->IFseconds();
-    fprintf(stderr, "PXF-TD: %s, wall_time=%.3fs (%.4fs/source)\n",
-            err ? "completed with errors" : "done", t1 - t0,
-            nsrc_use > 0 ? (t1 - t0) / nsrc_use : 0.0);
 
     SPfrontEnd->IFnewUid(ckt, &freqUid, NULL, "frequency", UID_OTHER, NULL);
     {

@@ -252,6 +252,27 @@ SMPsolve(SMPmatrix *Matrix, double RHS[], double Spare[])
     spSolve( Matrix->SPmatrix, RHS, RHS, NULL, NULL );
 }
 
+/*
+ * SMPtSolve() -- card #504: REAL transposed solve, A^T x = b. Passing
+ * NULL for iRHS/iSolution is safe here: spSolveTransposed's first act is
+ * `if (Matrix->Complex) { SolveComplexTransposedMatrix(...); return; }`
+ * (spsolve.c) -- the plain real path below that check never dereferences
+ * iRHS/iSolution, exactly mirroring SMPsolve's own `spSolve(..., NULL,
+ * NULL)` call just above. Matrix->Complex is off here for the same reason
+ * SMPsolve's real-only call already works in this codebase's PAC/adjoint
+ * per-step recursion (pacshoot.c never puts ckt->CKTmatrix into complex
+ * mode for its own solves -- see pac_capture_b0()'s header comment: the
+ * one place this file DOES call spSetComplex is superseded by the next
+ * DCtran() before any SMPsolve/SMPtSolve call happens).
+ */
+void
+SMPtSolve(SMPmatrix *Matrix, double RHS[], double Spare[])
+{
+    NG_IGNORE(Spare);
+
+    spSolveTransposed( Matrix->SPmatrix, RHS, RHS, NULL, NULL );
+}
+
 #ifdef CIDER
 void
 SMPsolveForCIDER (SMPmatrix *Matrix, double RHS[], double RHSsolution[])
