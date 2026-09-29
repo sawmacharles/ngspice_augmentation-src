@@ -332,6 +332,11 @@ pss_ripple_free(void)
  * (plus TRANplot, which DCtran() owns exclusively during this call) --
  * and restored before returning. The caller must have already written
  * the desired x0 into the device IC fields via pss_state_set_ic(). */
+/* card #498 2nd pass: exact event location/lagged sw is used by the FD-Jacobian
+ * path only; the analytic (saltation) Jacobian keeps the stock sw decision so
+ * baseline and trial runs stay mutually consistent. */
+static int g_pss_lag_enabled = 1;
+
 static int
 pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
 {
@@ -352,7 +357,7 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
     ckt->CKTtime      = 0.0;
     ckt->CKTmode     |= MODEUIC;   /* shooting always restarts from IC */
 
-    PSSeventLocateActive = (getenv("PSS_NO_EVENT_LOCATE") == NULL) && !PSSsensActive;
+    PSSeventLocateActive = (getenv("PSS_NO_EVENT_LOCATE") == NULL) && g_pss_lag_enabled && !PSSsensActive;
     PSSswLagActive = PSSeventLocateActive;
     err = DCtran(ckt, 1);   /* restart = 1: fresh run from t=0 */
     PSSeventLocateActive = 0;
@@ -3629,6 +3634,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * probe stages either). */
         use_analytic = (getenv("PSS_SHOOT_JACOBIAN") &&
                         strcmp(getenv("PSS_SHOOT_JACOBIAN"), "analytic") == 0);
+        g_pss_lag_enabled = !use_analytic;
 
         /* Tightened reltol for Newton's OWN (single-period) runs only --
          * same value (1e-5), same rationale as the second pass. THIRD-PASS
@@ -4204,6 +4210,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     ckt->CKTvoltTol = save_volttol;
     g_pss_loose_reltol = 0.0;   /* card #498: disable the fallback outside this call */
     g_pss_has_switch = 0;
+    g_pss_lag_enabled = 1;
     PSSbreakRecordActive = PSSbreakInstallActive = 0;
     pss_break_free();
     PSSsensActive = 0;
