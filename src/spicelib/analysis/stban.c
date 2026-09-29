@@ -1149,8 +1149,30 @@ STBan(CKTcircuit *ckt, int restart)
                 stb_sens_name(sg, namebuf, sizeof namebuf);
                 if (!stb_sens_selected(job, namebuf))
                     continue;
-                if (k >= nsens)
-                    break;  /* defensive: dry run and this walk must agree */
+                /* card #475 bugfix (found while smoke-testing this card):
+                 * sgen_next()'s isolation trick temporarily unlinks each
+                 * instance from its model's chain and only relinks it as
+                 * the generator advances PAST it -- an early `break` out
+                 * of this loop (as an earlier version of this code did,
+                 * once k>=nsens) abandons the walk before sgen_next() ever
+                 * reaches its own "done" state, so the LAST instance(s)
+                 * touched are left permanently unlinked from CKThead's
+                 * model->GENinstances chains: the very next CKTacLoad()
+                 * (next frequency point) then silently skips them, giving
+                 * WRONG (missing-stamp) T *and* garbage/zero sensitivities
+                 * from that point on. Never break here -- `continue`, the
+                 * same pattern cktsens.c's own per-frequency sgen walk
+                 * uses for its filtered-out parameters, always lets
+                 * sgen_next() run the walk to completion so it can restore
+                 * every temporarily-isolated instance. k can safely exceed
+                 * nsens-1 only if this walk finds MORE matches than the
+                 * dry run did (should not happen -- circuit structure is
+                 * unchanged in between -- but the store below is guarded
+                 * defensively anyway rather than indexing out of bounds). */
+                if (k >= nsens) {
+                    k++;
+                    continue;
+                }
 
                 SMPcClear(sensDeltaY);
                 for (i = 0; i <= size; i++) { sens_dI[i] = 0.0; sens_dII[i] = 0.0; }
