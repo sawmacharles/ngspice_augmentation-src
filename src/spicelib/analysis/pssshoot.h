@@ -72,6 +72,13 @@ extern int PSSbreakRecordActive;   /* dctran.c: record every accepted time */
 extern int PSSbreakInstallActive;  /* dctran.c: force the recorded times as breakpoints */
 
 void PSSbreakRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept() */
+/* card #505: exact step-sequence REPLAY (recorded time AND integration order
+ * per accepted step, no LTE control) for forced period runs; see
+ * pssshoot.c's PSSreplayStep() header comment. */
+extern int PSSreplayActive;      /* dctran.c: follow the recorded step/order sequence */
+extern int PSSlastStepOrder;     /* dctran.c: integration order of the step just accepted */
+void PSSreplayStep(CKTcircuit *ckt);   /* called once per fresh step, before the corrector */
+
 void PSSbreakInstallHook(CKTcircuit *ckt);
 extern int PSSeventLocateActive, PSSeventLocateRestart, PSSswLagActive, PSSeventLocateCrossed;   /* card #498 2nd pass: exact sw event location */
 int PSSeventLocate(CKTcircuit *ckt, double *newdelta);

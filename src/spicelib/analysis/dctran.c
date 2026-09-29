@@ -824,6 +824,11 @@ resume:
 #endif
 
 #endif  /* no XSPICE */
+#ifdef WITH_PSS
+    /* card #505: exact replay of a recorded step/order sequence */
+    if (PSSreplayActive)
+        PSSreplayStep(ckt);
+#endif
     for(i=5; i>=0; i--)
         ckt->CKTdeltaOld[i+1] = ckt->CKTdeltaOld[i];
     ckt->CKTdeltaOld[0] = ckt->CKTdelta;
@@ -871,6 +876,9 @@ resume:
 #endif /* PREDICTOR */
         save_mode = ckt->CKTmode;
         save_order = ckt->CKTorder;
+#ifdef WITH_PSS
+        PSSlastStepOrder = ckt->CKTorder;   /* card #505: order this step is integrated with */
+#endif
 #ifdef XSPICE
 
         /* Initialize temporary breakpoint to infinity */
@@ -990,6 +998,12 @@ resume:
             {
             /* Scan through all devices, estimate the truncation error,
                and reduce the time step, if necessary.*/
+#ifdef WITH_PSS
+            if (PSSreplayActive) {
+                newdelta = 2.0 * ckt->CKTdelta;   /* card #505: replay accepts every converged step */
+                error = 0;
+            } else
+#endif
             error = CKTtrunc(ckt,&newdelta);
             if(error) {
                 UPDATE_STATS(DOING_TRAN);
@@ -1016,7 +1030,11 @@ resume:
                 }
 #endif
                 /* don't raise the order for backward Euler */
-                if ((ckt->CKTorder == 1) && (ckt->CKTmaxOrder > 1)) {
+                if ((ckt->CKTorder == 1) && (ckt->CKTmaxOrder > 1)
+#ifdef WITH_PSS
+                    && !PSSreplayActive
+#endif
+                    ) {
                     newdelta = ckt->CKTdelta;
                     ckt->CKTorder = 2;
                     error = CKTtrunc(ckt, &newdelta);

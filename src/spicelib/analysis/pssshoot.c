@@ -388,10 +388,20 @@ static double *g_break_times = NULL;
 static unsigned char *g_break_is_event = NULL;   /* card #498 SECOND pass, see below */
 static int g_break_count = 0, g_break_cap = 0;
 
+/* card #505: full, UN-thinned record of the baseline run's accepted steps
+ * (time and the integration order used for the step) for exact replay --
+ * see PSSreplayStep(). */
+int PSSreplayActive = 0;
+int PSSlastStepOrder = 1;
+static double *g_rp_t = NULL;
+static unsigned char *g_rp_ord = NULL;
+static int g_rp_n = 0, g_rp_cap = 0, g_rp_idx = 0;
+
 static void
 pss_break_reset(void)
 {
     g_break_count = 0;
+    g_rp_n = 0;
 }
 
 static void
@@ -460,6 +470,20 @@ PSSbreakRecordStep(CKTcircuit *ckt)
     if (ckt->CKTtime <= 0.0)
         return;   /* t=0 is already a breakpoint; nothing to add */
 
+    /* card #505: full accepted-step record for exact replay */
+    if (g_rp_n >= g_rp_cap) {
+        int newcap = g_rp_cap ? g_rp_cap * 2 : 1024;
+        double *nt = TREALLOC(double, g_rp_t, newcap);
+        unsigned char *no = TREALLOC(unsigned char, g_rp_ord, newcap);
+        if (nt) g_rp_t = nt;
+        if (no) g_rp_ord = no;
+        if (nt && no) g_rp_cap = newcap;
+    }
+    if (g_rp_n < g_rp_cap) {
+        g_rp_t[g_rp_n] = ckt->CKTtime;
+        g_rp_ord[g_rp_n++] = (unsigned char) PSSlastStepOrder;
+    }
+
     is_event = PSSswLagActive ? PSSeventLocateCrossed : pss_break_step_is_switch_event(ckt);
 
     /* Thin clustered accepted times before recording them. Found on the
@@ -499,6 +523,38 @@ PSSbreakRecordStep(CKTcircuit *ckt)
     }
     g_break_is_event[g_break_count] = (unsigned char) is_event;
     g_break_times[g_break_count++] = ckt->CKTtime;
+}
+
+/* card #505: exact step-sequence replay. Called from dctran.c once per FRESH
+ * time step (not on a corrector-failure retry) while PSSreplayActive.
+ * Overrides the step the breakpoint/LTE logic just chose with the next
+ * recorded accepted time of the baseline run and the integration order that
+ * step used; dctran.c also skips CKTtrunc() (no LTE rejection, no order
+ * change) while replaying. Rationale (see docs/pss-pac.md "card #505"):
+ * the older "force every recorded time as a breakpoint" scheme restarts
+ * backward Euler at EVERY forced point and re-derives the sub-steps by LTE,
+ * so a forced run at the very same x0 does NOT reproduce the free baseline
+ * run (measured on R3d: 1e-4 relative in i(L1) at alpha->0), the
+ * baseline-vs-trial mismatch floors the Newton residual (3e-4) and the
+ * clustered/thinned sub-100 ps points are re-derived per run (map noise).
+ * Replay makes P(x0) on the recorded grid a smooth, exactly reproducible
+ * function of x0 (to the corrector tolerance). A corrector failure at a
+ * replayed step still falls back to dctran.c's own divide-by-8 sub-stepping;
+ * the next fresh step then again targets the recorded time. */
+void
+PSSreplayStep(CKTcircuit *ckt)
+{
+    double tgt;
+
+    while (g_rp_idx < g_rp_n &&
+           g_rp_t[g_rp_idx] - ckt->CKTtime <= ckt->CKTdelmin * 2.0)
+        g_rp_idx++;
+    if (g_rp_idx >= g_rp_n)
+        return;   /* past the record: leave the step as the stock logic chose it */
+    tgt = g_rp_t[g_rp_idx];
+    ckt->CKTdelta = tgt - ckt->CKTtime;
+    ckt->CKTorder = g_rp_ord[g_rp_idx];
+    ckt->CKTbreak = 0;
 }
 
 /* Called from dctran.c right after the restart-path breakpoint reset, when
@@ -808,6 +864,17 @@ estimate:
  * a run either DEFINES the grid for this Newton iteration (the baseline
  * P(x0) evaluation) or FOLLOWS a previously-defined one (every perturbed
  * and trial run in the same iteration). */
+/* card #505: replay mode. PSS_REPLAY=1 forces on, 0 off; default (unset) off
+ * until validated -- see pss_replay_enabled() callers. */
+static int g_replay_mode = -1;   /* -1 = read env */
+static int
+pss_replay_enabled(void)
+{
+    if (g_replay_mode < 0)
+        g_replay_mode = getenv("PSS_REPLAY") ? atoi(getenv("PSS_REPLAY")) : 0;
+    return g_replay_mode > 0;
+}
+
 static int
 pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
                    int record, int force)
@@ -820,12 +887,19 @@ pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
     if (record)
         pss_break_reset();
     PSSbreakRecordActive  = record;
-    PSSbreakInstallActive = force;
+    if (force && pss_replay_enabled() && g_rp_n > 0) {
+        PSSreplayActive = 1;
+        g_rp_idx = 0;
+        PSSbreakInstallActive = 0;
+    } else {
+        PSSbreakInstallActive = force;
+    }
 
     err = pss_run_period(ckt, T, jobname);
 
     PSSbreakRecordActive  = 0;
     PSSbreakInstallActive = 0;
+    PSSreplayActive = 0;
     return err;
 }
 
@@ -3093,6 +3167,11 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                         fprintf(stderr, "DEBUG %s iter=%d bt=%d alpha=%g "
                                 "newresidual=%.6e\n", stage_label, iter, bt,
                                 alpha, newresidual);
+                    if (getenv("PSS_SHOOT_DEBUG_TRIAL"))
+                        for (k = 0; k < n; k++)
+                            fprintf(stderr, "DEBUGTRIAL bt=%d k=%d %s xtrial-x0=%.4e x1trial=%.10g x1base=%.10g Ftrial=%.4e Fbase=%.4e\n",
+                                    bt, k, map->refs[slow_idx[k]].name, xtrial[k] - x0[k], x1trial[k], x1[k],
+                                    x1trial[k] - xtrial[k], F[k]);
                     if (newresidual < residual) {
                         accepted = 1;
                         break;
