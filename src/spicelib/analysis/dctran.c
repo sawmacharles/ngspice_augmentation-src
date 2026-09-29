@@ -821,6 +821,16 @@ resume:
         ckt->CKTstates[i+1] = ckt->CKTstates[i];
     }
     ckt->CKTstates[0] = temp;
+#ifdef WITH_PSS
+    if (PSSeventLocateRestart && PSSeventLocateActive) {
+        /* flat history after a located switch event (like the first step) */
+        if (ckt->CKTstate1 && ckt->CKTstate2 && ckt->CKTstate3) {
+            memcpy(ckt->CKTstate2, ckt->CKTstate1, (size_t) ckt->CKTnumStates * sizeof(double));
+            memcpy(ckt->CKTstate3, ckt->CKTstate1, (size_t) ckt->CKTnumStates * sizeof(double));
+        }
+        PSSeventLocateRestart = 0;
+    }
+#endif
 
 /* 600 */
     for (;;) {
@@ -949,6 +959,18 @@ resume:
 #endif
             }
             newdelta = ckt->CKTdelta;
+#ifdef WITH_PSS
+            /* card #498 second pass: exact switch-event location. */
+            int evloc = PSSeventLocateActive ? PSSeventLocate(ckt, &newdelta) : 0;
+            if (evloc == 1) {
+                ckt->CKTtime = ckt->CKTtime - ckt->CKTdelta;
+                ckt->CKTstat->STATrejected ++;
+                ckt->CKTdelta = newdelta;
+                ckt->CKTbreak = 0;
+            }
+            else
+#endif
+            {
             /* Scan through all devices, estimate the truncation error,
                and reduce the time step, if necessary.*/
             error = CKTtrunc(ckt,&newdelta);
@@ -1049,6 +1071,7 @@ resume:
                 (void)printf(
                     "delta set to truncation error result: point rejected\n");
 #endif
+            }
             }
         }
         /* Set the new delta to delmin (minimum delta allowed). However:

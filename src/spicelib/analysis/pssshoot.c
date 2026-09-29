@@ -352,7 +352,11 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
     ckt->CKTtime      = 0.0;
     ckt->CKTmode     |= MODEUIC;   /* shooting always restarts from IC */
 
+    PSSeventLocateActive = (getenv("PSS_NO_EVENT_LOCATE") == NULL) && !PSSsensActive;
+    PSSswLagActive = PSSeventLocateActive;
     err = DCtran(ckt, 1);   /* restart = 1: fresh run from t=0 */
+    PSSeventLocateActive = 0;
+    PSSswLagActive = 0;
 
     /* Defensive: some DCtran() error paths return without closing the
      * plot they opened; do not leak it across the (many) period runs one
@@ -375,6 +379,7 @@ int PSSbreakRecordActive  = 0;
 int PSSbreakInstallActive = 0;
 
 static double *g_break_times = NULL;
+static unsigned char *g_break_is_event = NULL;   /* card #498 SECOND pass, see below */
 static int g_break_count = 0, g_break_cap = 0;
 
 static void
@@ -387,16 +392,69 @@ static void
 pss_break_free(void)
 {
     if (g_break_times) tfree(g_break_times);
+    if (g_break_is_event) tfree(g_break_is_event);
     g_break_times = NULL;
+    g_break_is_event = NULL;
     g_break_count = g_break_cap = 0;
+}
+
+/* card #498 SECOND pass (root cause of the plateau the first pass's
+ * report left unresolved -- see docs/pss-pac.md's "card #498" section for
+ * the full derivation). Does the accepted step just recorded (CKTstate0,
+ * this step, vs CKTstate1, the previous accepted step) correspond to a
+ * REAL, conduction-changing state flip on any native `sw` instance -- the
+ * SAME on/off classification PSSsaltFindEvents()'s own pss_salt_is_on()
+ * uses (a REALLY_ON<->HYST_ON or REALLY_OFF<->HYST_OFF move, staying on
+ * the same side of the threshold, is NOT a real event; only an ON<->OFF
+ * crossing is). Duplicated here rather than calling pss_salt_is_on()/
+ * PSSsaltFindEvents() directly: pss_salt_is_on() is defined later in this
+ * file (function-pointer-free forward use would need a prototype either
+ * way) and PSSsaltFindEvents() itself carries PSSsaltActive/restart-
+ * filter/h_dot-history state that has nothing to do with this,
+ * unconditional, grid-consistency use -- this function only asks "did a
+ * switch instance's own conduction state change on this accepted step",
+ * nothing else. See PSSbreakInstallHook()'s own comment below for WHY
+ * this accepted time must then NOT be forced onto every other period run
+ * in the same Newton iteration. Self-gating: a deck with no native `sw`
+ * instance (CKTtypelook("Switch")<0, or no instance ever flips) always
+ * returns 0 here, making this an exact no-op for every existing switch-
+ * free fixture -- no separate has-switch gate needed for this part of
+ * the card #498 fix (unlike the first pass's retry/shrink fallbacks,
+ * which needed pss_ckt_has_switch() because THEY could rescue a state
+ * that was never going to converge; this one only withholds a forced
+ * breakpoint, which is a strictly narrower change). */
+static int
+pss_break_step_is_switch_event(CKTcircuit *ckt)
+{
+    int swtype;
+    SWmodel *model;
+    SWinstance *here;
+
+    swtype = CKTtypelook("Switch");
+    if (swtype < 0)
+        return 0;
+    for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+        for (here = SWinstances(model); here; here = SWnextInstance(here)) {
+            double now  = ckt->CKTstate0[here->SWswitchstate];
+            double prev = ckt->CKTstate1[here->SWswitchstate];
+            int now_on  = (now  == 1.0 /* REALLY_ON */ || now  == 3.0 /* HYST_ON */);
+            int prev_on = (prev == 1.0 /* REALLY_ON */ || prev == 3.0 /* HYST_ON */);
+            if (now_on != prev_on)
+                return 1;
+        }
+    return 0;
 }
 
 /* Called from dctran.c right after CKTaccept() when PSSbreakRecordActive. */
 void
 PSSbreakRecordStep(CKTcircuit *ckt)
 {
+    int is_event;
+
     if (ckt->CKTtime <= 0.0)
         return;   /* t=0 is already a breakpoint; nothing to add */
+
+    is_event = pss_break_step_is_switch_event(ckt) || PSSeventLocateCrossed;
 
     /* Thin clustered accepted times before recording them. Found on the
      * R3 fixture: forcing EVERY accepted time verbatim (including a long
@@ -412,21 +470,28 @@ PSSbreakRecordStep(CKTcircuit *ckt)
      * ~1000x finer than the nominal per-period sampling) while leaving
      * the solver its own adaptive freedom within a cluster narrower than
      * that -- which is exactly the timescale too fine to matter for a
-     * Newton monodromy estimate anyway. */
-    if (g_break_count > 0 &&
+     * Newton monodromy estimate anyway. card #498 SECOND pass: a real
+     * switch-event point is never thinned away by this clustering check
+     * even if it would otherwise qualify -- it is recorded (flagged, see
+     * below) unconditionally, so pss_break_step_is_switch_event() always
+     * gets a chance to see the exact accepted point that flipped. */
+    if (!is_event && g_break_count > 0 &&
         (ckt->CKTtime - g_break_times[g_break_count - 1]) < ckt->CKTmaxStep * 1e-2)
         return;
 
     if (g_break_count >= g_break_cap) {
         int newcap = g_break_cap ? g_break_cap * 2 : 256;
         double *nt = TREALLOC(double, g_break_times, newcap);
-        if (!nt)
+        unsigned char *ne = TREALLOC(unsigned char, g_break_is_event, newcap);
+        if (!nt || !ne)
             return;   /* out of memory: degrade to unforced steps past here,
                           rather than crash -- the perturbed run may then
                           reintroduce some noise, but never a wrong answer */
         g_break_times = nt;
+        g_break_is_event = ne;
         g_break_cap = newcap;
     }
+    g_break_is_event[g_break_count] = (unsigned char) is_event;
     g_break_times[g_break_count++] = ckt->CKTtime;
 }
 
@@ -469,16 +534,44 @@ PSSbreakInstallHook(CKTcircuit *ckt)
      * by then (>= the floor), so the very first step gets the SAME
      * 0.1x-of-next-breakpoint cut every other forced restart in this run
      * already gets -- no longer two orders of magnitude tighter -- while
-     * every OTHER forced time (mid-period, including every switch-edge
-     * cluster SUSPECTED CAUSE 2 exists to pin down) is untouched. Applied
-     * only to the LEADING run of skipped times (once a time clears the
-     * floor, every later one is forced normally, so a genuinely early
-     * switch edge -- not expected in this deck family, but not assumed
-     * impossible -- is not silently dropped). PSS_SHOOT_NO_EARLY_SKIP
-     * (debug env var, no effect unless set) disables this for isolation,
-     * same pattern as the file's other tunables. */
+     * every OTHER forced time is untouched. Applied only to the LEADING
+     * run of skipped times (once a time clears the floor, every later one
+     * is forced normally, so a genuinely early switch edge -- not
+     * expected in this deck family, but not assumed impossible -- is not
+     * silently dropped). PSS_SHOOT_NO_EARLY_SKIP (debug env var, no
+     * effect unless set) disables this for isolation, same pattern as
+     * the file's other tunables.
+     *
+     * card #498 SECOND pass: a genuine switch-edge crossing (g_break_
+     * is_event[i], see pss_break_step_is_switch_event()'s own header
+     * comment) is now NEVER forced here, on ANY run, regardless of the
+     * early-skip floor above -- root cause of the plateau the first
+     * pass's fallback could only paper over (see docs/pss-pac.md's
+     * "card #498" section for the derivation): forcing a perturbed FD
+     * column's period run to land at exactly the BASELINE's own switch-
+     * crossing time silently discards d(t_event)/d(x0) -- precisely the
+     * state-dependent-event sensitivity a comparator-driven switch's
+     * monodromy needs (the classical "saltation" contribution) -- and
+     * for a large-enough perturbation can additionally force the
+     * corrector to try to land at a time the perturbed trajectory's OWN
+     * switch decision has already made physically impossible (the
+     * switch already flipped, or hasn't yet), producing exactly the
+     * "Timestep too small ... trouble with swmod-instance" collapse the
+     * first pass's report characterises. Leaving this one instant
+     * unforced lets each period run (baseline AND every +h/-h column)
+     * locate ITS OWN crossing via its own LTE/hysteresis logic --
+     * exactly what a plain, unforced `.tran` of the same circuit already
+     * does cleanly (see the first pass's report) -- while every
+     * SURROUNDING smooth-region time is still forced as before, so the
+     * cross-run grid-consistency benefit SUSPECTED CAUSE 2 was built for
+     * is kept everywhere except the one instant it was never valid for.
+     * Self-gating (see pss_break_step_is_switch_event()): a switch-free
+     * deck never sets g_break_is_event[i], so this is an exact no-op for
+     * every existing no-`sw` fixture. */
+
     double early_floor = ckt->CKTmaxStep * 0.1;
     int skipping = (getenv("PSS_SHOOT_NO_EARLY_SKIP") == NULL);
+    int skipped_event = 0;
 
     if (getenv("PSS_SHOOT_DEBUG_BREAK")) {
         double mingap = 1e300; int mingap_i = -1;
@@ -503,6 +596,11 @@ PSSbreakInstallHook(CKTcircuit *ckt)
     }
     for (i = 0; i < g_break_count; i++) {
         double tt = g_break_times[i];
+        if (g_break_is_event && g_break_is_event[i]) {
+            skipped_event++;
+            continue;   /* card #498 SECOND pass: never force a real switch
+                           crossing -- see this function's header comment */
+        }
         if (skipping && tt < early_floor) {
             skipped++;
             continue;
@@ -513,7 +611,197 @@ PSSbreakInstallHook(CKTcircuit *ckt)
     }
     if (getenv("PSS_SHOOT_DEBUG_BREAK"))
         fprintf(stderr, "DEBUGBREAK: skipped %d leading early breakpoint(s) "
-                "below %.6g\n", skipped, early_floor);
+                "below %.6g, %d switch-event breakpoint(s) (card #498 "
+                "SECOND pass, never forced)\n", skipped, early_floor,
+                skipped_event);
+}
+
+/* ------------------------------------------------------------------ */
+/* card #498 SECOND pass: exact switch-event location inside a period run.
+ *
+ * ngspice's native `sw` flips its conduction state at whatever accepted
+ * time point first sees the control voltage past the threshold, so the
+ * switching instant is quantised to the adaptive time grid (error up to
+ * one step, ~1 % of the period at 200 points). For a comparator that is
+ * driven by a state (a closed PWM loop), the period map x0 -> x(T) is then
+ * piecewise constant in the event time: a finite-difference monodromy
+ * column sees either 0 or a whole-step jump of d(t_event)/d(x0), so the
+ * Newton residual plateaus at a Points-dependent floor (1.8e-3 at 200,
+ * 9e-4 at 2000). Fix: when a converged trial step flips a switch, reject
+ * it and re-run the step to the interpolated crossing time (regula falsi
+ * on the control voltage, bracket kept across trials); the flip is
+ * accepted only when the control overshoot corresponds to <= ttol seconds.
+ * Then the event time is a smooth function of x0 to ~ttol and FD columns
+ * with h >> ttol*slope are consistent.
+ * Returns 1 = reject this step and retry with *newdelta; 0 = carry on. */
+int PSSeventLocateActive = 0;
+int PSSeventLocateRestart = 0;   /* set when the step just accepted ended at a located crossing */
+int PSSeventLocateCrossed = 0;   /* the accepted step ended at a located crossing (event breakpoint) */
+long PSSeventLocateTrials = 0, PSSeventLocateEvents = 0;
+
+static int g_ev_n = 0;
+static double *g_ev_clo = NULL, *g_ev_chi = NULL;
+static double g_ev_tacc = -1.0, g_ev_tlo = 0.0, g_ev_thi = 0.0;
+static double g_ev_flo = 1.0, g_ev_fhi = 1.0;   /* Illinois weights */
+static int g_ev_have_hi = 0, g_ev_iter = 0, g_ev_last_side = 0;
+static double g_ev_req = -1.0;
+
+/* With PSSswLagActive the switch states are constant over a step, so the
+ * control value c_i(t) is smooth. A step "crosses" for instance i when, with
+ * respect to its (frozen) state, the control has moved beyond the flip
+ * threshold at the trial time but was not beyond it at the last accepted
+ * point. Return 1 = reject, retry with *newdelta ending at the estimated
+ * crossing (just past it); 0 = accept normally. */
+int
+PSSeventLocate(CKTcircuit *ckt, double *newdelta)
+{
+    int swtype = CKTtypelook("Switch");
+    SWmodel *model;
+    SWinstance *here;
+    int n = 0, i, any_cross = 0, accept = 1;
+    double t = ckt->CKTtime, tacc = ckt->CKTtime - ckt->CKTdelta;
+    double ttol, tbest = 1e300;
+    static double ttol_env = -1.0;
+
+    PSSeventLocateRestart = 0;
+    PSSeventLocateCrossed = 0;
+    if (swtype < 0 || !PSSswLagActive)
+        return 0;
+    if (ttol_env < 0.0)
+        ttol_env = getenv("PSS_EVENT_TTOL") ? atof(getenv("PSS_EVENT_TTOL")) : 1e-16;
+    ttol = ttol_env;
+
+    for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+        for (here = SWinstances(model); here; here = SWnextInstance(here))
+            n++;
+    if (n == 0)
+        return 0;
+    if (n != g_ev_n) {
+        g_ev_clo = TREALLOC(double, g_ev_clo, n);
+        g_ev_chi = TREALLOC(double, g_ev_chi, n);
+        g_ev_n = n;
+        g_ev_tacc = -1.0;
+    }
+    if (tacc != g_ev_tacc) {   /* new accepted point: fresh bracket */
+        g_ev_tacc = tacc;
+        g_ev_tlo = tacc;
+        g_ev_have_hi = 0;
+        g_ev_iter = 0;
+        g_ev_flo = g_ev_fhi = 1.0;
+        g_ev_last_side = 0;
+        i = 0;
+        for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+            for (here = SWinstances(model); here; here = SWnextInstance(here))
+                g_ev_clo[i++] = ckt->CKTstate1[here->SWctrlvalue];
+    }
+    PSSeventLocateTrials++;
+    {   /* did a switch actually change conduction state in this step? then
+         * the next step restarts with a flat history (see dctran.c) */
+        for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+            for (here = SWinstances(model); here; here = SWnextInstance(here)) {
+                double a = ckt->CKTstate0[here->SWswitchstate], b = ckt->CKTstate1[here->SWswitchstate];
+                if (((a == 1.0 || a == 3.0)) != ((b == 1.0 || b == 3.0)))
+                    PSSeventLocateRestart = 1;
+            }
+    }
+
+    /* classify this trial */
+    {
+        double w = t - g_ev_tlo;
+        i = 0;
+        for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+            for (here = SWinstances(model); here; here = SWnextInstance(here)) {
+                double st = ckt->CKTstate0[here->SWswitchstate];
+                int on = (st == 1.0 || st == 3.0);
+                double c = ckt->CKTstate0[here->SWctrlvalue];
+                double cacc = ckt->CKTstate1[here->SWctrlvalue];
+                double vt = model->SWvThreshold, vh = model->SWvHysteresis;
+                double thr = on ? vt - vh : vt + vh;
+                double dir = on ? -1.0 : 1.0;
+                g_ev_chi[i] = c;
+                if (vh > 0.0 && dir * (cacc - thr) <= 0.0 && dir * (c - thr) > 0.0) {
+                    double slope = (w > 0.0) ? fabs((c - g_ev_clo[i]) / w) : 0.0;
+                    double over = dir * (c - thr);
+                    any_cross = 1;
+                    if (over > ttol * slope + 1e-15 * (fabs(thr) + 1e-3))
+                        accept = 0;
+                }
+                i++;
+            }
+    }
+    if (getenv("PSS_EVENT_DEBUG")) {
+        char sb[256]; int sl = 0;
+        for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+            for (here = SWinstances(model); here; here = SWnextInstance(here))
+                sl += snprintf(sb + sl, sizeof sb - sl - 1, " %s[st=%g c=%.6g]", here->SWname, ckt->CKTstate0[here->SWswitchstate], ckt->CKTstate0[here->SWctrlvalue]);
+        fprintf(stderr, "EVT trial t=%.17g tacc=%.17g tlo=%.17g have_hi=%d thi=%.17g cross=%d acc=%d ord=%d%s\n", t, tacc, g_ev_tlo, g_ev_have_hi, g_ev_thi, any_cross, accept, ckt->CKTorder, sb);
+    }
+
+    if (!any_cross) {
+        if (t > g_ev_tlo) {
+            i = 0;
+            for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+                for (here = SWinstances(model); here; here = SWnextInstance(here))
+                    g_ev_clo[i++] = ckt->CKTstate0[here->SWctrlvalue];
+            if (g_ev_last_side == 0 && g_ev_have_hi) g_ev_fhi *= 0.5; else g_ev_flo = 1.0;
+            g_ev_last_side = 0;
+            g_ev_tlo = t;
+        }
+        if (!g_ev_have_hi)
+            return 0;          /* ordinary smooth step */
+        if (fabs(t - g_ev_req) > 1e-12 * fabs(t)) {
+            g_ev_have_hi = 0;  /* LTE shortened the step on its own: ordinary step */
+            return 0;
+        }
+        goto estimate;         /* bracketed and still short of the crossing: refine */
+    }
+
+    if (g_ev_last_side == 1 && g_ev_have_hi) g_ev_flo *= 0.5; else g_ev_fhi = 1.0;
+    g_ev_last_side = 1;
+    g_ev_thi = t;
+    g_ev_have_hi = 1;
+    if (t - g_ev_tlo < 4.0 * ttol)
+        accept = 1;
+    if (accept || g_ev_iter >= 80) {
+        if (accept) PSSeventLocateEvents++;
+        PSSeventLocateCrossed = 1;
+        return 0;
+    }
+
+estimate:
+    {
+        double w = g_ev_thi - g_ev_tlo;
+        i = 0;
+        for (model = (SWmodel *) ckt->CKThead[swtype]; model; model = SWnextModel(model))
+            for (here = SWinstances(model); here; here = SWnextInstance(here)) {
+                double chi = g_ev_chi[i], clo = g_ev_clo[i];
+                double vt = model->SWvThreshold, vh = model->SWvHysteresis;
+                double st = ckt->CKTstate0[here->SWswitchstate];
+                int on = (st == 1.0 || st == 3.0);
+                double thr = on ? vt - vh : vt + vh;
+                double dir = on ? -1.0 : 1.0;
+                if (vh > 0.0 && dir * (clo - thr) <= 0.0 && dir * (chi - thr) > 0.0) {
+                    double flo = (clo - thr) * g_ev_flo, fhi = (chi - thr) * g_ev_fhi;
+                    double aim = 0.5 * ttol * fabs((chi - clo) / w) * dir;
+                    if (fhi != flo) {
+                        double ti = g_ev_tlo + (w * (-flo + aim)) / (fhi - flo);
+                        if (ti < tbest && ti > g_ev_tlo && ti < g_ev_thi)
+                            tbest = ti;
+                    }
+                }
+                i++;
+            }
+    }
+    g_ev_iter++;
+    if (tbest > 1e299)
+        tbest = 0.5 * (g_ev_tlo + g_ev_thi);   /* bisection fallback */
+    if (tbest - tacc < 2.0 * ckt->CKTdelmin || g_ev_thi - tbest < 1e-15 * g_ev_thi) {
+        PSSeventLocateCrossed = 1;
+        return 0;     /* cannot refine further: accept */
+    }
+    *newdelta = tbest - tacc;
+    g_ev_req = tbest;
+    return 1;
 }
 
 /* Wraps pss_run_period(): record=1 captures this run's own accepted grid
@@ -598,6 +886,11 @@ pss_ckt_has_switch(CKTcircuit *ckt)
  * PSSshootFreerun(), and every switch-free driven deck) is completely
  * unaffected. */
 static double g_pss_loose_reltol = 0.0;
+static int g_dbg_jf = -1; static double g_dbg_h = 0.0;
+/* card #498 2nd pass: set by pss_run_period_ex_safe() when the LAST run it
+ * made needed the looser-reltol retry; a converged verdict must never rest
+ * on such a run (the deck's own tolerance is the only honest one). */
+static int g_pss_last_used_loose = 0;
 
 /* card #498: companion gate for pss_fd_perturb_side()'s own shrinking-h
  * retry -- see pss_ckt_has_switch()'s header comment for why this needs
@@ -634,16 +927,18 @@ pss_run_period_ex_safe(CKTcircuit *ckt, double T, const char *jobname,
 {
     int err = pss_run_period_ex(ckt, T, jobname, record, force);
 
+    g_pss_last_used_loose = 0;
     if (err && g_pss_loose_reltol > 0.0 && ckt->CKTreltol < g_pss_loose_reltol) {
         double saved_reltol = ckt->CKTreltol;
         if (getenv("PSS_SHOOT_DEBUG"))
             fprintf(stderr, "DEBUG %s failed at reltol=%.3g (ngspice error "
                     "%d); retrying once at the deck's own reltol=%.3g "
-                    "(card #498 guarded fallback) before giving up.\n",
-                    jobname, saved_reltol, err, g_pss_loose_reltol);
+                    "(card #498 guarded fallback) before giving up. [col jf=%d h=%.6g]\n",
+                    jobname, saved_reltol, err, g_pss_loose_reltol, g_dbg_jf, g_dbg_h);
         ckt->CKTreltol = g_pss_loose_reltol;
         err = pss_run_period_ex(ckt, T, jobname, record, force);
         ckt->CKTreltol = saved_reltol;
+        g_pss_last_used_loose = (err == 0);
     }
     return err;
 }
@@ -696,6 +991,7 @@ pss_fd_perturb_side(CKTcircuit *ckt, PSSstateMap *map, double T,
         int i;
         for (i = 0; i < n_full; i++) icbuf[i] = x_full[i];
         icbuf[jf] = x0j + sign_h * h;
+        g_dbg_jf = jf; g_dbg_h = sign_h * h;
         pss_state_set_ic(map, icbuf);
         err = pss_run_period_ex_safe(ckt, T, jobname, 0, 1);
         if (!err) {
@@ -2205,6 +2501,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     double *icbuf = NULL, *outbuf = NULL, *ripple_full = NULL, *Phi_full = NULL;
     double *plus_raw = NULL;   /* card #498: see the FD perturbation loop below */
     int *is_slow = NULL;
+    int baseline_loose = 0;
     int have_baseline = 0;   /* do x0/x1/F already hold a valid, just-run point? */
     int recompute = 1;       /* does THIS iteration's Jacobian need a fresh FD sweep? */
     int since_recompute = 0;
@@ -2333,6 +2630,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
             }
             PSSrippleRecordActive = 0;
             pss_ripple_get(map, ripple_full);
+            baseline_loose = g_pss_last_used_loose;
 
             if (err) {
                 fprintf(stderr, "PSS-SHOOT: %s period integration did not "
@@ -2410,7 +2708,11 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                         scale[k], fabs(F[k]) / scale[k]);
         }
 
-        if (residual <= tol) {
+        if (residual <= tol && baseline_loose) {
+            fprintf(stderr, "PSS-SHOOT: %s iter=%d residual %.3e is below tol, but this baseline "
+                    "period run only completed at the looser retry reltol; not declaring convergence.\n", stage_label, iter, residual);
+        }
+        if (residual <= tol && !baseline_loose) {
             /* THIRD-PASS GUARD, added after this pass's OWN testing found
              * it necessary: reject a "converged" point where EVERY
              * Newton-unknown state is still at (or under) the

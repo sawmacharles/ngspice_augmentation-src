@@ -72,7 +72,9 @@ extern int PSSbreakRecordActive;   /* dctran.c: record every accepted time */
 extern int PSSbreakInstallActive;  /* dctran.c: force the recorded times as breakpoints */
 
 void PSSbreakRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept() */
-void PSSbreakInstallHook(CKTcircuit *ckt);  /* called right after the restart-path breaks reset */
+void PSSbreakInstallHook(CKTcircuit *ckt);
+extern int PSSeventLocateActive, PSSeventLocateRestart, PSSswLagActive, PSSeventLocateCrossed;   /* card #498 2nd pass: exact sw event location */
+int PSSeventLocate(CKTcircuit *ckt, double *newdelta);  /* called right after the restart-path breaks reset */
 
 /* ---- card #458 FOURTH pass (plan T4.2): analytic (discretise-then-
  * linearise) sensitivity monodromy, replacing finite differences. See

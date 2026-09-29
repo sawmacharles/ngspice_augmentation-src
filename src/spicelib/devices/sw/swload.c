@@ -13,6 +13,16 @@ Modified: 2001 Jon Engelbert
 #include "ngspice/suffix.h"
 
 
+/* card #498 second pass: "lagged" switch decision for the shooting-PSS
+ * period runs (set/cleared by pssshoot.c; 0 = stock behaviour). When set,
+ * during a transient step a switch changes conduction state only if the
+ * control value at the previous ACCEPTED point (CKTstate1[SWctrlvalue]) was
+ * already beyond the threshold -- so the state is constant over one step's
+ * Newton iterations and the control voltage over the step is a smooth
+ * function of time, which is what lets pssshoot.c's exact event location
+ * (PSSeventLocate) find the crossing time by root finding. */
+int PSSswLagActive = 0;
+
 int
 SWload(GENmodel *inModel, CKTcircuit *ckt)
 {
@@ -39,6 +49,28 @@ SWload(GENmodel *inModel, CKTcircuit *ckt)
                 ckt->CKTrhsOld[here->SWnegCntrlNode];
 
             /* decide the state of the switch */
+
+            if (PSSswLagActive && model->SWvHysteresis > 0.0 &&
+                (ckt->CKTmode & MODETRAN) &&
+                (ckt->CKTmode & (MODEINITFLOAT | MODEINITPRED | MODEINITTRAN))) {
+                double c_prev = ckt->CKTstate1[here->SWctrlvalue];
+                if (c_prev > model->SWvThreshold + model->SWvHysteresis)
+                    current_state = REALLY_ON;
+                else if (c_prev < model->SWvThreshold - model->SWvHysteresis)
+                    current_state = REALLY_OFF;
+                else
+                    current_state = previous_state;
+                ckt->CKTstate0[here->SWswitchstate] = current_state;
+                ckt->CKTstate0[here->SWctrlvalue] = v_ctrl;
+                g_now = (current_state == REALLY_ON || current_state == HYST_ON)
+                        ? model->SWonConduct : model->SWoffConduct;
+                here->SWcond = g_now;
+                *(here->SWposPosPtr) += g_now;
+                *(here->SWposNegPtr) -= g_now;
+                *(here->SWnegPosPtr) -= g_now;
+                *(here->SWnegNegPtr) += g_now;
+                continue;
+            }
 
             if (ckt->CKTmode & (MODEINITFIX | MODEINITJCT)) {
 
