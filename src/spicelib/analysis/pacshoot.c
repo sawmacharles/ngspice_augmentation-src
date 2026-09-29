@@ -725,6 +725,15 @@ PSSpacRecordStep(CKTcircuit *ckt)
         }
     }
 
+    {
+    /* card #494 (plan T6.1): locate any sw event at THIS accepted step
+     * once, reuse for every column m below -- see pssshoot.c's
+     * PSSsaltFindEvents()/PSSsensRecordStep() for the shared derivation
+     * (real there, complex here: same formula, coeff is now a PACc). */
+    PSSsaltEvent salt_ev[PSS_SALT_MAX_EVENTS];
+    int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
+    int i_salt;
+
     for (m = 0; m < M; m++) {
         memset(g_pac_rhs_re, 0, (size_t) (neq + 1) * sizeof(double));
         memset(g_pac_rhs_im, 0, (size_t) (neq + 1) * sizeof(double));
@@ -766,6 +775,26 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
 
+        /* card #494: saltation correction, one term per event found at
+         * this accepted step. coeff uses g_pac_Cprev (THIS column m's
+         * propagated response from the END of the PREVIOUS accepted step
+         * -- delta_x(t_e-)/y(t_e-), exactly what Fang's formula calls
+         * for), NOT g_pac_rhs_re/im (this step's still-being-built
+         * result). dG*v_switch is real, so the injected RHS is just
+         * coeff scaled by that real number. */
+        for (i_salt = 0; i_salt < n_salt; i_salt++) {
+            PSSsaltEvent *e = &salt_ev[i_salt];
+            PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m);
+            PACc Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
+            PACc diff = pc_sub(Sp, Sn);
+            PACc coeff = pc_scale(diff, 1.0 / e->h_dot);
+            /* ag0 converts Coulombs to companion-model Amps -- see
+             * pssshoot.c's PSSsensRecordStep()'s identical comment. */
+            PACc dI = pc_scale(coeff, ag0 * e->dG * e->v_switch);
+            if (e->posNode > 0) { g_pac_rhs_re[e->posNode] -= dI.re; g_pac_rhs_im[e->posNode] -= dI.im; }
+            if (e->negNode > 0) { g_pac_rhs_re[e->negNode] += dI.re; g_pac_rhs_im[e->negNode] += dI.im; }
+        }
+
         SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
         SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
         for (row = 1; row <= neq; row++) {
@@ -773,6 +802,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
             pac_set(g_pac_Cnew, row, M, m, v);
         }
     }
+    }   /* card #494: closes the salt_ev/n_salt scope opened above */
 
     for (d = 0; d < n; d++) {
         PACstateRef *ref = &g_pac_map->refs[d];

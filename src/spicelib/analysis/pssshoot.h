@@ -105,4 +105,38 @@ extern int PSStrigActive;   /* dctran.c: watch the trigger node for a crossing *
 
 void PSStrigRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), same site as the hooks above */
 
+/* ---- card #494 (plan T6.1): saltation (event) correction for ideal `sw`
+ * voltage-controlled switches, shared by pssshoot.c's PSSsensRecordStep()
+ * (real monodromy Phi) and pacshoot.c's PSSpacRecordStep() (complex forced
+ * response). See pssshoot.c's pss_salt_find_events() header comment for
+ * the derivation (Fang's saltation matrix, S = I + (f+-f-) grad(h)^T /
+ * (grad(h).f- + dh/dt), specialised to ngspice's per-step companion-model
+ * recursion: the correction becomes one extra current-injection RHS term
+ * at the switch's own power terminals, solved through the SAME per-step
+ * factorization every other history term already uses -- no state-space
+ * f+/f- vector needed explicitly). One event per SW instance that changed
+ * state (CKTstate0[SWswitchstate] != CKTstate1[SWswitchstate]) at the
+ * CURRENT accepted step. ---- */
+
+typedef struct {
+    int posNode, negNode;       /* switch power terminals (the RHS rows to inject at) */
+    int posCntrl, negCntrl;     /* switch control terminals (h = v(posCntrl)-v(negCntrl)-vt) */
+    double v_switch;            /* V(posNode)-V(negNode) at the accepted point */
+    double dG;                  /* conductance jump, g_after - g_before */
+    double h_dot;               /* d(v_ctrl)/dt across this step (finite difference) */
+    const char *name;           /* instance name, for diagnostics */
+} PSSsaltEvent;
+
+#define PSS_SALT_MAX_EVENTS 8
+
+extern int PSSsaltActive;   /* env-var gated (PSS_SALTATION, default on); see pssshoot.c */
+
+/* Fills ev[0..return-1] (return <= PSS_SALT_MAX_EVENTS) with every sw/csw
+ * event found at the circuit's CURRENT accepted step (ckt->CKTtime,
+ * ckt->CKTdelta as the just-taken step size). Returns 0 if none (the
+ * overwhelmingly common case -- every step of every deck with no ideal
+ * switch, or whose switches didn't change state this step). Cheap unless
+ * PSSsaltActive. */
+int PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max);
+
 #endif

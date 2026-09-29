@@ -86,6 +86,7 @@ What this does NOT do (see the card #458 report for the full list):
 
 #include "cap/capdefs.h"
 #include "ind/inddefs.h"
+#include "sw/swdefs.h"   /* card #494 (plan T6.1): saltation for ideal `sw` events */
 
 #include <math.h>
 #include <string.h>
@@ -676,6 +677,159 @@ pss_solve_dense(double *A, double *b, int n, double *x)
  *   plain non-convergence, the same honest "did not confirm a steady
  *   state" signal a failed FD sweep already produces. */
 
+/* card #494 (plan T6.1): saltation (event) correction for ideal `sw`
+ * voltage-controlled switches. See research/simplis-pop-ac.md S4/S6 and
+ * research/ngspice-internals-pss-pac.md S4.5 for the theory this
+ * implements; pssshoot.h's own comment above the PSSsaltEvent struct has
+ * the one-paragraph summary.
+ *
+ * DERIVATION, mapped onto this file's own per-step recursion (the SAME
+ * discretise-then-linearise recursion PSSsensRecordStep() below and
+ * pacshoot.c's PSSpacRecordStep() already implement for the SMOOTH-device
+ * case, which this ADDS to, not replaces):
+ *
+ *   The switching surface for one `sw` instance is h(x,t) = v_ctrl(x) - vt
+ *   (v_ctrl = V(posCntrl)-V(negCntrl), vt = the model threshold;
+ *   hysteresis only shifts which of +-vh applies, a CONSTANT offset that
+ *   drops out of every derivative below). At the event time t_e (h=0),
+ *   Fang's saltation matrix gives the jump in ANY small perturbation
+ *   propagated through this circuit,
+ *
+ *       delta_x(t_e+) = S delta_x(t_e-),
+ *       S = I + (f+ - f-) grad(h)^T / (grad(h).f- + dh/dt)
+ *
+ *   with f+/f- the vector field (dx/dt) just after/before the event.
+ *   grad(h) is nonzero ONLY at the two control-node rows (posCntrl,
+ *   negCntrl) -- an ideal switch's control port has NO electrical
+ *   coupling to its power port, so h depends on nothing else. grad(h).f-
+ *   dropped: on ngspice's own accepted-step grid dh/dt is evaluated
+ *   directly from the TRAJECTORY (below), which already includes
+ *   whatever grad(h).f contribution there is -- there is no separate
+ *   term to add.
+ *
+ *   f+ - f- is normally a STATE-SPACE (reduced x) vector, needing f+/f-
+ *   evaluated explicitly. This file's own per-step recursion never
+ *   builds x explicitly -- it works entirely in the FULL neq-dimensional
+ *   node/branch space, propagating sensitivities through repeated
+ *   SMPsolve() calls against the SAME per-step Jacobian J_k every other
+ *   history term (ceq/veq) already uses. The jump (f+-f-) in THAT space
+ *   is exactly the effect of instantaneously changing the switch's own
+ *   conductance by dG = g_after-g_before while its terminal voltage
+ *   v_switch is unchanged: an extra current injection dI = dG*v_switch
+ *   at the switch's own two power nodes (+dI leaving posNode, -dI
+ *   leaving negNode -- same sign convention SWload.c's own g_now stamp
+ *   uses). Solving J_k * y_extra = [this injection] through the SAME
+ *   factorization gives EXACTLY (f+-f-) projected through the whole
+ *   linear network in one step -- no explicit n-dimensional f+/f- vector
+ *   is ever formed.
+ *
+ *   So the whole correction, added to whatever RHS a caller already
+ *   built for column j/m (a homogeneous monodromy column, or a PAC
+ *   forced column) BEFORE that column's SMPsolve():
+ *
+ *       coeff  = (y_prev[posCntrl] - y_prev[negCntrl]) / h_dot
+ *       dI     = dG * v_switch * coeff
+ *       rhs[posNode] -= dI
+ *       rhs[negNode] += dI
+ *
+ *   y_prev is THIS column's own propagated sensitivity from the END of
+ *   the PREVIOUS accepted step (g_sens_Sprev / g_pac_Cprev -- i.e.
+ *   delta_x(t_e-), exactly what the formula calls for), h_dot is
+ *   d(v_ctrl)/dt estimated from the trajectory across this step
+ *   (SWctrlvalue's own CKTstate0/1 history, already maintained by
+ *   SWload.c for its OWN hysteresis logic -- reused here, not
+ *   recomputed), and dG/v_switch come from the instance's actual
+ *   conductance/terminal-voltage change. This is real-valued in
+ *   pssshoot.c (one coeff per monodromy column j) and complex-valued in
+ *   pacshoot.c (one coeff per PAC column m, y_prev complex, h_dot still
+ *   real) -- the CALLER does the scalar multiply/RHS injection in its
+ *   own (real or complex) arithmetic; this file only LOCATES the event
+ *   and hands back (posNode, negNode, posCntrl, negCntrl, v_switch, dG,
+ *   h_dot).
+ *
+ *   Location precision: this event is detected AFTER the fact, from
+ *   whichever accepted step SWload.c's own state machine flipped
+ *   SWswitchstate on (no breakpoint-based exact time location -- see the
+ *   card #494 report's "what remains" for why: ngspice's SWload/SWtrunc
+ *   never locates the crossing time exactly today, only bounds the step
+ *   near it, so h_dot/v_switch/dG here are evaluated at the ACCEPTED
+ *   point, not the true h=0 instant; the error is O(h) in the step size,
+ *   the same order the surrounding discretise-then-linearise recursion
+ *   already carries for a smooth device's own G(t)/C(t)).
+ *
+ *   Scope: SW (voltage-controlled switch) only. CSW (current-controlled)
+ *   is NOT implemented (see the report) -- its control "voltage" is a
+ *   branch current through another device, a different CKTstate slot
+ *   convention this pass did not reach. */
+
+int PSSsaltActive = 1;   /* PSS_SALTATION=0 env var disables (red-proof toggle) */
+
+static int
+pss_salt_is_on(double state)
+{
+    return state == 1.0 /* REALLY_ON */ || state == 3.0 /* HYST_ON */;
+}
+
+int
+PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
+{
+    int swtype;
+    SWmodel *model;
+    SWinstance *here;
+    int n = 0;
+    static int env_checked = 0;
+
+    if (!env_checked) {
+        const char *e = getenv("PSS_SALTATION");
+        if (e && strcmp(e, "0") == 0)
+            PSSsaltActive = 0;
+        env_checked = 1;
+    }
+    if (!PSSsaltActive || ckt->CKTtime <= 0.0 || ckt->CKTdelta <= 0.0)
+        return 0;
+
+    swtype = CKTtypelook("Switch");
+    if (swtype < 0)
+        return 0;
+
+    for (model = (SWmodel *) ckt->CKThead[swtype]; model && n < max;
+         model = SWnextModel(model)) {
+        for (here = SWinstances(model); here && n < max;
+             here = SWnextInstance(here)) {
+            double now = ckt->CKTstate0[here->SWswitchstate];
+            double prev = ckt->CKTstate1[here->SWswitchstate];
+            double vctrl_now, vctrl_prev, h_dot, g_now, g_prev;
+
+            if (pss_salt_is_on(now) == pss_salt_is_on(prev))
+                continue;   /* hysteresis-band-only or no-change: no real event */
+
+            vctrl_now = ckt->CKTstate0[here->SWctrlvalue];
+            vctrl_prev = ckt->CKTstate1[here->SWctrlvalue];
+            h_dot = (vctrl_now - vctrl_prev) / ckt->CKTdelta;
+            if (fabs(h_dot) < 1e-30)
+                continue;   /* degenerate: avoid a divide-by-zero downstream */
+
+            g_now  = pss_salt_is_on(now)  ? model->SWonConduct : model->SWoffConduct;
+            g_prev = pss_salt_is_on(prev) ? model->SWonConduct : model->SWoffConduct;
+
+            ev[n].posNode = here->SWposNode;
+            ev[n].negNode = here->SWnegNode;
+            ev[n].posCntrl = here->SWposCntrlNode;
+            ev[n].negCntrl = here->SWnegCntrlNode;
+            ev[n].v_switch = ckt->CKTrhsOld[here->SWposNode] - ckt->CKTrhsOld[here->SWnegNode];
+            ev[n].dG = g_now - g_prev;
+            ev[n].h_dot = h_dot;
+            ev[n].name = here->SWname;
+            n++;
+        }
+    }
+    if (n > 0 && getenv("PSS_SALT_TRACE"))
+        fprintf(stderr, "SALT-TRACE t=%.9g delta=%.4g n_events=%d ev0=%s dG=%.6g v_switch=%.6g h_dot=%.6g posCntrl=%d negCntrl=%d\n",
+                ckt->CKTtime, ckt->CKTdelta, n, ev[0].name, ev[0].dG, ev[0].v_switch, ev[0].h_dot,
+                ev[0].posCntrl, ev[0].negCntrl);
+    return n;
+}
+
 int PSSsensActive = 0;
 
 static PSSstateMap *g_sens_map = NULL;
@@ -760,7 +914,7 @@ pss_sens_reset(CKTcircuit *ckt, PSSstateMap *map)
 void
 PSSsensRecordStep(CKTcircuit *ckt)
 {
-    int n, neq, d, j, nd, order;
+    int n, neq, d, j, nd, order, i_salt;
     double ag0, ag1;
 
     if (g_sens_failed || !g_sens_map)
@@ -849,6 +1003,13 @@ PSSsensRecordStep(CKTcircuit *ckt)
 
     memset(g_sens_Snew, 0, (size_t) (neq + 1) * n * sizeof(double));
 
+    {
+        /* card #494: locate any sw event at THIS accepted step once, reuse
+         * for every column j below (see PSSsaltFindEvents()'s header
+         * comment in this file for the derivation). */
+        PSSsaltEvent salt_ev[PSS_SALT_MAX_EVENTS];
+        int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
+
     for (j = 0; j < n; j++) {
         memset(g_sens_rhs, 0, (size_t) (neq + 1) * sizeof(double));
 
@@ -876,6 +1037,29 @@ PSSsensRecordStep(CKTcircuit *ckt)
             }
         }
 
+        /* card #494: saltation correction, one term per event found at
+         * this accepted step -- see PSSsaltFindEvents()'s header comment
+         * in this file for the derivation. coeff uses g_sens_Sprev (this
+         * SAME column j's sensitivity from the END of the PREVIOUS
+         * accepted step -- delta_x(t_e-), exactly what Fang's formula
+         * calls for), NOT g_sens_rhs/g_sens_Snew (this step's still-being-
+         * built result). */
+        for (i_salt = 0; i_salt < n_salt; i_salt++) {
+            PSSsaltEvent *e = &salt_ev[i_salt];
+            double Sp = pss_sens_get(g_sens_Sprev, e->posCntrl, n, j);
+            double Sn = pss_sens_get(g_sens_Sprev, e->negCntrl, n, j);
+            double coeff = (Sp - Sn) / e->h_dot;
+            /* ag0 converts the charge-like quantity dG*v_switch*coeff
+             * (Amps * seconds = Coulombs) into the companion-model
+             * equivalent CURRENT this RHS row expects (Amps) -- the SAME
+             * role ag0 plays in the ceq/veq history terms just above
+             * (dceq = -ag0*C*(...)): ag0 ~ 1/h is ngspice's own
+             * charge-to-current conversion for this integration step. */
+            double dI = ag0 * e->dG * e->v_switch * coeff;
+            if (e->posNode > 0) g_sens_rhs[e->posNode] -= dI;
+            if (e->negNode > 0) g_sens_rhs[e->negNode] += dI;
+        }
+
         /* SMPsolve()'s third argument ("Spare"/"Solution") is a dead
          * legacy parameter -- spsmp.c's own SMPsolve() does
          * `NG_IGNORE(Spare); spSolve(Matrix->SPmatrix, RHS, RHS, NULL,
@@ -892,6 +1076,7 @@ PSSsensRecordStep(CKTcircuit *ckt)
         for (nd = 1; nd <= neq; nd++)
             g_sens_Snew[(size_t) nd * n + j] = g_sens_rhs[nd];
     }
+    }   /* card #494: closes the salt_ev/n_salt scope opened above */
 
     for (d = 0; d < n; d++) {
         PSSstateRef *ref = &g_sens_map->refs[d];
