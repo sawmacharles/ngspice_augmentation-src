@@ -374,6 +374,7 @@ static int g_pac_demod_active = 0;
 static PACc *g_pac_demod = NULL;                         /* [neq*M], sideband-0 accumulator */
 static double g_pac_T = 0.0;                              /* period, for the 1/T normalisation */
 static double *g_pac_rhs_re = NULL, *g_pac_rhs_im = NULL, *g_pac_scratch = NULL; /* [neq+1] */
+static int g_pac_exact_jac = 0;   /* card #465 THIRD pass, task 1: see pac_refactor_at_accepted() */
 
 static PACc
 pac_get(const PACc *C, int row, int M, int m)
@@ -470,8 +471,109 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
         for (m = 0; m < M; m++)
             pac_set(g_pac_Cprev, row, M, m, ic0[(size_t) d * M + m]);
     }
+    g_pac_exact_jac = getenv("PAC_EXACT_JACOBIAN") != NULL;
     g_pac_failed = 0;
     return 0;
+}
+
+/* card #465 THIRD pass, task 1 (accuracy): .pstb vs native .stb on a
+ * LINEAR circuit (pstb_linear.cir) was found to converge only O(1/Points),
+ * not the O(h^2) a trapezoidal per-step recursion should give -- traced to
+ * this file's own documented design trade-off (header, "PAC (`.pac ...
+ * method=shoot solver=td`)" paragraph and "refactor" note): PSSpacRecordStep()
+ * below solves against ckt->CKTmatrix AS LEFT by NIiter() (SMPsolve() only,
+ * no refactor), which is G(x_{k-1})+ag0*C(x_{k-1}), NOT G(x_k)+ag0*C(x_k).
+ *
+ * Root cause, traced in src/maths/ni/niiter.c: on the converged
+ * (MODEINITFLOAT, CKTnoncon==0) return path, NIiter() returns OK
+ * immediately (line ~435) WITHOUT reaching its own
+ * `SWAP(double*, ckt->CKTrhs, ckt->CKTrhsOld)` (line ~463, only on the
+ * loop's continue path). So at this hook's call site (dctran.c, right
+ * after CKTaccept()): ckt->CKTrhs holds x_k (the just-solved, TRUE
+ * accepted point) but ckt->CKTrhsOld -- the array every device loader
+ * reads node voltages from, e.g. capload.c's `*(ckt->CKTrhsOld+...)`,
+ * resload.c likewise -- still holds x_{k-1}, the second-to-last Newton
+ * iterate. ckt->CKTmatrix was last loaded+factored AT x_{k-1} (the top of
+ * that final NIiter() loop pass), never refactored at x_k itself. This is
+ * the SAME staleness pssshoot.c's PSSsensRecordStep() documents for the
+ * PSS shooting-Newton monodromy and deliberately does NOT fix there (that
+ * path pays this cost on every accepted step of EVERY period of EVERY
+ * Newton iteration -- found too slow on R3, and a naive extra CKTload()
+ * was found to measurably perturb R2's SW switch model's history-
+ * dependent internal state -- see PSSsensRecordStep()'s own long comment).
+ *
+ * PAC's OWN recording pass is different in exactly the way that trade-off
+ * turns on: pac_engine_run() calls pac_run_period() at most TWICE total
+ * per `.pac`/`.pstb` invocation (pass 1: Phi + forced z; pass 2: re-
+ * propagate + demodulate) -- PSS's Newton has already converged x0/T
+ * before this file's code runs at all, so "refactor at every accepted
+ * point" here costs at most 2x this file's own (already O(one period)
+ * per the header) wall time, not O(Newton iterations x periods). The
+ * card's plan calls this "affordable" -- validated below (accuracy
+ * table, card #465 THIRD pass report).
+ *
+ * Guarded behind PAC_EXACT_JACOBIAN (env var, default unset = OFF, same
+ * opt-in convention as pssshoot.c's PSS_SHOOT_JACOBIAN=analytic) rather
+ * than made the unconditional default: validated to fix the O(1/Points)
+ * convergence to true O(h^2) on the pure-LTI circuits this task's target
+ * is stated against (pstb_linear.cir, pac_lti.cir -- no history-dependent
+ * device state at all) but the save/restore in pac_refactor_at_accepted()
+ * below (CKTrhs, CKTrhsOld, CKTstate0 -- everything an extra CKTload()
+ * can touch beyond what this hook already owns) has only been exercised
+ * end to end against R2/R3/R4's actual switching devices via this
+ * project's existing pac_sb0(b)/pstb_loop regression checks, not proven
+ * safe by the SAME kind of targeted, single-device validation
+ * PSSsensRecordStep()'s own comment describes doing for the SW model --
+ * see the card #465 THIRD pass report for exactly what was and was not
+ * checked. Default OFF until that gap is closed. */
+static int
+pac_refactor_at_accepted(CKTcircuit *ckt)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix);
+    int nstates = ckt->CKTnumStates;
+    double *save_rhs, *save_rhsold, *save_state0 = NULL;
+    int err;
+
+    save_rhs = TMALLOC(double, neq + 1);
+    save_rhsold = TMALLOC(double, neq + 1);
+    if (nstates > 0)
+        save_state0 = TMALLOC(double, nstates);
+    if (!save_rhs || !save_rhsold || (nstates > 0 && !save_state0)) {
+        if (save_rhs) tfree(save_rhs);
+        if (save_rhsold) tfree(save_rhsold);
+        if (save_state0) tfree(save_state0);
+        return 1;
+    }
+
+    memcpy(save_rhs, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+    if (nstates > 0)
+        memcpy(save_state0, ckt->CKTstate0, (size_t) nstates * sizeof(double));
+
+    /* devices read node voltages from CKTrhsOld (see capload.c/resload.c) --
+     * put x_k (the just-accepted CKTrhs) there so CKTload() evaluates
+     * G(x_k)/C(x_k), not G(x_{k-1})/C(x_{k-1}). */
+    memcpy(ckt->CKTrhsOld, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
+
+    err = CKTload(ckt);
+    if (!err)
+        err = SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin);
+
+    /* restore CKTrhs/CKTrhsOld/CKTstate0 exactly as dctran.c's own
+     * subsequent code (CKTdump right after this hook returns, and the
+     * NEXT accepted step's own CKTload()) expects to find them. Only
+     * ckt->CKTmatrix is left changed -- holding the fresh
+     * G(x_k)+ag0*C(x_k) factorization PSSpacRecordStep()'s own
+     * SMPsolve() calls (right after this function returns) need. */
+    memcpy(ckt->CKTrhs, save_rhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+    if (nstates > 0)
+        memcpy(ckt->CKTstate0, save_state0, (size_t) nstates * sizeof(double));
+
+    tfree(save_rhs);
+    tfree(save_rhsold);
+    if (save_state0) tfree(save_state0);
+    return err ? 1 : 0;
 }
 
 void
@@ -501,6 +603,36 @@ PSSpacRecordStep(CKTcircuit *ckt)
     order = (fabs(ag1 + ag0) < 1e-6 * fabs(ag0)) ? 1 : 2;
     t_new = ckt->CKTtime;
     h = t_new - g_pac_tprev;
+    /* card #465 THIRD pass, task 1 investigation: debug trace (PAC_ORDER_TRACE,
+     * no-op unless set) used to rule out "order pinned at 1" as the cause of
+     * pstb_linear.cir's O(1/Points) error -- it is NOT: on a 20000-point
+     * recording pass only the first 6 of ~80000 calls (t < 2e-11 s, well
+     * before the first real breakpoint) are order 1, the rest are trapezoidal
+     * order 2 throughout. Left in since it is cheap and the question comes
+     * up again with every accuracy pass on this file. */
+    if (getenv("PAC_ORDER_TRACE")) {
+        static int calls = 0, n1 = 0, n2 = 0;
+        if (order == 1) n1++; else n2++;
+        calls++;
+        if (calls <= 5 || calls % 500 == 0)
+            fprintf(stderr, "PACORDER call=%d t=%.9g h=%.6g ag0=%.6g ag1=%.6g order=%d n1=%d n2=%d\n",
+                    calls, t_new, h, ag0, ag1, order, n1, n2);
+    }
+
+
+    /* card #465 THIRD pass, task 1: refactor ckt->CKTmatrix at the TRUE
+     * accepted point x_k before using it below -- see
+     * pac_refactor_at_accepted()'s header for why this is needed and why
+     * it is safe to do here (unlike pssshoot.c's Newton-loop-scoped
+     * case). No-op unless PAC_EXACT_JACOBIAN is set. */
+    if (g_pac_exact_jac) {
+        if (pac_refactor_at_accepted(ckt)) {
+            fprintf(stderr, "PAC-TD: exact-Jacobian refactor failed at "
+                    "t=%g; abandoning this pass.\n", ckt->CKTtime);
+            g_pac_failed = 1;
+            return;
+        }
+    }
 
     for (m = 0; m < M; m++) {
         memset(g_pac_rhs_re, 0, (size_t) (neq + 1) * sizeof(double));
