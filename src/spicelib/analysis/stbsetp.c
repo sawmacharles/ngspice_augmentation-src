@@ -8,6 +8,7 @@ Native `.stb` loop-stability analysis: parameter table. See stbdefs.h.
 #include "ngspice/iferrmsg.h"
 #include "ngspice/stbdefs.h"
 #include "ngspice/cktdefs.h"
+#include "ngspice/stringutil.h"
 
 #include "analysis.h"
 
@@ -105,6 +106,21 @@ STBsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->STBmodeGiven = 1;
         break;
 
+    case STB_SENS:
+        /* card #475: sens=all | sens=<name> (repeatable). "all"
+         * (case-insensitive) short-circuits any prior/later sens=<name>
+         * list -- STBan() checks STBsensAll first. */
+        if (!job->STBsensAll) {
+            if (cieq((char *) value->uValue, "all")) {
+                job->STBsensAll = 1;
+            } else {
+                job->STBsensNames = TREALLOC(IFuid, job->STBsensNames, job->STBsensCount + 1);
+                job->STBsensNames[job->STBsensCount] = value->uValue;
+                job->STBsensCount++;
+            }
+        }
+        break;
+
     default:
         return (E_BADPARM);
     }
@@ -122,6 +138,7 @@ static IFparm STBparms[] = {
     { "localgnd", STB_LOCALGND, IF_SET | IF_ASK | IF_NODE,     "local ground reference node (optional)" },
     { "probe2",   STB_PROBE2,   IF_SET | IF_ASK | IF_INSTANCE, "second (branch n) probe for probe=Vp,Vn mode=dm|cm (set via probe=)" },
     { "mode",     STB_MODE,     IF_SET | IF_ASK | IF_INTEGER,  "1=dm, 2=cm (set via mode=dm|cm on probe=Vp,Vn)" },
+    { "sens",     STB_SENS,     IF_SET | IF_INSTANCE,          "adjoint sensitivity: sens=all or sens=<name> (repeatable, loop mode only)" },
 };
 
 SPICEanalysis STBinfo = {

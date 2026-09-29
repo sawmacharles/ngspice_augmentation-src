@@ -55,6 +55,19 @@ implement (see the card #457 report's "what was not done").
 #include "ngspice/devdefs.h"
 #include "ngspice/smpdefs.h"
 #include "ngspice/sperror.h"
+/* card #475 (plan T10.7): adjoint sensitivity reuses cktsgen.c's generic
+ * instance/model-parameter walker (sgen_init/sgen_next/sens_getp), the
+ * SAME machinery src/spicelib/analysis/cktsens.c's existing DC/AC `.sens`
+ * (a finite-difference-of-the-device's-OWN-stamp, one-solve-per-parameter
+ * "direct method") is built on -- see this file's stb_sens_* block below
+ * for how the adjoint method replaces its per-parameter SOLVE with a
+ * per-parameter cheap DOT PRODUCT against two precomputed adjoint vectors
+ * (2 extra solves per frequency total, not per parameter). sens_setp/
+ * sens_temp in cktsens.c are file-static there (not exported); this file
+ * defines its own tiny equivalents (stb_sens_setp/stb_sens_temp) rather
+ * than change cktsens.c's linkage for a private, non-upstream fork. */
+#include "ngspice/sensgen.h"
+#include "ngspice/stringutil.h"
 
 #include <math.h>
 
@@ -133,11 +146,15 @@ interp_logf(double f0, double f1, double y0, double y1, double target)
 }
 
 /* One crossing record, kept in a growable array (mirrors stbcore.margins'
- * pm_crossings / gm_crossings lists). */
-typedef struct { double freq, value, aux; } CROSSING;
+ * pm_crossings / gm_crossings lists). card #475: idx/t2 (the bracket's
+ * lower freqs[]/Tarr[]/dTdp_re[k][] index, and the SAME log-f
+ * interpolation fraction used to find fc itself) let the post-sweep
+ * margin-sensitivity pass re-use the identical bracket/interpolation a
+ * crossing was found with, instead of re-deriving it. */
+typedef struct { double freq, value, aux, t2; int idx; } CROSSING;
 
 static CROSSING *
-push_crossing(CROSSING *arr, int *n, int *cap, double freq, double value, double aux)
+push_crossing(CROSSING *arr, int *n, int *cap, double freq, double value, double aux, double t2, int idx)
 {
     if (*n >= *cap) {
         *cap = *cap ? *cap * 2 : 8;
@@ -146,6 +163,8 @@ push_crossing(CROSSING *arr, int *n, int *cap, double freq, double value, double
     arr[*n].freq = freq;
     arr[*n].value = value;
     arr[*n].aux = aux;
+    arr[*n].t2 = t2;
+    arr[*n].idx = idx;
     (*n)++;
     return arr;
 }
@@ -278,6 +297,161 @@ stb_bsim4_probe(GENinstance *inst, STBdevProbe *p)
     return 0;
 }
 
+/* ============================================================
+ * card #475 (plan T10.7): adjoint sensitivity of the Tian loop-gain
+ * probe readings (v1,i1,v2,i2 -> T -> margins) wrt element/model
+ * parameters. Design: research/feature-survey.md's adjoint-sensitivity
+ * item, docs/stb.md, and the card's own DESIGN note (see the report).
+ *
+ * For a small-signal quantity y = c^T x at one frequency, with
+ * Y(p) x = b (b independent of p here -- the probe's own unit
+ * injections), the ordinary forward/direct sensitivity is
+ *   dx/dp = Y^-1 (db/dp - (dY/dp) x)
+ * (what cktsens.c's existing DC/AC `.sens` computes, ONE extra solve
+ * per parameter, reusing the already-factored Y). The ADJOINT form
+ * reuses the same identity by moving the solve onto c instead of onto
+ * dY/dp x:
+ *   dy/dp = lambda^T (db/dp - (dY/dp) x),   Y^T lambda = c
+ * -- ONE extra (TRANSPOSED, same factorisation) solve per OUTPUT
+ * reading, independent of how many parameters p are swept, then a
+ * cheap sparse matrix-vector product + dot product per parameter (no
+ * solve at all). Four probe readings (v1,i1,v2,i2) but only two
+ * DISTINCT c vectors (v1/v2 share c_v = e_{node_b}; i1/i2 share
+ * c_i = -e_{branch_probe}), so exactly 2 adjoint solves per frequency
+ * cover all four.
+ *
+ * dY/dp (times a small delta) for one isolated device/parameter is
+ * built with EXACTLY cktsens.c's own technique (DEVsetup into a fresh,
+ * per-parameter-isolated delta_Y, then DEVacLoad at p and at p+delta,
+ * subtracting) -- this is not a fresh design, it is the same proven
+ * mechanism reused so every IF_REAL, AC-capable instance/model
+ * parameter of every device type (R, C, L, VCCS/VCVS gains, and any
+ * MOSFET model parameter, e.g. w/l/vto) is already covered generically,
+ * with no per-device-type code. What this does NOT cover: MOSFET small-
+ * signal "device" quantities (gm/gds/caps) treated as independent knobs
+ * -- those are operating-point-DERIVED, not settable instance/model
+ * parameters, so they are outside this generic mechanism; see the card
+ * #475 report's "what was not done".
+ *
+ * Loop mode only (device mode / dm|cm are refused together with sens=,
+ * see STBan() below) and SPARSE (non-KLU) only: SMPcaSolve (the complex
+ * TRANSPOSED solve this needs) and SMPmultiply only implement the
+ * Sparse1.3 matrix path in this fork (spsolve.c/sputils.c) -- refused,
+ * not silently wrong, when CKTkluMODE is on (see below). */
+
+static double STBsens_Delta = 1e-6;      /* same defaults as cktsens.c's Sens_Delta */
+static double STBsens_AbsDelta = 1e-6;
+
+/* Simple glob match ('*' / '?'), mirroring cktsens.c's static scan()/
+ * check_filter() (duplicated here rather than exported from cktsens.c --
+ * both are private-fork WIP files and this keeps the two independent). */
+static int
+stb_sens_glob(const char *filter, const char *name)
+{
+    while (*filter && *name) {
+        if (*filter == '*') {
+            if (!filter[1])
+                return 1;
+            while (*name && !stb_sens_glob(filter + 1, name))
+                ++name;
+            return *name != '\0';
+        }
+        if (*filter == *name || *filter == '?')
+            ++name, ++filter;
+        else
+            return 0;
+    }
+    return !*name && (!*filter || (*filter == '*' && !filter[1]));
+}
+
+/* namebuf convention, byte-for-byte mirroring cktsens.c's sens_sens() so
+ * sens=<name> selects the SAME parameter a .sens run would print (minus
+ * cktsens.c's "M1_vto" underscore form for a non-principal instance
+ * param, which is kept here too -- only the "M1:vto" model-param colon
+ * form is remapped to underscore for the OUTPUT VECTOR name, since ':'
+ * is not safe in a vector name; the sens=<name> MATCH itself still uses
+ * the colon form to stay identical to cktsens.c's own naming). */
+static void
+stb_sens_name(sgen *sg, char *namebuf, size_t buflen)
+{
+    if (!sg->is_instparam) {
+        snprintf(namebuf, buflen, "%s:%s", sg->instance->GENname, sg->ptable[sg->param].keyword);
+    } else if ((sg->ptable[sg->param].dataType & IF_PRINCIPAL) && sg->is_principle == 1) {
+        snprintf(namebuf, buflen, "%s", sg->instance->GENname);
+    } else {
+        snprintf(namebuf, buflen, "%s_%s", sg->instance->GENname, sg->ptable[sg->param].keyword);
+    }
+}
+
+static int
+stb_sens_selected(STBAN *job, const char *namebuf)
+{
+    int k;
+    if (job->STBsensAll)
+        return 1;
+    for (k = 0; k < job->STBsensCount; k++)
+        if (stb_sens_glob((char *) job->STBsensNames[k], namebuf))
+            return 1;
+    return 0;
+}
+
+/* AC-only equivalents of cktsens.c's (file-static, unexported) sens_load/
+ * sens_temp -- same one-line bodies, just not reachable from here. */
+static int
+stb_sens_load_ac(sgen *sg, CKTcircuit *ckt)
+{
+    int (*fn)(GENmodel *, CKTcircuit *) = DEVices[sg->dev]->DEVacLoad;
+    if (!fn) return 1;
+    return fn(sg->model, ckt);
+}
+
+static int
+stb_sens_temp(sgen *sg, CKTcircuit *ckt)
+{
+    int (*fn)(GENmodel *, CKTcircuit *) = DEVices[sg->dev]->DEVtemperature;
+    if (!fn) return 1;
+    return fn(sg->model, ckt);
+}
+
+/* cktsens.c's sens_setp is file-static (see this block's top comment) --
+ * same body, new name. */
+static int
+stb_sens_setp(sgen *sg, CKTcircuit *ckt, IFvalue *val)
+{
+    int pid, error = 0;
+    NG_IGNORE(ckt);
+    if (sg->is_instparam) {
+        int (*fn)(int, IFvalue *, GENinstance *, IFvalue *) = DEVices[sg->dev]->DEVparam;
+        pid = DEVices[sg->dev]->DEVpublic.instanceParms[sg->param].id;
+        if (fn) error = fn(pid, val, sg->instance, NULL);
+        else return 1;
+    } else {
+        int (*fn)(int, IFvalue *, GENmodel *) = DEVices[sg->dev]->DEVmodParam;
+        pid = DEVices[sg->dev]->DEVpublic.modelParms[sg->param].id;
+        if (fn) error = fn(pid, val, sg->model);
+        else return 1;
+    }
+    return error;
+}
+
+/* complex "bilinear" dot product lambda^T v (ordinary transpose, NOT a
+ * conjugated inner product -- see this block's top comment: the adjoint
+ * identity needs Y^T, not Y^H). Skips index 0 (the MNA ground "trash"
+ * slot -- same guard stban.c's loop-mode code already applies to
+ * CKTrhs[0]/CKTirhs[0], see STBan() below). */
+static STBcplx
+stb_sens_dot(const double *lam_re, const double *lam_im,
+             const double *v_re, const double *v_im, int size)
+{
+    STBcplx r = { 0.0, 0.0 };
+    int j;
+    for (j = 1; j <= size; j++) {
+        r.re += lam_re[j] * v_re[j] - lam_im[j] * v_im[j];
+        r.im += lam_re[j] * v_im[j] + lam_im[j] * v_re[j];
+    }
+    return r;
+}
+
 int
 STBan(CKTcircuit *ckt, int restart)
 {
@@ -308,9 +482,37 @@ STBan(CKTcircuit *ckt, int restart)
     double *freqs = NULL;
     STBcplx *Tarr = NULL, *LGarr = NULL;
     int npts = 0, cap = 0;
+    /* card #475: kept alive (not freed right after the margin/crossing
+     * pass, unlike upstream's original scoping) so the dPM/dp, dfc/dp
+     * block below can reuse the same unwrapped-phase trace the crossing
+     * search itself used, rather than recomputing it. */
+    double *phs = NULL;
 
     CROSSING *pmx = NULL, *gmx = NULL;
     int npm = 0, ngm = 0, capm = 0, capg = 0;
+
+    /* card #475: adjoint sensitivity state. sens_requested is fixed at
+     * entry (job->STBsensAll/STBsensCount, set by the parser -- see
+     * stbdefs.h/stbsetp.c); nsens (the actual matched-parameter count) is
+     * only known after the first dry enumeration pass, below, once the DC
+     * operating point exists. sensNames/sensVecUids/dTdp_re/dTdp_im are
+     * parallel nsens-length arrays; dTdp_re[k]/dTdp_im[k] grow in lockstep
+     * with freqs[]/Tarr[] (same cap-doubling pattern) so a per-parameter
+     * dT/dp trace can be read back at the same bracket indices the
+     * existing PM/GM crossing search already found. */
+    int sens_requested = (job->STBsensAll || job->STBsensCount > 0);
+    int nsens = 0;
+    char **sensNames = NULL;
+    IFuid *sensVecUids = NULL;
+    double **dTdp_re = NULL, **dTdp_im = NULL;
+    SMPmatrix *sensDeltaY = NULL;
+    double *sens_lamv_re = NULL, *sens_lamv_im = NULL;
+    double *sens_lami_re = NULL, *sens_lami_im = NULL;
+    double *sens_x1_re = NULL, *sens_x1_im = NULL;
+    double *sens_x2_re = NULL, *sens_x2_im = NULL;
+    double *sens_dI = NULL, *sens_dII = NULL;
+    double *sens_mv_re = NULL, *sens_mv_im = NULL;
+    runDesc *sensPlot = NULL;
 
     /* ---- resolve the probe device ---- */
     inst = CKTfndDev(ckt, job->STBprobeName);
@@ -454,6 +656,32 @@ STBan(CKTcircuit *ckt, int restart)
         return E_PARMVAL;
     }
 
+    /* card #475: sens= scope checks -- loop mode (single-ended), Sparse
+     * only. Refused up front (E_PARMVAL), never silently ignored or
+     * silently wrong (rule: no silent numbers). */
+    if (sens_requested) {
+        if (device_mode) {
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb sens=: device-mode probes are not supported (loop mode only)");
+            return E_PARMVAL;
+        }
+        if (job->STBprobeName2Given || job->STBmodeGiven) {
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb sens=: probe2=/mode=dm|cm (differential probing) is not supported "
+                "(single-ended loop mode only)");
+            return E_PARMVAL;
+        }
+#ifdef KLU
+        if (ckt->CKTmatrix->CKTkluMODE) {
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb sens=: needs the Sparse solver (SMPcaSolve/SMPmultiply are not "
+                "implemented for KLU in this fork) -- add '.options sparse' or remove "
+                "'.option klu' and re-run");
+            return E_PARMVAL;
+        }
+#endif
+    }
+
     /* ---- DC operating point (identical to the closed loop: the probe is
      * an ordinary 0V branch already in the netlist, not a mutation) ---- */
     if (job->STBsaveFreq == 0 || restart) {
@@ -544,11 +772,89 @@ STBan(CKTcircuit *ckt, int restart)
         if (job->STBstepType != LINEAR)
             SPfrontEnd->OUTattributes(stbPlot, NULL, OUT_SCALE_LOG, NULL);
 
+        /* card #475: dry-run parameter enumeration -- walks EVERY IF_REAL,
+         * AC-capable instance/model parameter of every device (same
+         * generic walk cktsens.c's DC/AC `.sens` uses), keeping only the
+         * ones sens=all|<name> selects. Counted/named ONCE here so the
+         * per-frequency loop below can re-walk with the SAME filter and
+         * index results 0..nsens-1 by POSITION (deterministic: the
+         * circuit's device/model/instance/param structure does not change
+         * between these two walks) instead of a name lookup every time. */
+        if (sens_requested) {
+            sgen *sg;
+            int senscap = 0;
+            for (sg = sgen_init(ckt, 0); sg; sgen_next(&sg)) {
+                char namebuf[256];
+                stb_sens_name(sg, namebuf, sizeof namebuf);
+                if (!stb_sens_selected(job, namebuf))
+                    continue;
+                if (nsens >= senscap) {
+                    senscap = senscap ? senscap * 2 : 8;
+                    sensNames  = TREALLOC(char *, sensNames, senscap);
+                    sensVecUids = TREALLOC(IFuid, sensVecUids, senscap);
+                    dTdp_re = TREALLOC(double *, dTdp_re, senscap);
+                    dTdp_im = TREALLOC(double *, dTdp_im, senscap);
+                }
+                sensNames[nsens] = copy(namebuf);
+                dTdp_re[nsens] = NULL;
+                dTdp_im[nsens] = NULL;
+                {
+                    char vecname[300];
+                    int ci;
+                    snprintf(vecname, sizeof vecname, "dT_d%s", namebuf);
+                    for (ci = 0; vecname[ci]; ci++)
+                        if (vecname[ci] == ':') vecname[ci] = '_';
+                    SPfrontEnd->IFnewUid(ckt, &sensVecUids[nsens], NULL, vecname, UID_OTHER, NULL);
+                }
+                nsens++;
+            }
+            if (nsens == 0) {
+                SPfrontEnd->IFerrorf(ERR_WARNING,
+                    "stb sens=: no matching IF_REAL instance/model parameter found in the "
+                    "circuit -- T itself is still computed and printed normally, but no "
+                    "dT/dp vectors or margin sensitivities are produced");
+            } else {
+                IFuid sensFreqUid;
+                SPfrontEnd->IFnewUid(ckt, &sensFreqUid, NULL, "frequency", UID_OTHER, NULL);
+                error = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob,
+                    (IFuid) "STB dT/dp", sensFreqUid, IF_REAL,
+                    nsens, sensVecUids, IF_COMPLEX, &sensPlot);
+                if (error) return error;
+                if (job->STBstepType != LINEAR)
+                    SPfrontEnd->OUTattributes(sensPlot, NULL, OUT_SCALE_LOG, NULL);
+
+                /* persistent per-frequency scratch, allocated once (size+1
+                 * doubles: index 0 is the MNA ground "trash" slot, same
+                 * convention as CKTrhs/CKTirhs -- see this file's existing
+                 * node-0 guards). sensDeltaY mirrors cktsens.c's delta_Y:
+                 * a throwaway matrix used only to isolate one device's own
+                 * dY/dp stamp (SMPcClear'd fresh for every parameter). */
+                {
+                    int vsize = SMPmatSize(ckt->CKTmatrix) + 1;
+                    sensDeltaY = TMALLOC(SMPmatrix, 1);
+                    error = SMPnewMatrix(sensDeltaY, vsize - 1);
+                    if (error) return error;
+                    sens_lamv_re = TMALLOC(double, vsize); sens_lamv_im = TMALLOC(double, vsize);
+                    sens_lami_re = TMALLOC(double, vsize); sens_lami_im = TMALLOC(double, vsize);
+                    sens_x1_re = TMALLOC(double, vsize); sens_x1_im = TMALLOC(double, vsize);
+                    sens_x2_re = TMALLOC(double, vsize); sens_x2_im = TMALLOC(double, vsize);
+                    sens_dI = TMALLOC(double, vsize); sens_dII = TMALLOC(double, vsize);
+                    sens_mv_re = TMALLOC(double, vsize); sens_mv_im = TMALLOC(double, vsize);
+                }
+            }
+        }
+
         freq = job->STBstartFreq;
     } else {
         freq = job->STBsaveFreq;
         job->STBsaveFreq = 0;
         error = SPfrontEnd->OUTpBeginPlot(NULL, NULL, NULL, NULL, 0, 666, NULL, 666, &stbPlot);
+        if (sens_requested) {
+            SPfrontEnd->IFerrorf(ERR_WARNING,
+                "stb sens=: pause/resume is not supported for a sensitivity run in this "
+                "fork -- re-run the whole sweep in one call");
+            return E_PARMVAL;
+        }
     }
 
     switch (job->STBstepType) {
@@ -723,6 +1029,16 @@ STBan(CKTcircuit *ckt, int restart)
          * card #456 report). */
         i1.re = -ckt->CKTrhs[branch_probe]; i1.im = -ckt->CKTirhs[branch_probe];
 
+        /* card #475: save the whole x1 solution vector (not just v1/i1)
+         * BEFORE it is overwritten by run 2's solve -- the adjoint-
+         * sensitivity contraction below needs the full vector for the
+         * (dY/dp)*x1 matrix-vector product. */
+        if (sens_requested && nsens > 0)
+            for (i = 0; i <= size; i++) {
+                sens_x1_re[i] = ckt->CKTrhs[i];
+                sens_x1_im[i] = ckt->CKTirhs[i];
+            }
+
         /* RHS #2: unit current injection into the probe's other terminal
          * (node_b); probe branch equation back to 0 (unperturbed) */
         for (i = 0; i <= size; i++) {
@@ -758,6 +1074,13 @@ STBan(CKTcircuit *ckt, int restart)
         v2.im = node_b ? ckt->CKTirhs[node_b] : 0.0;
         i2.re = -ckt->CKTrhs[branch_probe]; i2.im = -ckt->CKTirhs[branch_probe];
 
+        /* card #475: save x2 the same way x1 was saved above. */
+        if (sens_requested && nsens > 0)
+            for (i = 0; i <= size; i++) {
+                sens_x2_re[i] = ckt->CKTrhs[i];
+                sens_x2_im[i] = ckt->CKTirhs[i];
+            }
+
         if (getenv("STB_DEBUG"))
             fprintf(stderr, "STB_DEBUG f=%g node_a=%d node_b=%d branch=%d "
                 "v1=%.10g%+.10gj i1=%.10g%+.10gj v2=%.10g%+.10gj i2=%.10g%+.10gj\n",
@@ -781,10 +1104,134 @@ STBan(CKTcircuit *ckt, int restart)
             freqs = TREALLOC(double, freqs, cap);
             Tarr = TREALLOC(STBcplx, Tarr, cap);
             LGarr = TREALLOC(STBcplx, LGarr, cap);
+            if (sens_requested && nsens > 0) {
+                int kk;
+                for (kk = 0; kk < nsens; kk++) {
+                    dTdp_re[kk] = TREALLOC(double, dTdp_re[kk], cap);
+                    dTdp_im[kk] = TREALLOC(double, dTdp_im[kk], cap);
+                }
+            }
         }
         freqs[npts] = freq;
         Tarr[npts] = t;
         LGarr[npts] = lg;
+
+        /* card #475: adjoint sensitivity, this frequency. Two extra
+         * (TRANSPOSED, same factorisation) solves for lambda_v/lambda_i,
+         * THEN a cheap per-parameter contraction (no further solves) --
+         * see this file's design comment above stb_sens_dot(). */
+        if (sens_requested && nsens > 0) {
+            double *save_rhs = ckt->CKTrhs, *save_irhs = ckt->CKTirhs;
+            SMPmatrix *save_matrix = ckt->CKTmatrix;
+            sgen *sg;
+            int k;
+            STBcplx one;
+            one.re = 1.0; one.im = 0.0;
+
+            for (i = 0; i <= size; i++) { sens_lamv_re[i] = 0.0; sens_lamv_im[i] = 0.0; }
+            if (node_b) sens_lamv_re[node_b] = 1.0;
+            SMPcaSolve(ckt->CKTmatrix, sens_lamv_re, sens_lamv_im, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
+
+            for (i = 0; i <= size; i++) { sens_lami_re[i] = 0.0; sens_lami_im[i] = 0.0; }
+            sens_lami_re[branch_probe] = -1.0;
+            SMPcaSolve(ckt->CKTmatrix, sens_lami_re, sens_lami_im, ckt->CKTrhsSpare, ckt->CKTirhsSpare);
+
+            ckt->CKTrhs = sens_dI; ckt->CKTirhs = sens_dII; ckt->CKTmatrix = sensDeltaY;
+
+            k = 0;
+            for (sg = sgen_init(ckt, 0); sg; sgen_next(&sg)) {
+                char namebuf[256];
+                IFvalue nvalue, ovalue;
+                double delta_var;
+                STBcplx dv1, di1, dv2, di2, dT;
+                int (*setupfn)(SMPmatrix *, GENmodel *, CKTcircuit *, int *);
+
+                stb_sens_name(sg, namebuf, sizeof namebuf);
+                if (!stb_sens_selected(job, namebuf))
+                    continue;
+                if (k >= nsens)
+                    break;  /* defensive: dry run and this walk must agree */
+
+                SMPcClear(sensDeltaY);
+                for (i = 0; i <= size; i++) { sens_dI[i] = 0.0; sens_dII[i] = 0.0; }
+
+                ckt->CKTnumStates = sg->istate;
+                setupfn = DEVices[sg->dev]->DEVsetup;
+                if (setupfn)
+                    setupfn(sensDeltaY, sg->model, ckt, &ckt->CKTnumStates);
+
+                if (stb_sens_load_ac(sg, ckt)) {
+                    dTdp_re[k][npts] = 0.0; dTdp_im[k][npts] = 0.0;
+                    k++; continue;  /* no AC load fn on this device -- dT/dp undefined, report 0 rather than garbage */
+                }
+
+                delta_var = (sg->value != 0.0) ? sg->value * STBsens_Delta : STBsens_AbsDelta;
+                nvalue.rValue = sg->value + delta_var;
+                stb_sens_setp(sg, ckt, &nvalue);
+
+                SMPconstMult(sensDeltaY, -1.0);
+                for (i = 0; i <= size; i++) { sens_dI[i] = -sens_dI[i]; sens_dII[i] = -sens_dII[i]; }
+
+                stb_sens_temp(sg, ckt);
+                stb_sens_load_ac(sg, ckt);
+
+                ovalue.rValue = sg->value;
+                stb_sens_setp(sg, ckt, &ovalue);
+                stb_sens_temp(sg, ckt);
+
+                /* sensDeltaY/sens_dI/sens_dII now hold delta*(dY/dp),
+                 * delta*(db/dp) for this ISOLATED device (sgen's own
+                 * temporary instance-unlinking keeps DEVsetup/DEVacLoad
+                 * from touching any sibling instance -- cktsgen.c). */
+
+                SMPmultiply(sensDeltaY, sens_mv_re, sens_x1_re, sens_mv_im, sens_x1_im);
+                for (i = 0; i <= size; i++) {
+                    sens_mv_re[i] = sens_dI[i] - sens_mv_re[i];
+                    sens_mv_im[i] = sens_dII[i] - sens_mv_im[i];
+                }
+                {
+                    STBcplx dvv = stb_sens_dot(sens_lamv_re, sens_lamv_im, sens_mv_re, sens_mv_im, size);
+                    STBcplx dii = stb_sens_dot(sens_lami_re, sens_lami_im, sens_mv_re, sens_mv_im, size);
+                    dv1.re = dvv.re / delta_var; dv1.im = dvv.im / delta_var;
+                    di1.re = dii.re / delta_var; di1.im = dii.im / delta_var;
+                }
+
+                SMPmultiply(sensDeltaY, sens_mv_re, sens_x2_re, sens_mv_im, sens_x2_im);
+                for (i = 0; i <= size; i++) {
+                    sens_mv_re[i] = sens_dI[i] - sens_mv_re[i];
+                    sens_mv_im[i] = sens_dII[i] - sens_mv_im[i];
+                }
+                {
+                    STBcplx dvv = stb_sens_dot(sens_lamv_re, sens_lamv_im, sens_mv_re, sens_mv_im, size);
+                    STBcplx dii = stb_sens_dot(sens_lami_re, sens_lami_im, sens_mv_re, sens_mv_im, size);
+                    dv2.re = dvv.re / delta_var; dv2.im = dvv.im / delta_var;
+                    di2.re = dii.re / delta_var; di2.im = dii.im / delta_var;
+                }
+
+                /* s = 2*(i1*v2 - v1*i2) + v1 + i2
+                 * ds/dp = 2*(di1*v2 + i1*dv2 - dv1*i2 - v1*di2) + dv1 + di2
+                 * T = s/(1-s)  =>  dT/dp = ds/dp / (1-s)^2 */
+                {
+                    STBcplx term1 = stb_cmul(di1, v2);
+                    STBcplx term2 = stb_cmul(i1, dv2);
+                    STBcplx term3 = stb_cmul(dv1, i2);
+                    STBcplx term4 = stb_cmul(v1, di2);
+                    STBcplx inner = stb_csub(stb_cadd(term1, term2), stb_cadd(term3, term4));
+                    STBcplx two_inner; two_inner.re = 2.0 * inner.re; two_inner.im = 2.0 * inner.im;
+                    STBcplx dsdp = stb_cadd(stb_cadd(two_inner, dv1), di2);
+                    STBcplx one_minus_s = stb_csub(one, s);
+                    STBcplx denom = stb_cmul(one_minus_s, one_minus_s);
+                    dT = stb_cdiv(dsdp, denom);
+                }
+
+                dTdp_re[k][npts] = dT.re;
+                dTdp_im[k][npts] = dT.im;
+                k++;
+            }
+
+            ckt->CKTrhs = save_rhs; ckt->CKTirhs = save_irhs; ckt->CKTmatrix = save_matrix;
+        }
+
         npts++;
 
         {
@@ -796,6 +1243,21 @@ STBan(CKTcircuit *ckt, int restart)
             valueData.v.numValue = 2;
             valueData.v.vec.cVec = data;
             SPfrontEnd->OUTpData(stbPlot, &freqData, &valueData);
+        }
+
+        if (sens_requested && nsens > 0) {
+            IFvalue freqData, valueData;
+            IFcomplex *data = TMALLOC(IFcomplex, nsens);
+            int kk;
+            for (kk = 0; kk < nsens; kk++) {
+                data[kk].real = dTdp_re[kk][npts - 1];
+                data[kk].imag = dTdp_im[kk][npts - 1];
+            }
+            freqData.rValue = freq;
+            valueData.v.numValue = nsens;
+            valueData.v.vec.cVec = data;
+            SPfrontEnd->OUTpData(sensPlot, &freqData, &valueData);
+            tfree(data);
         }
 
         switch (job->STBstepType) {
@@ -816,14 +1278,18 @@ STBan(CKTcircuit *ckt, int restart)
 endsweep:
     SPfrontEnd->OUTendPlot(stbPlot);
     stbPlot = NULL;
+    if (sensPlot) {
+        SPfrontEnd->OUTendPlot(sensPlot);
+        sensPlot = NULL;
+    }
     ckt->CKTcurrentAnalysis = 0;
 
     /* ---- margins: post-process the whole T(f) trace, mirroring
      * tools/stbcore.margins() exactly (log-f interpolation, unwrapped
      * phase, worst-of-several-crossings, "no crossing" is never a number) */
     {
-        double *phs = TMALLOC(double, npts);
         double prevp = 0.0;
+        phs = TMALLOC(double, npts);
         for (i = 0; i < npts; i++) {
             double p = 180.0 / M_PI * stb_cph(Tarr[i]);
             if (i > 0) {
@@ -849,7 +1315,7 @@ endsweep:
                  * decreasing through this crossing (the usual stability-margin
                  * crossing), 0.0 when it is rising (PM here, even < 180 deg, is
                  * not the textbook margin -- see the printed warning below). */
-                pmx = push_crossing(pmx, &npm, &capm, fc, 180.0 + ph, m1 < m0 ? 1.0 : 0.0);
+                pmx = push_crossing(pmx, &npm, &capm, fc, 180.0 + ph, m1 < m0 ? 1.0 : 0.0, t2, i);
             }
             lo = p0 < p1 ? p0 : p1;
             hi = p0 < p1 ? p1 : p0;
@@ -860,12 +1326,11 @@ endsweep:
                     double fc = interp_logf(f0, f1, p0, p1, target);
                     double t2 = (target - p0) / (p1 - p0);
                     double mag = m0 + t2 * (m1 - m0);
-                    gmx = push_crossing(gmx, &ngm, &capg, fc, -mag, target);
+                    gmx = push_crossing(gmx, &ngm, &capg, fc, -mag, target, t2, i);
                 }
                 n++;
             }
         }
-        tfree(phs);
     }
 
     {
@@ -979,6 +1444,106 @@ endsweep:
             printf("stb%s%s: note: integrator-like low-frequency behaviour\n",
                 job->JOBname ? " " : "", job->JOBname ? (char *) job->JOBname : "");
         }
+
+        /* card #475: dPM/dp, dfc/dp (implicit differentiation of the
+         * crossing condition |T(fc)|=1 through the SAME bracket/log-f
+         * interpolation the crossing search above used) and dGM/dp (a
+         * plain chain-rule readout at the gain crossing's own fixed
+         * phase point -- see the design comment above stb_sens_dot()).
+         * "no crossing" (pmi/gmi < 0) reports NaN here too, same rule as
+         * phaseMargin/gainMargin themselves: never a number for a
+         * quantity that was not actually measured. */
+        if (sens_requested && nsens > 0) {
+            IFuid *suids = TMALLOC(IFuid, 3 * nsens);
+            double *sout = TMALLOC(double, 3 * nsens);
+            runDesc *splot = NULL;
+            double snan = strtod("NaN", NULL);
+            int kk;
+
+            for (kk = 0; kk < nsens; kk++) {
+                char nbuf[340];
+                int ci;
+
+                snprintf(nbuf, sizeof nbuf, "dPM_d%s", sensNames[kk]);
+                for (ci = 0; nbuf[ci]; ci++) if (nbuf[ci] == ':') nbuf[ci] = '_';
+                SPfrontEnd->IFnewUid(ckt, &suids[3 * kk + 0], NULL, nbuf, UID_OTHER, NULL);
+                snprintf(nbuf, sizeof nbuf, "dfc_d%s", sensNames[kk]);
+                for (ci = 0; nbuf[ci]; ci++) if (nbuf[ci] == ':') nbuf[ci] = '_';
+                SPfrontEnd->IFnewUid(ckt, &suids[3 * kk + 1], NULL, nbuf, UID_OTHER, NULL);
+                snprintf(nbuf, sizeof nbuf, "dGM_d%s", sensNames[kk]);
+                for (ci = 0; nbuf[ci]; ci++) if (nbuf[ci] == ':') nbuf[ci] = '_';
+                SPfrontEnd->IFnewUid(ckt, &suids[3 * kk + 2], NULL, nbuf, UID_OTHER, NULL);
+
+                sout[3 * kk + 0] = snan;
+                sout[3 * kk + 1] = snan;
+                sout[3 * kk + 2] = snan;
+
+                if (pmi >= 0) {
+                    int idx = pmx[pmi].idx;
+                    double t2v = pmx[pmi].t2;
+                    double f0 = freqs[idx], f1 = freqs[idx + 1];
+                    double x0 = log(f0), x1 = log(f1);
+                    STBcplx Tc, dTc;
+                    double Tcmag2;
+
+                    Tc.re = Tarr[idx].re + t2v * (Tarr[idx + 1].re - Tarr[idx].re);
+                    Tc.im = Tarr[idx].im + t2v * (Tarr[idx + 1].im - Tarr[idx].im);
+                    dTc.re = dTdp_re[kk][idx] + t2v * (dTdp_re[kk][idx + 1] - dTdp_re[kk][idx]);
+                    dTc.im = dTdp_im[kk][idx] + t2v * (dTdp_im[kk][idx + 1] - dTdp_im[kk][idx]);
+                    Tcmag2 = Tc.re * Tc.re + Tc.im * Tc.im;
+
+                    if (Tcmag2 > 0.0 && x1 != x0) {
+                        /* d ln|T|/dp = Re(dT/dp / T) = Re(dT/dp * conj(T)) / |T|^2 */
+                        double dGdp = (dTc.re * Tc.re + dTc.im * Tc.im) / Tcmag2;
+                        double m0log = log(stb_cmag(Tarr[idx]));
+                        double m1log = log(stb_cmag(Tarr[idx + 1]));
+                        double dGdx = (m1log - m0log) / (x1 - x0);
+                        /* d(arg T)/dp [rad] = Im(dT/dp / T) = Im(dT/dp*conj(T))/|T|^2 */
+                        double dphidp_deg = (180.0 / M_PI) * (dTc.im * Tc.re - dTc.re * Tc.im) / Tcmag2;
+                        double dphidx_deg = (phs[idx + 1] - phs[idx]) / (x1 - x0);
+                        double fc = pmx[pmi].freq;
+
+                        if (dGdx != 0.0) {
+                            double dxdp = -dGdp / dGdx;
+                            sout[3 * kk + 0] = dphidp_deg + dphidx_deg * dxdp;  /* dPM/dp */
+                            sout[3 * kk + 1] = fc * dxdp;                       /* dfc/dp */
+                        }
+                    }
+                }
+
+                if (gmi >= 0) {
+                    int idx = gmx[gmi].idx;
+                    double t2v = gmx[gmi].t2;
+                    STBcplx Tc, dTc;
+                    double Tcmag2;
+
+                    Tc.re = Tarr[idx].re + t2v * (Tarr[idx + 1].re - Tarr[idx].re);
+                    Tc.im = Tarr[idx].im + t2v * (Tarr[idx + 1].im - Tarr[idx].im);
+                    dTc.re = dTdp_re[kk][idx] + t2v * (dTdp_re[kk][idx + 1] - dTdp_re[kk][idx]);
+                    dTc.im = dTdp_im[kk][idx] + t2v * (dTdp_im[kk][idx + 1] - dTdp_im[kk][idx]);
+                    Tcmag2 = Tc.re * Tc.re + Tc.im * Tc.im;
+
+                    if (Tcmag2 > 0.0) {
+                        /* GM = -20*log10|T|  =>  dGM/dp = -20/ln(10) * Re(dT/dp/T) */
+                        double dGdp = (dTc.re * Tc.re + dTc.im * Tc.im) / Tcmag2;
+                        sout[3 * kk + 2] = -20.0 / log(10.0) * dGdp;
+                    }
+                }
+            }
+
+            error = SPfrontEnd->OUTpBeginPlot(ckt, ckt->CKTcurJob,
+                (IFuid) "STB dMargins/dp", NULL, 0, 3 * nsens, suids, IF_REAL, &splot);
+            if (!error) {
+                IFvalue refval, outdata;
+                refval.rValue = 0;
+                outdata.v.numValue = 3 * nsens;
+                outdata.v.vec.rVec = sout;
+                SPfrontEnd->OUTpData(splot, &refval, &outdata);
+                SPfrontEnd->OUTendPlot(splot);
+            }
+            tfree(suids);
+            tfree(sout);
+        }
     }
 
     if (freqs) tfree(freqs);
@@ -986,6 +1551,40 @@ endsweep:
     if (LGarr) tfree(LGarr);
     if (pmx) tfree(pmx);
     if (gmx) tfree(gmx);
+    if (phs) tfree(phs);
+
+    /* card #475: sensitivity scratch, freed unconditionally -- every
+     * pointer here is either NULL (sens not requested / nsens==0) or was
+     * allocated exactly once, above. */
+    if (nsens > 0) {
+        int kk;
+        for (kk = 0; kk < nsens; kk++) {
+            tfree(sensNames[kk]);
+            if (dTdp_re) tfree(dTdp_re[kk]);
+            if (dTdp_im) tfree(dTdp_im[kk]);
+        }
+    }
+    if (sensNames) tfree(sensNames);
+    if (sensVecUids) tfree(sensVecUids);
+    if (dTdp_re) tfree(dTdp_re);
+    if (dTdp_im) tfree(dTdp_im);
+    /* SMPdestroy() frees the matrix's own internals; the small SMPmatrix
+     * wrapper itself is left un-freed here, matching cktsens.c's existing
+     * DC/AC `.sens' (its own delta_Y, same TMALLOC+SMPdestroy pattern,
+     * never tfree()s the wrapper either) -- not changed for this fork. */
+    if (sensDeltaY) SMPdestroy(sensDeltaY);
+    if (sens_lamv_re) tfree(sens_lamv_re);
+    if (sens_lamv_im) tfree(sens_lamv_im);
+    if (sens_lami_re) tfree(sens_lami_re);
+    if (sens_lami_im) tfree(sens_lami_im);
+    if (sens_x1_re) tfree(sens_x1_re);
+    if (sens_x1_im) tfree(sens_x1_im);
+    if (sens_x2_re) tfree(sens_x2_re);
+    if (sens_x2_im) tfree(sens_x2_im);
+    if (sens_dI) tfree(sens_dI);
+    if (sens_dII) tfree(sens_dII);
+    if (sens_mv_re) tfree(sens_mv_re);
+    if (sens_mv_im) tfree(sens_mv_im);
 
     return OK;
 }

@@ -42,6 +42,19 @@ typedef struct {
     unsigned int STBprobeName2Given : 1;
     int STBmode;           /* 0 = single-ended (default), 1 = dm, 2 = cm */
     unsigned int STBmodeGiven : 1;
+    /* card #475 (plan T10.7), 2026-09-29: adjoint sensitivity, sens=all |
+     * sens=<name> (repeatable -- see stban.c's top-of-file comment and
+     * inp2dot.c's dot_stb() for why a comma-separated list was NOT used:
+     * the same tokenizer comma-splitting hazard probe=Vp,Vn already hit,
+     * card #457). "all" (case-insensitive) sets STBsensAll and ignores any
+     * further sens=<name>; otherwise each sens=<name> token (may include
+     * '*'/'?' wildcards, matched against the same "instance[:keyword]"
+     * naming cktsens.c's own .sens analysis uses) is appended to
+     * STBsensNames. Loop mode only -- refused (E_PARMVAL) together with
+     * device mode or probe2=/mode=dm|cm, see stban.c. */
+    IFuid *STBsensNames;
+    int STBsensCount;
+    unsigned int STBsensAll : 1;
 } STBAN;
 
 enum {
@@ -55,6 +68,7 @@ enum {
     STB_LOCALGND,
     STB_PROBE2,
     STB_MODE,
+    STB_SENS,
 };
 
 enum {

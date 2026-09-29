@@ -673,6 +673,23 @@ dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
             INPtermInsert(ckt, &nname, tab, &nnode);
             ptemp.nValue = nnode;
             GCA(INPapName, (ckt, which, foo, "localgnd", &ptemp));
+        } else if (cieq(key, "sens")) {
+            /* card #475: sens=all | sens=<name> (repeatable -- see
+             * stbdefs.h's STBAN comment for why not a comma list).
+             * INPgetNetTok (not INPgetTok) for the same reason localgnd=
+             * above uses it: no comma/sign-splitting surprises, single
+             * token only ("all" or one parameter name, which may contain
+             * '*'/'?' wildcards -- neither is a tokenizer hazard). */
+            char *name;
+            INPgetNetTok(&line, &name, 1);
+            if (!*name) {
+                LITERR("'.stb' sens= needs a value (\"all\" or a parameter name)\n");
+                tfree(name);
+                return (0);
+            }
+            INPinsert(&name, tab);
+            ptemp.uValue = name;
+            GCA(INPapName, (ckt, which, foo, "sens", &ptemp));
         } else {
             fprintf(stderr, "Error: unknown parameter '%s' on .stb - ignored\n", key);
             INPgetTok(&line, &mline, 1); /* consume the value so parsing can continue */
