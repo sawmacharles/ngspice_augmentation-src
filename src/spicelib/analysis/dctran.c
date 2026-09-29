@@ -21,6 +21,9 @@ Modified: 2023 XSPICE breakpoint fix for shared ngspice by Vyacheslav Shevchuk
 #include "ngspice/sperror.h"
 #include "ngspice/fteext.h"
 #include "ngspice/missing_math.h"
+#ifdef WITH_PSS
+#include "pssshoot.h"   /* card #458 second pass: breakpoint-forcing hooks */
+#endif
 
 /* for setting breakpoints required by dbs data base */
 extern struct dbcomm *dbs;
@@ -224,6 +227,17 @@ DCtran(CKTcircuit *ckt,
         ckt->CKTbreaks[0] = 0;
         ckt->CKTbreaks[1] = ckt->CKTfinalTime;
         ckt->CKTbreakSize = 2;
+
+        /* card #458 second pass: force this run onto a caller-supplied
+           breakpoint set (a `.pss method=shoot` Newton iteration's own
+           baseline-run accepted times), so a perturbed monodromy period
+           run retraces the identical step grid instead of deriving its
+           own -- see pssshoot.h. No-op (single flag test) for every other
+           use of DCtran(), including plain `.tran` and driven-mode `.pss`. */
+#ifdef WITH_PSS
+        if (PSSbreakInstallActive)
+            PSSbreakInstallHook(ckt);
+#endif
 
 #ifdef SHARED_MODULE
         add_bkpt();
@@ -474,6 +488,15 @@ DCtran(CKTcircuit *ckt,
         UPDATE_STATS(DOING_TRAN);
         return(error);
     }
+
+    /* card #458 second pass: record this accepted time for a `.pss
+       method=shoot` baseline run so later period runs in the same Newton
+       iteration can be forced onto the same grid (see pssshoot.h). No-op
+       otherwise. */
+#ifdef WITH_PSS
+    if (PSSbreakRecordActive)
+        PSSbreakRecordStep(ckt);
+#endif
 
 #ifdef XSPICE
     /*  Send evt data stuff in shared library */

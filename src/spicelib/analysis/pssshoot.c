@@ -91,6 +91,8 @@ What this does NOT do (see the card #458 report for the full list):
 #include <string.h>
 #include <stdlib.h>
 
+#include "pssshoot.h"
+
 /* ------------------------------------------------------------------ */
 /* State-vector bookkeeping: one entry per native capacitor (terminal
  * voltage) and one per native inductor (branch current).              */
@@ -249,6 +251,114 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
 
 
 /* ------------------------------------------------------------------ */
+/* SUSPECTED CAUSE 2 (card #458 second pass): breakpoint-forcing support so
+ * every period run within one Newton iteration retraces the SAME accepted
+ * time grid -- see pssshoot.h for the design note and why this was chosen
+ * over the fuller analytic S_k/J_k/C_k recursion. int, not bool, to match
+ * the extern declarations dctran.c sees without pulling in <stdbool.h>. */
+int PSSbreakRecordActive  = 0;
+int PSSbreakInstallActive = 0;
+
+static double *g_break_times = NULL;
+static int g_break_count = 0, g_break_cap = 0;
+
+static void
+pss_break_reset(void)
+{
+    g_break_count = 0;
+}
+
+static void
+pss_break_free(void)
+{
+    if (g_break_times) tfree(g_break_times);
+    g_break_times = NULL;
+    g_break_count = g_break_cap = 0;
+}
+
+/* Called from dctran.c right after CKTaccept() when PSSbreakRecordActive. */
+void
+PSSbreakRecordStep(CKTcircuit *ckt)
+{
+    if (ckt->CKTtime <= 0.0)
+        return;   /* t=0 is already a breakpoint; nothing to add */
+
+    /* Thin clustered accepted times before recording them. Found on the
+     * R3 fixture: forcing EVERY accepted time verbatim (including a long
+     * run right at/near CKTdelmin, where the baseline's own LTE control
+     * was already stepping as finely as it could resolve a steep tanh
+     * transition) made a perturbed run's corrector fail to converge
+     * exactly at those forced points ("Timestep too small") -- the
+     * perturbed trajectory's edge lands at a very slightly different time
+     * than the baseline's, and forcing arrival at a long sequence of
+     * sub-CKTdelmin-spaced points fights the corrector instead of
+     * removing noise. Keeping only points at least maxStep*1e-3 apart
+     * still constrains the grid everywhere it matters (this is still
+     * ~1000x finer than the nominal per-period sampling) while leaving
+     * the solver its own adaptive freedom within a cluster narrower than
+     * that -- which is exactly the timescale too fine to matter for a
+     * Newton monodromy estimate anyway. */
+    if (g_break_count > 0 &&
+        (ckt->CKTtime - g_break_times[g_break_count - 1]) < ckt->CKTmaxStep * 1e-3)
+        return;
+
+    if (g_break_count >= g_break_cap) {
+        int newcap = g_break_cap ? g_break_cap * 2 : 256;
+        double *nt = TREALLOC(double, g_break_times, newcap);
+        if (!nt)
+            return;   /* out of memory: degrade to unforced steps past here,
+                          rather than crash -- the perturbed run may then
+                          reintroduce some noise, but never a wrong answer */
+        g_break_times = nt;
+        g_break_cap = newcap;
+    }
+    g_break_times[g_break_count++] = ckt->CKTtime;
+}
+
+/* Called from dctran.c right after the restart-path breakpoint reset, when
+ * PSSbreakInstallActive. Uses ngspice's own, unmodified CKTsetBreak(), so
+ * every existing invariant it maintains (sorted list, CKTminBreak dedup,
+ * "no breakpoint in the past") is preserved exactly. */
+void
+PSSbreakInstallHook(CKTcircuit *ckt)
+{
+    int i;
+    for (i = 0; i < g_break_count; i++) {
+        double tt = g_break_times[i];
+        if (tt > 0.0 && tt < ckt->CKTfinalTime)
+            CKTsetBreak(ckt, tt);
+    }
+}
+
+/* Wraps pss_run_period(): record=1 captures this run's own accepted grid
+ * (resetting whatever was recorded before); force=1 installs the
+ * currently-recorded grid as breakpoints on this run instead. Never both:
+ * a run either DEFINES the grid for this Newton iteration (the baseline
+ * P(x0) evaluation) or FOLLOWS a previously-defined one (every perturbed
+ * and trial run in the same iteration). */
+static int
+pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
+                   int record, int force)
+{
+    int err;
+
+    if (getenv("PSS_SHOOT_NO_FORCE") != NULL)
+        force = 0;   /* debug/isolation switch, card #458 second pass */
+
+    if (record)
+        pss_break_reset();
+    PSSbreakRecordActive  = record;
+    PSSbreakInstallActive = force;
+
+    err = pss_run_period(ckt, T, jobname);
+
+    PSSbreakRecordActive  = 0;
+    PSSbreakInstallActive = 0;
+    return err;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Small dense linear solve (Gauss elimination, partial pivoting) --
  * n is never more than a handful of states here, so this is simpler and
  * safer than routing a tiny dense system through the sparse solver.
@@ -296,64 +406,16 @@ pss_solve_dense(double *A, double *b, int n, double *x)
 }
 
 
-/* Spectral radius of Phi (n*n row-major) by power iteration, plus a
- * cheap period-doubling flag: if the dominant eigenvalue is real and
- * negative, the power-iteration vector's sign flips every pass, which
- * shows up as a negative dot product between successive (normalised)
- * iterates once the direction has settled down. */
-static double
-pss_spectral_radius(double *Phi, int n, int *flip_flag)
-{
-    double *v, *w;
-    int i, j, iter;
-    double lambda = 0.0, prevlambda = -1.0;
-
-    *flip_flag = 0;
-    if (n == 1) {
-        *flip_flag = (Phi[0] < 0.0);
-        return fabs(Phi[0]);
-    }
-
-    v = TMALLOC(double, n);
-    w = TMALLOC(double, n);
-    if (!v || !w) {
-        if (v) tfree(v);
-        if (w) tfree(w);
-        return 0.0;
-    }
-    for (i = 0; i < n; i++)
-        v[i] = 1.0 / sqrt((double) n);
-
-    for (iter = 0; iter < 300; iter++) {
-        double norm = 0.0, dot;
-        for (i = 0; i < n; i++) {
-            double s = 0.0;
-            for (j = 0; j < n; j++)
-                s += Phi[i * n + j] * v[j];
-            w[i] = s;
-        }
-        for (i = 0; i < n; i++)
-            norm += w[i] * w[i];
-        norm = sqrt(norm);
-        if (norm < 1e-300) {
-            lambda = 0.0;
-            break;
-        }
-        dot = 0.0;
-        for (i = 0; i < n; i++)
-            dot += v[i] * (w[i] / norm);
-        for (i = 0; i < n; i++)
-            v[i] = w[i] / norm;
-        lambda = norm;
-        *flip_flag = (dot < 0.0);
-        if (iter > 5 && fabs(lambda - prevlambda) < 1e-9 * (lambda > 1e-300 ? lambda : 1.0))
-            break;
-        prevlambda = lambda;
-    }
-    tfree(v);
-    tfree(w);
-    return lambda;
-}
+/* SUSPECTED CAUSE 1 fix: the former spectral-radius estimator (power
+ * iteration) is gone -- it cannot resolve a complex-conjugate dominant
+ * multiplier pair, which is exactly what a slow oscillation (the R3 x20
+ * red-proof) produces, and that was the confirmed bug (ground truth,
+ * parent, 2026-09-28: nominal R3 got an inconsistent 0.99-2.4, and the
+ * genuinely-unstable x20-gain variant got 0.98 "stable"). Floquet
+ * classification is now pss_eigenvalues() + pss_classify_floquet() from
+ * psseigen.c (full real Hessenberg + double-shift QR eigendecomposition,
+ * validated against an independent root-finder -- see psseigen.c's header
+ * and the card #458 report). */
 
 
 /* ------------------------------------------------------------------ */
@@ -363,12 +425,15 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
 {
     double T = 1.0 / ckt->CKTguessedFreq;
     PSSstateMap map = { 0, NULL };
-    int n, k, j, iter, err, maxiter, flip_flag = 0;
-    double tol, eps, residual = 0.0, specrad = 0.0;
+    int n, k, j, iter, err, maxiter;
+    double tol, eps, residual = 0.0;
     double t_wall_start, t_wall_end;
     int converged_flag = 0;
     double *x0 = NULL, *x1 = NULL, *F = NULL, *Phi = NULL, *delta_x = NULL,
            *xtrial = NULL, *x1trial = NULL, *scale = NULL, *A = NULL, *b = NULL;
+    double save_reltol, save_abstol, save_volttol;
+    PSSfloquet floq;
+    PSScomplex *eig = NULL;
 
     t_wall_start = SPfrontEnd->IFseconds();
 
@@ -377,7 +442,22 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     ckt->CKTmaxStep  = (job->PSSpoints > 0) ? T / (double) job->PSSpoints : T / 200.0;
     ckt->CKTstep     = ckt->CKTmaxStep;
     ckt->CKTdelmin   = 1e-9 * ckt->CKTmaxStep;
-    ckt->CKTminBreak = 0.0;
+    /* CKTminBreak: the first pass set this to 0.0 (every breakpoint kept,
+     * however close together). SUSPECTED CAUSE 2's forced-breakpoint fix
+     * (this card) reinstates every one of a baseline run's accepted times
+     * -- possibly hundreds, tightly clustered right around a smooth
+     * tanh switch transition where the baseline's own LTE control was
+     * already stepping near CKTdelmin -- as breakpoints on the perturbed
+     * runs. With CKTminBreak=0.0 that produced its own failure on the R3
+     * fixture ("Timestep too small" at the pwm node): forcing exact
+     * arrival at a long run of breakpoints separated by less than a
+     * numerically meaningful interval fights the corrector instead of
+     * helping it. ngspice's own plain-`.tran` default (CKTmaxStep*5e-5,
+     * see traninit.c) lets CKTsetBreak()'s existing dedup logic merge
+     * breakpoints closer together than that -- restoring it (instead of
+     * 0.0) fixed the R3 failure while keeping the forced grid everywhere
+     * that actually matters (see the card #458 report). */
+    ckt->CKTminBreak = ckt->CKTmaxStep * 5e-5;
     ckt->CKTinitTime = 0.0;
 
     err = pss_build_state_map(ckt, &map);
@@ -390,6 +470,25 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         return E_UNSUPP;
     }
 
+    /* CKTreltol/abstol/voltTol saved here (single funnel-point restore at
+     * shoot_cleanup). CKTreltol IS tightened below (to 1e-5, AFTER
+     * pre-stabilization only -- see that comment for why not here and not
+     * further, and why not abstol/voltTol). TRIED and reverted on this
+     * card: tightening CKTreltol to 1e-6 (not 1e-5) made even a single,
+     * UNFORCED R3 period run fail outright ("Timestep too small" at the
+     * pwm node) -- the steep tanh switch transition there is already
+     * close to the edge of what CKTdelmin (1e-9*maxStep here) can resolve
+     * at the default tolerance, and 1e-6 pushed it over that edge; 1e-5
+     * (below) does not. CKTvoltTol was also tried tightened (to 1e-9) and
+     * reverted for the same failure mode, so it is left alone entirely.
+     * See the card #458 report for the eps/reltol sweep (PSS_SHOOT_EPS /
+     * PSS_SHOOT_RELTOL / PSS_SHOOT_NO_FORCE debug env vars, still
+     * present, used to produce it). */
+    save_reltol  = ckt->CKTreltol;
+    save_abstol  = ckt->CKTabstol;
+    save_volttol = ckt->CKTvoltTol;
+    memset(&floq, 0, sizeof floq);
+
     x0      = TMALLOC(double, n);
     x1      = TMALLOC(double, n);
     F       = TMALLOC(double, n);
@@ -400,8 +499,9 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     scale   = TMALLOC(double, n);
     A       = TMALLOC(double, n * n);
     b       = TMALLOC(double, n);
+    eig     = TMALLOC(PSScomplex, n);
 
-    if (!x0 || !x1 || !F || !Phi || !delta_x || !xtrial || !x1trial || !scale || !A || !b) {
+    if (!x0 || !x1 || !F || !Phi || !delta_x || !xtrial || !x1trial || !scale || !A || !b || !eig) {
         err = E_NOMEM;
         goto shoot_cleanup;
     }
@@ -440,17 +540,38 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         pss_state_get_ic(&map, x0);
     }
 
+    /* Tighten reltol to 1e-5 for the Newton loop's own (single-period)
+     * runs -- a middle ground found empirically on the R3 fixture on this
+     * card: the default (1e-3) leaves enough per-step solve noise that
+     * finite-difference Newton plateaus around residual ~1e-4 and never
+     * reaches tol; 1e-6 (tried first) pushes R3's steep tanh switch-node
+     * transition past what CKTdelmin can resolve ("Timestep too small").
+     * 1e-5 converges R3 cleanly (see the card #458 report for the
+     * eps/reltol sweep). Only ever applied AFTER pre-stabilization (see
+     * save_reltol's capture above) -- the long multi-period warm-up
+     * transient is left at the deck's own tolerance. PSS_SHOOT_RELTOL
+     * overrides for debugging. */
+    ckt->CKTreltol = getenv("PSS_SHOOT_RELTOL") ? atof(getenv("PSS_SHOOT_RELTOL")) : 1e-5;
+    if (ckt->CKTreltol > save_reltol) ckt->CKTreltol = save_reltol;
+    if (ckt->CKTreltol <= 0.0) ckt->CKTreltol = save_reltol;
+
     maxiter = (job->sc_iter > 0) ? job->sc_iter : 20;
     tol     = (job->steady_coeff > 0.0) ? job->steady_coeff : 1e-6;
-    /* Finite-difference perturbation size for the monodromy columns. Must
-     * sit above the numerical noise floor of the transient itself (each
-     * internal Newton solve only converges to CKTreltol, default 1e-3) or
-     * the finite difference is dominated by noise, not signal -- found on
-     * the R3 fixture: eps=1e-6 gave a Newton direction that could not
-     * reduce the residual even at very small step sizes (the damped
-     * backtracking exhausted all 8 halvings), consistent with a noisy
-     * monodromy estimate rather than a genuinely bad direction. */
-    eps     = 1e-2;
+    /* Finite-difference perturbation size for the monodromy columns.
+     * SUSPECTED CAUSE 2 second-pass fix: pss_run_period_ex(..., force=1)
+     * below forces the +-h perturbation runs onto the SAME accepted time
+     * grid as the baseline (see pssshoot.h), which removes the adaptive-
+     * step-sequence noise the first pass's eps=1e-2 had to sit above.
+     * With that noise source gone (and reltol tightened just above), eps
+     * can shrink a lot: found on the R3 fixture that eps=1e-2 now
+     * actively HURTS (the FD perturbation itself becomes large enough to
+     * shift the switch edge, and forcing the unperturbed grid onto that
+     * shifted trajectory biases the estimate -- Newton stalled/failed at
+     * iteration 1-2), while eps=1e-5 converges R3 in 4 iterations
+     * (residual 2.9e-7) instead of the first pass's 52. */
+    eps     = 1e-5;
+    if (getenv("PSS_SHOOT_EPS"))
+        eps = atof(getenv("PSS_SHOOT_EPS"));
 
     fprintf(stdout, "\nPSS-SHOOT: shooting-Newton PSS, period T=%g s "
             "(f=%g Hz), %d state(s):", T, ckt->CKTguessedFreq, n);
@@ -462,7 +583,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     for (iter = 0; ; iter++) {
 
         pss_state_set_ic(&map, x0);
-        err = pss_run_period(ckt, T, "PSS shoot (Newton baseline period)");
+        err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline period)", 1, 0);
         if (err) {
             fprintf(stderr, "PSS-SHOOT: FAILED -- period integration did "
                     "not complete at Newton iteration %d (ngspice error "
@@ -532,7 +653,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 xtrial[k] = x0[k];
             xtrial[j] = x0[j] + h;
             pss_state_set_ic(&map, xtrial);
-            err = pss_run_period(ckt, T, "PSS shoot (monodromy perturbation +)");
+            err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation +)", 0, 1);
             if (err) {
                 fprintf(stderr, "PSS-SHOOT: FAILED -- monodromy "
                         "perturbation run for state %s (+h) did not "
@@ -548,7 +669,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 xtrial[k] = x0[k];
             xtrial[j] = x0[j] - h;
             pss_state_set_ic(&map, xtrial);
-            err = pss_run_period(ckt, T, "PSS shoot (monodromy perturbation -)");
+            err = pss_run_period_ex(ckt, T, "PSS shoot (monodromy perturbation -)", 0, 1);
             if (err) {
                 fprintf(stderr, "PSS-SHOOT: FAILED -- monodromy "
                         "perturbation run for state %s (-h) did not "
@@ -565,7 +686,10 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * true baseline P(x0) once more for the F(x0) used below (cheap:
          * one extra period run, traded for centred-difference accuracy). */
         pss_state_set_ic(&map, x0);
-        err = pss_run_period(ckt, T, "PSS shoot (Newton baseline, post-monodromy)");
+        /* Not forced: this replays x0 itself (the same point the very
+         * first call in this iteration already ran under record=1), so it
+         * is deterministic either way -- forcing adds no benefit here. */
+        err = pss_run_period_ex(ckt, T, "PSS shoot (Newton baseline, post-monodromy)", 0, 0);
         if (err) {
             fprintf(stderr, "PSS-SHOOT: FAILED -- baseline period "
                     "integration did not complete after the monodromy "
@@ -615,7 +739,21 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                     xtrial[k] = x0[k] + alpha * delta_x[k];
 
                 pss_state_set_ic(&map, xtrial);
-                err = pss_run_period(ckt, T, "PSS shoot (damped-step trial)");
+                /* NOT forced (unlike the FD monodromy columns above): a
+                 * damped trial point x0+alpha*delta_x can be a full Newton
+                 * step away from x0, not an infinitesimal perturbation, so
+                 * there is no reason its true trajectory should retrace
+                 * x0's own accepted grid near a switch edge -- found on
+                 * the R3 fixture that forcing it anyway made the residual
+                 * oscillate for 20+ iterations instead of converging
+                 * (the forced grid was measuring the trial point's
+                 * residual at the WRONG place relative to its own,
+                 * shifted switching edge, corrupting the line search this
+                 * block is trying to do). This call evaluates the actual
+                 * nonlinear residual F(xtrial), not a finite difference,
+                 * so it wants its own natural adaptive grid, same as
+                 * before this card. */
+                err = pss_run_period_ex(ckt, T, "PSS shoot (damped-step trial)", 0, 0);
                 if (!err) {
                     double newresidual = 0.0;
                     pss_state_get(&map, ckt, x1trial);
@@ -671,26 +809,33 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         goto shoot_fail;
     }
 
-    /* Floquet report: recompute Phi once more at x0 (now converged) with a
-     * smaller, steadier perturbation than the eps=1e-2 Newton ended up
-     * needing. eps=1e-2 was needed during the iteration to get a
-     * perturbation clearly above the adaptive-step transient's own
-     * noise floor (found on the R3 fixture: eps=1e-4 gave a Newton
-     * direction that could not improve the residual at all, plateauing
-     * well short of tol -- see the eps history above); that size is more
-     * than the local linearisation really wants for an eigenvalue
-     * estimate on these steep tanh switches, since the perturbed run can
-     * cross into a visibly different (if still locally linear-ish)
-     * regime. At the converged x0 (not mid-iteration) a smaller,
-     * more classically-scaled eps is worth trying for this one purpose;
-     * fall back to the Newton-loop Phi if this second pass fails to run. */
+    /* Floquet report: recompute Phi once more at x0 (now converged), with
+     * a perturbation size tuned separately from the Newton loop's own eps
+     * (see below). SUSPECTED CAUSE 2's fix forces this run and its +-h
+     * perturbations onto the SAME accepted time grid
+     * (pss_run_period_ex(..., force=1) below, using the grid the Floquet
+     * baseline run just recorded), removing the adaptive-step MISMATCH
+     * between separate period runs that the first pass's eps=1e-3 was
+     * still exposed to (reltol tightening was also tried, to address the
+     * OTHER noise source -- per-step solve tolerance -- but reverted; see
+     * the comment above save_reltol's capture). Falls back to the
+     * Newton-loop's own last Phi if
+     * this dedicated pass fails to run. */
     {
-        double eps_floquet = 1e-3;
+        /* Reuse the Newton loop's own eps (not a separate, untested
+         * constant): it is already tuned above to be small enough to be
+         * accurate under the forced grid, and large enough to clear the
+         * per-step solve noise floor at the tightened reltol. A separate,
+         * larger eps_floquet=1e-4 was tried on this card and failed to
+         * run at all on R3 ("Timestep too small") -- the same "FD
+         * perturbation large enough to shift a forced switch edge"
+         * problem eps=1e-2 caused in the Newton loop itself. */
+        double eps_floquet = eps;
         double *Phi2 = TMALLOC(double, n * n);
         int floquet_ok = (Phi2 != NULL);
 
         pss_state_set_ic(&map, x0);
-        if (floquet_ok && pss_run_period(ckt, T, "PSS shoot (Floquet baseline)"))
+        if (floquet_ok && pss_run_period_ex(ckt, T, "PSS shoot (Floquet baseline)", 1, 0))
             floquet_ok = 0;
         if (floquet_ok)
             pss_state_get(&map, ckt, x1);
@@ -702,7 +847,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n; k++) xtrial[k] = x0[k];
             xtrial[j] = x0[j] + h;
             pss_state_set_ic(&map, xtrial);
-            if (pss_run_period(ckt, T, "PSS shoot (Floquet perturbation +)")) {
+            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet perturbation +)", 0, 1)) {
                 floquet_ok = 0;
                 break;
             }
@@ -713,7 +858,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n; k++) xtrial[k] = x0[k];
             xtrial[j] = x0[j] - h;
             pss_state_set_ic(&map, xtrial);
-            if (pss_run_period(ckt, T, "PSS shoot (Floquet perturbation -)")) {
+            if (pss_run_period_ex(ckt, T, "PSS shoot (Floquet perturbation -)", 0, 1)) {
                 floquet_ok = 0;
                 break;
             }
@@ -722,15 +867,22 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 Phi2[k * n + j] = (Phi2[k * n + j] - x1trial[k]) / (2.0 * h);
         }
 
-        if (floquet_ok) {
-            specrad = pss_spectral_radius(Phi2, n, &flip_flag);
-        } else {
-            fprintf(stderr, "PSS-SHOOT: WARNING -- the dedicated Floquet "
-                    "re-evaluation (eps=%g) failed to run; reporting the "
-                    "spectral radius from the last Newton-step monodromy "
-                    "(eps=%g) instead, which may be less accurate.\n",
-                    eps_floquet, eps);
-            specrad = pss_spectral_radius(Phi, n, &flip_flag);
+        {
+            const double *src = floquet_ok ? Phi2 : Phi;
+            if (!floquet_ok)
+                fprintf(stderr, "PSS-SHOOT: WARNING -- the dedicated Floquet "
+                        "re-evaluation (eps=%g) failed to run; reporting the "
+                        "eigenvalues of the last Newton-step monodromy "
+                        "(eps=%g) instead, which may be less accurate.\n",
+                        eps_floquet, eps);
+            if (pss_eigenvalues(src, n, eig) != 0) {
+                fprintf(stderr, "PSS-SHOOT: WARNING -- the eigenvalue solver "
+                        "did not converge on the monodromy matrix; Floquet "
+                        "report is NOT trustworthy this run.\n");
+                floq.valid = 0;
+            } else {
+                pss_classify_floquet(eig, n, &floq);
+            }
         }
         if (Phi2) tfree(Phi2);
         /* restore the baseline transient's data (x1/Phi corrupted as
@@ -740,12 +892,25 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     }
     t_wall_end = SPfrontEnd->IFseconds();
 
+    if (getenv("PSS_SHOOT_DEBUG") && floq.valid) {
+        fprintf(stderr, "DEBUG Floquet multipliers (%d):", n);
+        for (k = 0; k < n; k++)
+            fprintf(stderr, " (%.6g%+.6gi)", eig[k].re, eig[k].im);
+        fprintf(stderr, "\n");
+    }
+
     fprintf(stdout, "\nPSS-SHOOT: CONVERGED iter=%d residual=%.6e "
             "spectral_radius=%.6f %s wall_time=%.3fs\n",
-            iter, residual, specrad,
-            specrad >= 1.0 ? (flip_flag ? "UNSTABLE(period-doubling)" : "UNSTABLE")
-                           : "stable",
+            iter, residual, floq.valid ? floq.spectral_radius : -1.0,
+            !floq.valid ? "UNKNOWN(eigensolve-failed)" :
+            floq.unstable ? (floq.period_doubling ? "UNSTABLE(period-doubling)" :
+                              floq.oscillation ? "UNSTABLE(oscillation)" : "UNSTABLE")
+                          : "stable",
             t_wall_end - t_wall_start);
+    if (floq.valid)
+        fprintf(stdout, "PSS-SHOOT: FLOQUET dominant_multiplier=%.6g%+.6gi "
+                "angle_deg=%.3f\n", floq.dominant.re, floq.dominant.im,
+                atan2(floq.dominant.im, floq.dominant.re) * 180.0 / M_PI);
 
     /* Emit the converged trajectory as an ordinary time-domain plot, same
      * title the existing driven-mode algorithm uses. */
@@ -761,6 +926,11 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     err = OK;
 
  shoot_cleanup:
+    ckt->CKTreltol  = save_reltol;
+    ckt->CKTabstol  = save_abstol;
+    ckt->CKTvoltTol = save_volttol;
+    PSSbreakRecordActive = PSSbreakInstallActive = 0;
+    pss_break_free();
     if (x0) tfree(x0);
     if (x1) tfree(x1);
     if (F) tfree(F);
@@ -771,6 +941,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     if (scale) tfree(scale);
     if (A) tfree(A);
     if (b) tfree(b);
+    if (eig) tfree(eig);
     if (map.refs) tfree(map.refs);
     return err;
 
