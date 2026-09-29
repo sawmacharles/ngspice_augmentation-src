@@ -903,6 +903,7 @@ static int g_salt_first_step_pending = 0;   /* card #494 third pass: restart fil
 static double g_salt_prev_time = -1.0;      /* card #494 fifth pass: h_dot's true-elapsed-time tracker */
 static double g_salt_settle_until = -1.0;   /* card #494 fifth pass: force-order-1 window deadline */
 static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
+static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_ind_jump() */
 
 void
 PSSsaltReset(void)
@@ -911,6 +912,7 @@ PSSsaltReset(void)
     g_salt_prev_time = -1.0;
     g_salt_settle_until = -1.0;
     g_salt_events_seen = 0;
+    g_salt_ind_warned = 0;   /* card #510 step 1: once per analysis (fresh period/recording run) */
 }
 
 int
@@ -1296,6 +1298,27 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
      * the FIFTH pass root-caused for the capacitor case (docs/pss-pac.md's
      * "FOURTH pass"/"FIFTH pass" sections) -- found to matter here too. */
     *out_tau = found->INDinduct / (g_prev + Gsum);
+
+    /* card #510 step 1 (maintainer decision: MERGE WITH A WARNING, not hold --
+     * see the report): this path is genuinely less validated than the
+     * THIRD pass's capacitor case (0.001dB on R6o) -- measured worst case
+     * ~3.6dB/3.1deg vs tools/pac_perturbed.py on pac_sw_ctrl_direct.cir,
+     * see docs/pss-pac.md's card #510 section -- so every analysis that
+     * actually takes it must say so, once, unmissably, on stderr. Gated
+     * by g_salt_ind_warned (cleared by PSSsaltReset(), so once per fresh
+     * period/recording run == once per .pac/.pstb/.pss/.pxf analysis, the
+     * same granularity patch 0904's VALIDATED-BAND GUARD warning uses) --
+     * never fires for a deck whose events all resolve via the capacitor
+     * case (R6o and every other existing fixture), confirmed by
+     * tests/test_pac.py's new check_pac_ind_jump_warning(). */
+    if (!g_salt_ind_warned) {
+        g_salt_ind_warned = 1;
+        fprintf(stderr, "PAC-TD: WARNING -- saltation via inductor-routed jump at node %s "
+                "(no capacitor at the switch node): validated only to ~4 dB/3 deg vs an "
+                "independent reference (card #510); cross-check with tools/pac_perturbed.py "
+                "-- see docs/pss-pac.md's card #510 section.\n",
+                NODENAME(ckt, node));
+    }
     return 1;
 }
 
