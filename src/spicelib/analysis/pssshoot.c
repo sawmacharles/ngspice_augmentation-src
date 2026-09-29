@@ -4501,28 +4501,11 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * overwritten by a record=1 call, and every record=1 call left in
      * this file by this fix runs before this point). */
     pss_state_set_ic(&map, x0);
-    /* card #505: emit the orbit from an exact REPLAY of the Floquet baseline
-     * run (a free, LTE-controlled trapezoidal run at the converged x0), not
-     * from the classic forced-breakpoint run (backward-Euler restart at every
-     * recorded time): same accuracy as a plain .tran at this reltol. Measured
-     * on R4d: the classic-forced emission put the vc orbit 0.21 % of ripple
-     * from the settled .tran reference (target 0.1 %). Falls back to the
-     * classic forced run if the replay run fails. PSS_NO_REPLAY_EMIT
-     * disables. */
-    {
-        int saved_mode = g_replay_mode;
-        int used_replay = 0;
-        if (g_rp_n > 0 && !g_pss_has_switch && getenv("PSS_NO_REPLAY_EMIT") == NULL) {
-            g_replay_mode = 1;
-            used_replay = 1;
-        }
-        err = pss_run_period_ex_safe(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
-        if (err && used_replay) {
-            g_replay_mode = saved_mode;
-            err = pss_run_period_ex_safe(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
-        }
-        g_replay_mode = saved_mode;
-    }
+    /* card #505: the emission follows the Newton run's own map (replay if the
+     * replay rung converged, classic forced otherwise). Emitting via replay
+     * after a CLASSIC convergence was tried and made R4d's orbit 1-2 % of
+     * ripple off the .tran reference (vs 0.01 % classic). */
+    err = pss_run_period_ex_safe(ckt, T, "Time Domain Periodic Steady State Analysis", 0, 1);
     if (err) {
         fprintf(stderr, "PSS-SHOOT: WARNING -- converged, but the final "
                 "trajectory output run failed (ngspice error %d); the "
