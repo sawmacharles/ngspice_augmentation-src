@@ -80,6 +80,10 @@ implement (see the card #457 report's "what was not done").
  * in a way that does not visibly reduce to the same two-vector rank-1
  * pattern without more study than this card's budget allowed. */
 #include "mos1/mos1defs.h"
+/* card #460: BSIM4 device mode, probe=<BSIM4 instance>. bsim4def.h
+ * resolves the same way mos1defs.h does above (this directory's
+ * AM_CPPFLAGS already has -I$(top_srcdir)/src/spicelib/devices). */
+#include "bsim4/bsim4def.h"
 
 extern SPICEdev **DEVices;
 
@@ -206,6 +210,74 @@ stb_mos1_probe(GENinstance *inst, STBdevProbe *p)
     return 0;
 }
 
+/* card #460 (plan follow-up to #459): BSIM4 device mode, probe=<BSIM4
+ * instance>. Derivation (see the card #460 report for the full worked
+ * algebra): b4acld.c's AC stamp for gm ALONE (ignoring gmbs, gds, the
+ * GIDL/GISL leakage conductances, and the optional gate-leakage/rgate/
+ * rbody extra rows -- none of which touch the same four corners, see
+ * below) reduces to EXACTLY the same rank-1 pattern as MOS1's, in BOTH
+ * BSIM4mode branches:
+ *   u    = +1 at dNodePrime, -1 at sNodePrime   (forward, BSIM4mode>=0)
+ *          +1 at sNodePrime, -1 at dNodePrime   (reverse, BSIM4mode<0)
+ *   v_gm = +1 at gNodePrime, -1 at (whichever of the above is "node_s")
+ *   scalar = +gm  (BSIM4gm, UNCHANGED sign in both modes -- verified by
+ *          hand against b4acld.c's Gmr/FwdSumr/RevSumr bookkeeping: the
+ *          "node_d/node_s swap" picture below and BSIM4's own reverse-
+ *          mode Gmr=-gmr-plus-unswapped-DP/SP-rows bookkeeping are two
+ *          different-looking but ALGEBRAICALLY IDENTICAL ways of writing
+ *          the same six nonzero matrix entries -- checked corner by
+ *          corner, not assumed)
+ * i.e. this function is stb_mos1_probe() with the field names changed;
+ * the node_d/node_s swap-on-reverse trick reused here for BSIM4 gives
+ * bit-for-bit the same 6 corner entries as b4acld.c's own reverse-mode
+ * Gmr=-gmr bookkeeping produces, by direct hand expansion of both.
+ *
+ * Why the OTHER stamps in b4acld.c don't corrupt this: gds (channel
+ * conductance, incl. its own NQS real/imag split) is a plain 2-terminal
+ * admittance between dNodePrime/sNodePrime -- passive, stays in Y, not
+ * nulled (exactly as MOS1's Rds is never nulled either). GIDL/GISL
+ * (the ggidl-prefixed and ggisl-prefixed fields) and gate-leakage (the
+ * gIxtot-prefixed fields) are separate, genuinely
+ * small leakage-current stamps with their OWN control pattern (not a
+ * scalar multiple of v_gm) -- they are not "the dominant controlled
+ * source" in Tian's sense (nulling them would not render the device
+ * passive; they are leakage, not gain) and are left in Y, same
+ * treatment as gds. rdsMod/rgateMod/rbodyMod add entries at OTHER matrix
+ * corners entirely (Dgp/Sgp/GMgp/DBdb/etc, never DPgp/DPsp/SPgp/SPsp/
+ * DPdp/SPdp), so they don't interact with this derivation regardless of
+ * their setting.
+ *
+ * Scope, deliberately narrow (card #460's own ask -- "quasi-static, NQS
+ * off, first"): QUASI-STATIC ONLY. Under here->BSIM4acnqsMod, b4acld.c
+ * turns Gm into a COMPLEX, frequency-shaped scalar gm*(T2-jT3) (T2,T3
+ * from omega*BSIM4taunet) -- itself STILL a rank-1 update with the SAME
+ * u/v (a per-frequency complex scalar in place of the real gm), so NQS
+ * support is a small, mechanical follow-up (recompute T2/T3 from
+ * ckt->CKTomega and BSIM4taunet here, same formula as b4acld.c) -- NOT
+ * implemented in this card; instances with acnqsMod on are refused
+ * (return nonzero) rather than silently nulling the wrong (real-only)
+ * scalar. gmbs is NOT folded in (same "gm-only" production default as
+ * MOS1, for the same reason -- see stb_mos1_probe()'s doc comment
+ * above); it reduces to rank-1 too (same u, v_gmbs = +1@bNodePrime,
+ * -1@node_s) but was not made the default here either. */
+static int
+stb_bsim4_probe(GENinstance *inst, STBdevProbe *p)
+{
+    BSIM4instance *here = (BSIM4instance *) inst;
+    bool normal = (here->BSIM4mode >= 0);
+
+    if (here->BSIM4acnqsMod)
+        return 1;
+
+    p->node_d = normal ? here->BSIM4dNodePrime : here->BSIM4sNodePrime;
+    p->node_s = normal ? here->BSIM4sNodePrime : here->BSIM4dNodePrime;
+    p->node_g = here->BSIM4gNodePrime;
+    p->node_b = here->BSIM4bNodePrime;
+    p->gm     = here->BSIM4gm;
+    p->gmbs   = here->BSIM4gmbs;
+    return 0;
+}
+
 int
 STBan(CKTcircuit *ckt, int restart)
 {
@@ -246,10 +318,12 @@ STBan(CKTcircuit *ckt, int restart)
         SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s' not in circuit", job->STBprobeName);
         return E_NOTFOUND;
     }
-    if (inst->GENmodPtr->GENmodType == CKTtypelook("Mos1")) {
-        /* card #459: device mode. probe2/mode=dm|cm (loop-mode DM/CM,
-         * card #457) is meaningless here -- refuse rather than silently
-         * ignore it (rule: no silent numbers). */
+    if (inst->GENmodPtr->GENmodType == CKTtypelook("Mos1") ||
+        inst->GENmodPtr->GENmodType == CKTtypelook("BSIM4")) {
+        /* card #459/#460: device mode (MOS1 or, card #460, BSIM4).
+         * probe2/mode=dm|cm (loop-mode DM/CM, card #457) is meaningless
+         * here -- refuse rather than silently ignore it (rule: no silent
+         * numbers). */
         device_mode = 1;
         if (job->STBprobeName2Given || job->STBmodeGiven) {
             SPfrontEnd->IFerrorf(ERR_WARNING,
@@ -489,17 +563,28 @@ STBan(CKTcircuit *ckt, int restart)
         return E_BADPARM;
     }
 
-    /* card #459: NOW read gm/gmbs and the node indices off the MOS1
-     * instance -- after CKTop()+CKTload() above (fresh start) or a prior
-     * call's op point (resume/pause: MOS1gm lives on the persistent
+    /* card #459/#460: NOW read gm/gmbs and the node indices off the MOS1
+     * or BSIM4 instance -- after CKTop()+CKTload() above (fresh start) or
+     * a prior call's op point (resume/pause: *gm lives on the persistent
      * instance struct, not this function's stack, so it is still valid
      * here without recomputing). Doing this any earlier reads a
      * never-computed (zero) gm on a fresh run -- see this file's comment
      * where device_mode is set, above. */
-    if (device_mode && stb_mos1_probe(inst, &devp)) {
-        SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s': could not read device fields", job->STBprobeName);
-        ckt->CKTcurrentAnalysis = 0;
-        return E_NOTFOUND;
+    if (device_mode) {
+        bool is_bsim4 = (inst->GENmodPtr->GENmodType == CKTtypelook("BSIM4"));
+        int perr = is_bsim4 ? stb_bsim4_probe(inst, &devp) : stb_mos1_probe(inst, &devp);
+        if (perr) {
+            if (is_bsim4)
+                SPfrontEnd->IFerrorf(ERR_WARNING,
+                    "stb probe '%s': BSIM4 device mode is quasi-static only in "
+                    "this fork (card #460) -- this instance (or its model) has "
+                    "acnqsmod=1 (NQS on); refusing rather than nulling the "
+                    "wrong (real-only) scalar", job->STBprobeName);
+            else
+                SPfrontEnd->IFerrorf(ERR_WARNING, "stb probe '%s': could not read device fields", job->STBprobeName);
+            ckt->CKTcurrentAnalysis = 0;
+            return E_NOTFOUND;
+        }
     }
 
     ckt->CKTcurrentAnalysis = DOING_AC;
