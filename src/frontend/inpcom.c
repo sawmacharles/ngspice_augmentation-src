@@ -3512,7 +3512,7 @@ void inp_casefix(char *string)
 
     /* single non-printable character */
 
-    if (!isspace_c(*string) && !isprint_c(*string) &&
+    if (*string && !isspace_c(*string) && !isprint_c(*string) &&
         (string[1] == '\0' || isspace_c(string[1]))) {
         *string = '*';
         return;
@@ -3527,14 +3527,22 @@ void inp_casefix(char *string)
 
     while (*string) {
         if (*string == '"') {
+            /* ngspice_augmentation (card #477): the original advanced past the
+               closing quote and then again at the bottom of the loop, so a line
+               ending in a quote walked (and lower-cased/rewrote) bytes past the
+               terminator: heap corruption detected at a later free(). Never step
+               past the terminator; text inside quotes is left untouched. */
             if (!keepquotes)
-                *string++ = ' ';
-            while (*++string && *string != '"')
-                ;
+                *string = ' ';
+            string++;
+            while (*string && *string != '"')
+                string++;
             if (*string == '\0')
                 break; /* needed if string is "something ! */
             if (!keepquotes)
-                *string++ = ' ';
+                *string = ' ';
+            string++;
+            continue;
         }
         if (*string && !isspace_c(*string) && !isprint_c(*string))
             *string = '_';
