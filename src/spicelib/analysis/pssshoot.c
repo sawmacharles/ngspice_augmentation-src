@@ -2639,6 +2639,30 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
             }
             pss_state_get(map, ckt, outbuf);
 
+            /* card #498: with a sw in the circuit the recording run (free
+             * adaptive grid) and the forced runs (FD columns, trials) walk
+             * different grids, and the trapezoid error at a conduction
+             * kink makes their period maps differ by ~1e-7 V (R2 q=1:
+             * orbit residual floor 1.4e-6 vs tol 1e-6, line search could
+             * not reduce it). Newton solved the recording run's F but was
+             * judged by the forced trial's F. Take F from a forced run at
+             * the same x0 instead, so F, the columns and the trials all
+             * belong to one map. The recording run only supplies the grid
+             * (and the ripple). If the forced rerun fails, keep the
+             * recording run's result. PSS_NO_FORCED_BASELINE=1 restores
+             * the old behaviour. */
+            if (!use_analytic && pss_ckt_has_switch(ckt) && !getenv("PSS_NO_FORCED_BASELINE")) {
+                double *ob2 = TMALLOC(double, n_full);
+                if (ob2) {
+                    pss_state_set_ic(map, icbuf);
+                    if (!pss_run_period_ex_safe(ckt, T, "PSS shoot (Newton baseline, forced rerun)", 0, 1)) {
+                        pss_state_get(map, ckt, ob2);
+                        memcpy(outbuf, ob2, (size_t) n_full * sizeof(double));
+                    }
+                    tfree(ob2);
+                }
+            }
+
             if (use_analytic) {
                 if (pss_sens_get_phi(map, Phi_full)) {
                     fprintf(stderr, "PSS-SHOOT: %s analytic sensitivity failed "
