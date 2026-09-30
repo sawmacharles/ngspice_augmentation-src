@@ -2974,6 +2974,28 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
             alpha = 1.0;
             if (trust_radius > 0.0 && maxratio > trust_radius)
                 alpha = trust_radius / maxratio;
+            /* card #525: doomed-probe early exit. A probe attempt
+             * (trust_radius>0) whose Newton step is clipped so hard that
+             * even taking the clipped fraction alpha on EVERY remaining
+             * iteration covers less than one full Newton step cannot
+             * reach the orbit within its budget: the caller discards a
+             * failed probe's wandering and restarts the next, longer
+             * warm-up from the stage-start state, so finishing this
+             * attempt is pure waste (measured: r3_longsettle stages 3-4,
+             * alpha ~0.06/0.17 against 4 iterations; stages 1-2 alpha
+             * ~1e-6). The final stage (trust_radius<=0) is never cut.
+             * PSS_SHOOT_NO_DOOMED_EXIT=1 restores the old behaviour. */
+            if (trust_radius > 0.0 && alpha < 1.0 &&
+                !getenv("PSS_SHOOT_NO_DOOMED_EXIT") &&
+                alpha * (double)(maxiter_this - iter) < 1.0) {
+                fprintf(stdout, "PSS-SHOOT: %s iter=%d trust-clipped step "
+                        "(alpha=%.3g) cannot reach the orbit in the %d "
+                        "remaining iteration(s); abandoning this probe.\n",
+                        stage_label, iter, alpha, maxiter_this - iter);
+                fflush(stdout);
+                result = 0;
+                goto newton_done;
+            }
 
             /* 24, not 8: see the second-pass comment (kept verbatim in
              * this function's git history) on why a fast/stiff coordinate
