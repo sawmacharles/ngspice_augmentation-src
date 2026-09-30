@@ -530,8 +530,25 @@ SMPcLUfac (SMPmatrix *Matrix, double PivTol)
           return 0 ;
         }
 
-        ret = klu_z_refactor (Matrix->SMPkluMatrix->KLUmatrixAp, Matrix->SMPkluMatrix->KLUmatrixAi, Matrix->SMPkluMatrix->KLUmatrixAxComplex,
-                              Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, Matrix->SMPkluMatrix->KLUmatrixCommon) ;
+        {
+            /* card #527 (round 14): complex refactor unscaled, same idea as the
+             * real refactor in SMPluFac (card #520).  klu_z_factor (SMPcReorder)
+             * still picks the pivots on the scaled matrix.
+             * NGSPICE_KLU_REFSCALE=1 restores the scaled refactor. */
+            static int refscale = -2 ;
+            klu_common *kc = Matrix->SMPkluMatrix->KLUmatrixCommon ;
+            int save_scale = kc ? kc->scale : 0 ;
+            if (refscale == -2) {
+                const char *e = getenv ("NGSPICE_KLU_REFSCALE") ;
+                refscale = (e && atoi (e)) ? 1 : 0 ;
+            }
+            if (kc && !refscale && save_scale > 0)
+                kc->scale = -1 ;
+            ret = klu_z_refactor (Matrix->SMPkluMatrix->KLUmatrixAp, Matrix->SMPkluMatrix->KLUmatrixAi, Matrix->SMPkluMatrix->KLUmatrixAxComplex,
+                                  Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, kc) ;
+            if (kc)
+                kc->scale = save_scale ;
+        }
 
         if (ret == 0)
         {
