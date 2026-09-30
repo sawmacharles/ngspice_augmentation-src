@@ -636,6 +636,18 @@ resume:
 #endif
 
     ckt->CKTdelta = MIN(ckt->CKTdelta,ckt->CKTmaxStep);
+#ifdef WITH_PSS
+    /* the step that starts at a located switch crossing carries the
+     * conduction discontinuity at its beginning; trapezoidal integration
+     * mis-weights the pre-flip capacitor current by ~h*dI/2 over it, so keep
+     * that one step short (card #498) */
+    if (PSSeventLocateActive && PSSeventLocateCrossed) {
+        static double capf = -1.0;
+        if (capf < 0.0) capf = getenv("PSS_EV_FLIPCAP") ? atof(getenv("PSS_EV_FLIPCAP")) : 3e-3;
+        if (ckt->CKTdelta > capf * ckt->CKTmaxStep && capf * ckt->CKTmaxStep > 2.0 * ckt->CKTdelmin)
+            ckt->CKTdelta = capf * ckt->CKTmaxStep;
+    }
+#endif
 
 #ifdef XSPICE
     /* Cut integration order if first timepoint after breakpoint */
@@ -822,6 +834,11 @@ resume:
     }
     ckt->CKTstates[0] = temp;
 #ifdef WITH_PSS
+    /* the step that starts at a located switch crossing contains the
+     * conduction discontinuity at its very beginning: backward Euler (no
+     * dependence on the pre-flip capacitor currents), as after a breakpoint */
+    if (PSSeventLocateActive && PSSeventLocateCrossed && getenv("PSS_EV_BE"))
+        ckt->CKTorder = 1;
     if (PSSeventLocateRestart && PSSeventLocateActive) {
         /* flat history after a located switch event (like the first step) */
         if (ckt->CKTstate1 && ckt->CKTstate2 && ckt->CKTstate3) {
