@@ -809,6 +809,8 @@ PSSpacRecordStep(CKTcircuit *ckt)
     order = (fabs(ag1 + ag0) < 1e-6 * fabs(ag0)) ? 1 : 2;
     t_new = ckt->CKTtime;
     h = t_new - g_pac_tprev;
+    if (getenv("PAC_STEP_TRACE"))   /* card #517 diagnostics */
+        fprintf(stderr, "STEP517 t=%.17g h=%.17g\n", t_new, h);
 
     /* card #504: adjoint-engine trajectory recording, independent of the
      * M-column machinery below -- see g_pac_traj_active's own comment.
@@ -1415,7 +1417,7 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         fprintf(stderr, "PAC-V1-DEBUG: n=%d exact_jac=%d\n", n, g_pac_exact_jac);
         for (d = 0; d < n; d++) {
             for (j = 0; j < n; j++)
-                fprintf(stderr, "  Phi[%d][%d]=%.6g%+.6gi", d, j,
+                fprintf(stderr, "  Phi[%d][%d]=%.15g%+.15gi", d, j,
                         Phi[(size_t) d * n + j].re, Phi[(size_t) d * n + j].im);
             fprintf(stderr, "\n");
         }
@@ -1445,7 +1447,7 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
          * term actually changes the answer (not a silent no-op) by A/B
          * comparison against the same independent reference this pass's
          * own report validates against. Never set in production. */
-        if (fT && trig_idx >= 0 && fT[trig_idx] != 0.0 && !getenv("PAC_FREERUN_NO_PROJ")) {
+        if (fT && trig_idx >= 0 && fT[trig_idx] != 0.0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ")) {
             double denom = fT[trig_idx];
             PhiCorr = TMALLOC(PACc, (size_t) n * n);
             zCorr = TMALLOC(PACc, (size_t) n * nfreq);
@@ -1979,7 +1981,7 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
         fprintf(stderr, "PXF-ADJ-DEBUG: n=%d nfreq=%d traj_n=%d\n", n, nfreq, g_pac_traj_n);
         for (d = 0; d < n; d++) {
             for (e = 0; e < n; e++)
-                fprintf(stderr, "  Phi[%d][%d]=%.6g%+.6gi", d, e,
+                fprintf(stderr, "  Phi[%d][%d]=%.15g%+.15gi", d, e,
                         Phi[(size_t) d * n + e].re, Phi[(size_t) d * n + e].im);
             fprintf(stderr, "\n");
         }

@@ -4549,6 +4549,9 @@ pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
             break;
     }
 
+    if (getenv("PSS_TRIG_TRACE"))
+        fprintf(stderr, "TRIG517 t_lo=%.17g t_hi=%.17g v_lo0=%.17g v_hi0=%.17g dt_mid=%.17g v_mid=%.17g T=%.17g iters=%d\n",
+                g_trig_t_lo, g_trig_t_hi, g_trig_v_lo, g_trig_v_hi, dt_mid, v_mid, g_trig_t_lo + dt_mid, iter);
     pss_state_set_ic(map, g_trig_x_lo);
     err = pss_run_period(ckt, dt_mid, "PSS freerun (trigger endpoint)");
     if (!err)
@@ -5026,6 +5029,14 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         double *x0_polished = NULL;
         double save_reltol_polish = ckt->CKTreltol;
         int reltol_tightened = 0;
+        /* card #517: the whole .pac/.pstb solver profile (reltol, trtol,
+         * max step) is tightened/matched for the polish AND the recording
+         * passes, and restored after -- see the block comment below. */
+        double save_trtol_polish = ckt->CKTtrtol;
+        double save_maxstep_polish = ckt->CKTmaxStep;
+        double save_step_polish = ckt->CKTstep;
+        double save_delmin_polish = ckt->CKTdelmin;
+        long rec_points = 0;
         if (!getenv("PSS_FREERUN_X0_OVERRIDE")) {
             int polish_iters = getenv("PSS_FREERUN_POLISH_ITERS") ?
                 atoi(getenv("PSS_FREERUN_POLISH_ITERS")) : 5;
@@ -5069,11 +5080,51 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                     ckt->CKTreltol = polish_reltol;
                     reltol_tightened = 1;
                 }
+                /* card #517: SELF-CONSISTENT solver profile. Root cause of
+                 * the machine-to-machine (libm last-bit) disagreement of the
+                 * free-running .pac (0.435 vs 0.556 dB at 100 kHz), see
+                 * docs/pss-pac.md's card #517 section: the period T this
+                 * polish converges to is a property of the SOLVER that
+                 * measured it, not of the circuit -- a plain .tran of the
+                 * same orbit at reltol=1e-9 gives T=2.36700733e-6 s with
+                 * the default trtol=7 / max-step T/200 but 2.36710784e-6 s
+                 * (converged; +42 ppm = 100 ps, comparable to R5's switch
+                 * edge) with trtol=1 and a fine step -- so x0/T did not
+                 * close the recording pass's own orbit, the recording
+                 * pass's Phi did not map f(T) onto itself, and every
+                 * discrete step-size decision (which libm last bits flip)
+                 * moved the answer by up to 0.12 dB. Fix: run the polish
+                 * AND the two recording passes with ONE tight profile
+                 * (reltol 1e-9, trtol 1, max step T/pacpoints) so the
+                 * orbit is converged to well below the edge time and both
+                 * agree with each other. PSS_FREERUN_POLISH_TRTOL
+                 * (default 1; 0 disables) overrides the trtol part. */
+                {
+                    double polish_trtol = getenv("PSS_FREERUN_POLISH_TRTOL") ?
+                        atof(getenv("PSS_FREERUN_POLISH_TRTOL")) : 1.0;
+                    if (polish_trtol > 0.0 && polish_trtol < ckt->CKTtrtol)
+                        ckt->CKTtrtol = polish_trtol;
+                    rec_points = (job->PACrecordPoints > 0) ? job->PACrecordPoints :
+                                 ((job->PSSpoints > 0) ? job->PSSpoints : 200);
+                }
                 x0_polished = TMALLOC(double, n);
                 for (k = 0; k < n; k++) x0_polished[k] = x0[k];
                 for (pk = 0; pk < polish_iters; pk++) {
                     double *xnext = TMALLOC(double, n);
                     double Tnext = 0.0;
+                    if (rec_points > 0) {   /* same max step the recording pass will use */
+                        /* the period a solver measures carries an O(h^2)
+                         * max-step error that trtol does not see: 5.1e-11 s
+                         * at T/200, 6e-13 s at T/2000 (docs/pss-pac.md card
+                         * #517), and the answer moves ~1.5 dB per 1e-9 s --
+                         * so the polish uses at least T/5000. */
+                        long pp = getenv("PSS_FREERUN_POLISH_POINTS") ?
+                            atol(getenv("PSS_FREERUN_POLISH_POINTS")) :
+                            (rec_points > 5000 ? rec_points : 5000);
+                        ckt->CKTmaxStep = T_pac / (double) pp;
+                        ckt->CKTstep    = ckt->CKTmaxStep;
+                        ckt->CKTdelmin  = 1e-9 * ckt->CKTmaxStep;
+                    }
                     if (!xnext || pss_run_until_trigger(ckt, &map, x0_polished,
                                                          node_num, trigval, dir,
                                                          max_period, xnext,
@@ -5252,11 +5303,28 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                         fprintf(stderr, "DEBUG fT[%d]=%.9g x_T=%.9g x_prev=%.9g\n",
                                 kk, fT[kk], x1trial[kk], x_prev[kk]);
                 }
-                if (reltol_tightened) {
+                if (getenv("PSS_FREERUN_TRACE") || getenv("PSS_FREERUN_PERT_T") ||
+                    getenv("PSS_FREERUN_PERT_X0") || getenv("PSS_FREERUN_PERT_FT")) {
+                    /* card #517 diagnostics: cross-machine sensitivity study.
+                     * PERT_X0="idx:rel", PERT_FT="idx:rel", PERT_T="rel". */
+                    const char *e;
+                    int kk, id;
+                    double rl;
+                    if ((e = getenv("PSS_FREERUN_PERT_X0")) && sscanf(e, "%d:%lf", &id, &rl) == 2 && id >= 0 && id < n)
+                        x0_pac[id] *= (1.0 + rl);
+                    if ((e = getenv("PSS_FREERUN_PERT_FT")) && sscanf(e, "%d:%lf", &id, &rl) == 2 && id >= 0 && id < n)
+                        fT[id] *= (1.0 + rl);
+                    if ((e = getenv("PSS_FREERUN_PERT_T")) && sscanf(e, "%lf", &rl) == 1)
+                        T_pac *= (1.0 + rl);
+                    fprintf(stderr, "TRACE517 T_pac=%.17g\n", T_pac);
+                    for (kk = 0; kk < n; kk++)
+                        fprintf(stderr, "TRACE517 k=%d x0=%.17g fT=%.17g\n", kk, x0_pac[kk], fT[kk]);
+                }
+                pac_err = pac_pstb_run_ex(ckt, job, x0_pac, n, T_pac, fT, node_num);
+                if (reltol_tightened) {   /* card #517: profile held through the recording passes */
                     ckt->CKTreltol = save_reltol_polish;
                     reltol_tightened = 0;
                 }
-                pac_err = pac_pstb_run_ex(ckt, job, x0_pac, n, T_pac, fT, node_num);
                 if (pac_err)
                     fprintf(stderr, "PSS-FREERUN: .pac/.pstb on the "
                             "free-running orbit did not complete (see "
@@ -5275,6 +5343,10 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         }
             }   /* end of "inside the band, or experimental" branch */
         }   /* end of band-check block */
+        ckt->CKTtrtol   = save_trtol_polish;       /* card #517 */
+        ckt->CKTmaxStep = save_maxstep_polish;
+        ckt->CKTstep    = save_step_polish;
+        ckt->CKTdelmin  = save_delmin_polish;
         if (reltol_tightened)
             ckt->CKTreltol = save_reltol_polish;   /* catch-all: any early-exit
                                                      * branch above that skipped
