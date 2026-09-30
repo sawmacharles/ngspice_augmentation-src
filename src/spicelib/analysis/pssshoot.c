@@ -460,7 +460,7 @@ PSSbreakRecordStep(CKTcircuit *ckt)
     if (ckt->CKTtime <= 0.0)
         return;   /* t=0 is already a breakpoint; nothing to add */
 
-    is_event = pss_break_step_is_switch_event(ckt) || PSSeventLocateCrossed;
+    is_event = PSSswLagActive ? PSSeventLocateCrossed : pss_break_step_is_switch_event(ckt);
 
     /* Thin clustered accepted times before recording them. Found on the
      * R3 fixture: forcing EVERY accepted time verbatim (including a long
