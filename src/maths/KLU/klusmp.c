@@ -588,8 +588,28 @@ SMPluFac (SMPmatrix *Matrix, double PivTol, double Gmin)
             LoadGmin_CSC (Matrix->SMPkluMatrix->KLUmatrixDiag, Matrix->SMPkluMatrix->KLUmatrixN, Gmin) ;
         }
 
-        ret = klu_refactor (Matrix->SMPkluMatrix->KLUmatrixAp, Matrix->SMPkluMatrix->KLUmatrixAi, Matrix->SMPkluMatrix->KLUmatrixAx,
-                            Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, Matrix->SMPkluMatrix->KLUmatrixCommon) ;
+        {
+            /* card #520 (round 13): refactor unscaled. klu_factor (SMPreorder)
+             * still picks the pivots on the max-row-scaled matrix, exactly as
+             * before; klu_refactor then reuses that pivot order on the
+             * unscaled values.  Row scaling only changes the roundoff pattern
+             * of a fixed-pivot LU (A = D*L*U = L'*(D'*U)), and it saves the
+             * per-refactor klu_scale pass and one division per matrix entry
+             * (and the Rs scaling in every solve).  NGSPICE_KLU_REFSCALE=1
+             * restores the scaled refactor. */
+            static int refscale = -2 ;
+            klu_common *kc = Matrix->SMPkluMatrix->KLUmatrixCommon ;
+            int save_scale = kc->scale ;
+            if (refscale == -2) {
+                const char *e = getenv ("NGSPICE_KLU_REFSCALE") ;
+                refscale = (e && atoi (e)) ? 1 : 0 ;
+            }
+            if (!refscale && save_scale > 0)
+                kc->scale = -1 ;
+            ret = klu_refactor (Matrix->SMPkluMatrix->KLUmatrixAp, Matrix->SMPkluMatrix->KLUmatrixAi, Matrix->SMPkluMatrix->KLUmatrixAx,
+                                Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, kc) ;
+            kc->scale = save_scale ;
+        }
 
         if (ret == 0)
         {
