@@ -871,6 +871,7 @@ estimate:
  * until validated -- see pss_replay_enabled() callers. */
 static int g_replay_mode = -1;   /* -1 = read env */
 static int g_pss_has_switch;      /* defined (with its comment) further down */
+static int g_replay_auto_used;    /* card #505: the automatic replay rung ran in this analysis */
 static int
 pss_replay_enabled(void)
 {
@@ -4200,6 +4201,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 if (!converged_flag && last_stage && !pss_replay_enabled() &&
                     getenv("PSS_REPLAY") == NULL && g_rp_n > 0 && !g_pss_has_switch) {
                     int seed_dummy = 0;
+                    g_replay_auto_used = 1;
                     fprintf(stdout, "PSS-SHOOT: [stage %d/final] the forced-grid Newton attempt did not "
                             "converge (residual %.3e); retrying once with exact step-sequence replay "
                             "(card #505).\n", stage, residual);
@@ -4471,6 +4473,23 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         fprintf(stderr, "\n");
     }
 
+    /* card #505: the automatic replay rung only rescues a run onto a STABLE
+     * orbit. Its smooth map can also find the (mathematically real but
+     * unobservable) period-1 fixed point of a circuit whose true steady state
+     * is period-2 -- refs/README.md's D~0.55 no-slope-compensation R4, the
+     * test_pss red-proof, converges there with spectral radius 1.18 -- and
+     * the FD Floquet of a noisy deck can also read spuriously > 1. Neither
+     * is accepted as a steady state (the classic path never reported them
+     * either: it plateaued). */
+    if (g_replay_auto_used && floq.valid && floq.unstable) {
+        fprintf(stderr, "PSS-SHOOT: the replay rung reached a fixed point with spectral radius %.4f >= 1 "
+                "(residual %.3e); not accepted as a steady state (card #505).\n",
+                floq.spectral_radius, residual);
+        fprintf(stderr, "PSS-SHOOT: FAILED to converge within %d Newton iterations (final residual %.6e, "
+                "tol %.3e); this is NOT a steady state.\n", maxiter, residual, tol);
+        goto shoot_fail;
+    }
+
     fprintf(stdout, "\nPSS-SHOOT: CONVERGED iter=%d residual=%.6e "
             "spectral_radius=%.6f %s wall_time=%.3fs\n",
             iter, residual, floq.valid ? floq.spectral_radius : -1.0,
@@ -4541,6 +4560,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     PSSbreakRecordActive = PSSbreakInstallActive = 0;
     PSSreplayActive = 0;
     g_replay_mode = -1;   /* card #505: replay choice is per analysis */
+    g_replay_auto_used = 0;
     pss_break_free();
     PSSsensActive = 0;
     pss_sens_free();   /* g_sens_map points into &map, about to be freed below */
