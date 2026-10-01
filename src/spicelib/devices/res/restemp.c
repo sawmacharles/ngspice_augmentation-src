@@ -10,6 +10,11 @@ Modified: 2000 AlanSfixes
 #include "resdefs.h"
 #include "ngspice/sperror.h"
 
+/* card #527 (round 14): bumped whenever any resistor's conductance may change
+ * (REStemp is the only writer of RESconduct) or its matrix binding is redone;
+ * CKTload's resistor-base cache is keyed on it. */
+unsigned long RESgeneration = 1;
+
 int
 REStemp(GENmodel *inModel, CKTcircuit *ckt)
 /* perform the temperature update to the resistors
@@ -22,6 +27,7 @@ REStemp(GENmodel *inModel, CKTcircuit *ckt)
     RESmodel *model =  (RESmodel *)inModel;
     RESinstance *here;
 
+    RESgeneration++;
 
     /*  loop through all the resistor models */
     for( ; model != NULL; model = RESnextModel(model)) {

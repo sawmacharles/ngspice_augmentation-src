@@ -18,6 +18,8 @@ Modified: September 2003 Paolo Nenzi
 int
 CAPparam(int param, IFvalue *value, GENinstance *inst, IFvalue *select)
 {
+    extern unsigned long CAPgeneration;
+    CAPgeneration++;
     double scale;
 
     CAPinstance *here = (CAPinstance*)inst;

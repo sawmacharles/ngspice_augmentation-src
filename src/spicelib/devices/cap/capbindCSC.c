@@ -8,9 +8,12 @@ Author: 2013 Francesco Lannutti
 #include "ngspice/sperror.h"
 #include "ngspice/klu-binding.h"
 
+extern unsigned long CAPgeneration;
+
 int
 CAPbindCSC (GENmodel *inModel, CKTcircuit *ckt)
 {
+    CAPgeneration++;
     CAPmodel *model = (CAPmodel *)inModel ;
     CAPinstance *here ;
     BindElement i, *matched, *BindStruct ;
@@ -38,6 +41,7 @@ CAPbindCSC (GENmodel *inModel, CKTcircuit *ckt)
 int
 CAPbindCSCComplex (GENmodel *inModel, CKTcircuit *ckt)
 {
+    CAPgeneration++;
     CAPmodel *model = (CAPmodel *)inModel ;
     CAPinstance *here ;
 
@@ -62,6 +66,7 @@ CAPbindCSCComplex (GENmodel *inModel, CKTcircuit *ckt)
 int
 CAPbindCSCComplexToReal (GENmodel *inModel, CKTcircuit *ckt)
 {
+    CAPgeneration++;
     CAPmodel *model = (CAPmodel *)inModel ;
     CAPinstance *here ;
 

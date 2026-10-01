@@ -17,6 +17,8 @@ Modified: Apr 2000 - Paolo Nenzi
 int
 RESparam(int param, IFvalue *value, GENinstance *inst, IFvalue *select)
 {
+    extern unsigned long RESgeneration;
+    RESgeneration++;
     double scale;
 
     RESinstance *here = (RESinstance *)inst;

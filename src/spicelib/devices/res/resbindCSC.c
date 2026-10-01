@@ -8,9 +8,12 @@ Author: 2013 Francesco Lannutti
 #include "ngspice/sperror.h"
 #include "ngspice/klu-binding.h"
 
+extern unsigned long RESgeneration;
+
 int
 RESbindCSC (GENmodel *inModel, CKTcircuit *ckt)
 {
+    RESgeneration++;
     RESmodel *model = (RESmodel *)inModel ;
     RESinstance *here ;
     BindElement i, *matched, *BindStruct ;
@@ -38,6 +41,7 @@ RESbindCSC (GENmodel *inModel, CKTcircuit *ckt)
 int
 RESbindCSCComplex (GENmodel *inModel, CKTcircuit *ckt)
 {
+    RESgeneration++;
     RESmodel *model = (RESmodel *)inModel ;
     RESinstance *here ;
 
@@ -62,6 +66,7 @@ RESbindCSCComplex (GENmodel *inModel, CKTcircuit *ckt)
 int
 RESbindCSCComplexToReal (GENmodel *inModel, CKTcircuit *ckt)
 {
+    RESgeneration++;
     RESmodel *model = (RESmodel *)inModel ;
     RESinstance *here ;
 

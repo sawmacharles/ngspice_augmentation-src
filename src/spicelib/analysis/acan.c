@@ -413,6 +413,23 @@ endsweep:
  */
 
 
+#ifdef KLU
+/* card #527 (round 14): resistor/capacitor base cache for the complex KLU AC
+ * load.  G = sum of resistor stamps (real parts), C1 = sum of capacitor stamps
+ * at omega = 1 (imaginary parts); per frequency Ax = G + j*omega*C1 replaces
+ * the two device loops (the stamps of R and C are otherwise re-scattered at
+ * every frequency).  Keyed on RES/CAP generation (restemp.c, captemp.c, the
+ * bind and param functions), the matrix storage and the device lists; not used
+ * with sensitivity.  NGSPICE_RESBASE=0 disables it.  Roundoff-level different
+ * from the per-device sum (omega*(sum) vs sum of omega*C). */
+extern unsigned long RESgeneration, CAPgeneration;
+static int acb_enabled = -1;
+static int acb_res = -2, acb_cap = -2;
+static int acb_noinval = 0;   /* test-only red-proof: NGSPICE_RESBASE=2 */
+static struct { double *Ax; unsigned int nz; unsigned long rg, cg; void *rh, *ch; CKTcircuit *ckt;
+                double *G, *C1; } acb;
+#endif
+
 int
 CKTacLoad(CKTcircuit* ckt)
 {
@@ -420,6 +437,7 @@ CKTacLoad(CKTcircuit* ckt)
     int size;
     int error;
     double startTime;
+    int skipR = -1, skipC = -1;
 
     startTime = SPfrontEnd->IFseconds();
     size = SMPmatSize(ckt->CKTmatrix);
@@ -427,9 +445,58 @@ CKTacLoad(CKTcircuit* ckt)
         ckt->CKTrhs[i] = 0;
         ckt->CKTirhs[i] = 0;
     }
-    SMPcClear(ckt->CKTmatrix);
+#ifdef KLU
+    if (acb_enabled < 0) {
+        const char *e = getenv("NGSPICE_RESBASE");
+        acb_enabled = (e && atoi(e) == 0) ? 0 : 1;
+        acb_noinval = (e && atoi(e) == 2);
+    }
+    if (acb_enabled && ckt->CKTmatrix->CKTkluMODE && !ckt->CKTsenInfo &&
+        ckt->CKTmatrix->SMPkluMatrix && ckt->CKTmatrix->SMPkluMatrix->KLUmatrixIsComplex &&
+        ckt->CKTmatrix->SMPkluMatrix->KLUmatrixAxComplex && ckt->CKTmatrix->SMPkluMatrix->KLUmatrixNZ) {
+        if (acb_res == -2) {
+            acb_res = acb_cap = -1;
+            for (i = 0; i < DEVmaxnum; i++) {
+                if (!DEVices[i] || !DEVices[i]->DEVpublic.name || !DEVices[i]->DEVacLoad) continue;
+                if (strcmp(DEVices[i]->DEVpublic.name, "Resistor") == 0) acb_res = i;
+                if (strcmp(DEVices[i]->DEVpublic.name, "Capacitor") == 0) acb_cap = i;
+            }
+        }
+        if (acb_res >= 0 && acb_cap >= 0 && ckt->CKThead[acb_res] && ckt->CKThead[acb_cap]) {
+            double *Ax = ckt->CKTmatrix->SMPkluMatrix->KLUmatrixAxComplex;
+            unsigned int nz = ckt->CKTmatrix->SMPkluMatrix->KLUmatrixNZ, k;
+            if (!(acb.G && acb.ckt == ckt && acb.Ax == Ax && acb.nz == nz && (acb_noinval || (acb.rg == RESgeneration &&
+                  acb.cg == CAPgeneration)) && acb.rh == (void *) ckt->CKThead[acb_res] &&
+                  acb.ch == (void *) ckt->CKThead[acb_cap])) {
+                double om = ckt->CKTomega;
+                free(acb.G); free(acb.C1);
+                acb.G = TMALLOC(double, nz); acb.C1 = TMALLOC(double, nz);
+                SMPcClear(ckt->CKTmatrix);
+                error = DEVices[acb_res]->DEVacLoad(ckt->CKThead[acb_res], ckt);
+                if (error) return(error);
+                for (k = 0; k < nz; k++) acb.G[k] = Ax[2*k];
+                SMPcClear(ckt->CKTmatrix);
+                ckt->CKTomega = 1.0;
+                error = DEVices[acb_cap]->DEVacLoad(ckt->CKThead[acb_cap], ckt);
+                ckt->CKTomega = om;
+                if (error) return(error);
+                for (k = 0; k < nz; k++) acb.C1[k] = Ax[2*k+1];
+                acb.Ax = Ax; acb.nz = nz; acb.rg = RESgeneration; acb.cg = CAPgeneration;
+                acb.rh = (void *) ckt->CKThead[acb_res]; acb.ch = (void *) ckt->CKThead[acb_cap]; acb.ckt = ckt;
+            }
+            {
+                double om = ckt->CKTomega;
+                for (k = 0; k < nz; k++) { Ax[2*k] = acb.G[k]; Ax[2*k+1] = om * acb.C1[k]; }
+            }
+            skipR = acb_res; skipC = acb_cap;
+        }
+    }
+#endif
+    if (skipR < 0)
+        SMPcClear(ckt->CKTmatrix);
 
     for (i = 0; i < DEVmaxnum; i++) {
+        if (i == skipR || i == skipC) continue;
         if (DEVices[i] && DEVices[i]->DEVacLoad && ckt->CKThead[i]) {
             error = DEVices[i]->DEVacLoad(ckt->CKThead[i], ckt);
             if (error) return(error);

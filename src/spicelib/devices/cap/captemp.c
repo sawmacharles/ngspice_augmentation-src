@@ -18,11 +18,16 @@ Modified: September 2003 Paolo Nenzi
 
 
 /*ARGSUSED*/
+/* card #527 (round 14): see RESgeneration in restemp.c */
+unsigned long CAPgeneration = 1;
+
 int
 CAPtemp(GENmodel *inModel, CKTcircuit *ckt)
 
 {
     CAPmodel *model = (CAPmodel*)inModel;
+
+    CAPgeneration++;
     CAPinstance *here;
     double difference;
     double factor;

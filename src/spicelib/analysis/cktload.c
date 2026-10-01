@@ -25,6 +25,22 @@ Modified: 2000 AlansFixes
 /* gtri - end - wbk - 11/26/90 */
 #endif
 
+#ifdef KLU
+/* card #527 (round 14): resistor-base cache for the real KLU transient load.
+ * A resistor's stamp is constant (RESconduct changes only in REStemp), so the
+ * sum of all resistor stamps is snapshotted once and memcpy'd into the matrix
+ * instead of re-running RESload (4 scattered read-modify-writes per resistor)
+ * on every Newton iteration.  Keyed on RESgeneration (REStemp and the CSC
+ * binding functions bump it), the matrix storage and the device list.  Only
+ * MODETRAN (REScurrent, read only by flicker noise, is then not refreshed).
+ * NGSPICE_RESBASE=0 disables it. */
+extern unsigned long RESgeneration;
+static int rb_enabled = -1;
+static int rb_resIdx = -2;
+static int rb_noinval = 0;   /* test-only red-proof: NGSPICE_RESBASE=2 ignores invalidation */
+static struct { double *Ax; unsigned int nz; unsigned long gen; void *head; double *base; CKTcircuit *ckt; } rb;
+#endif
+
 static int ZeroNoncurRow(SMPmatrix *matrix, CKTnode *nodes, int rownum);
 
 // #define PER_DEVICE_STATS
@@ -36,6 +52,7 @@ CKTload(CKTcircuit *ckt)
     double startTime, td0;
     CKTnode *node;
     int error;
+    int skipRes;
 #ifdef STEPDEBUG
     int noncon;
 #endif /* STEPDEBUG */
@@ -62,12 +79,52 @@ CKTload(CKTcircuit *ckt)
     for (i = 0; i <= size; i++) {
         ckt->CKTrhs[i] = 0;
     }
-    SMPclear(ckt->CKTmatrix);
+    skipRes = -1;
+#ifdef KLU
+    if (rb_enabled < 0) {
+        const char *e = getenv("NGSPICE_RESBASE");
+        rb_enabled = (e && atoi(e) == 0) ? 0 : 1;
+        rb_noinval = (e && atoi(e) == 2);
+    }
+    if (rb_enabled && (ckt->CKTmode & MODETRAN) && ckt->CKTmatrix->CKTkluMODE &&
+        ckt->CKTmatrix->SMPkluMatrix && !ckt->CKTmatrix->SMPkluMatrix->KLUmatrixIsComplex &&
+        ckt->CKTmatrix->SMPkluMatrix->KLUmatrixAx && ckt->CKTmatrix->SMPkluMatrix->KLUmatrixNZ) {
+        if (rb_resIdx == -2) {
+            rb_resIdx = -1;
+            for (i = 0; i < DEVmaxnum; i++)
+                if (DEVices[i] && DEVices[i]->DEVpublic.name &&
+                    strcmp(DEVices[i]->DEVpublic.name, "Resistor") == 0 && DEVices[i]->DEVload)
+                    rb_resIdx = i;
+        }
+        if (rb_resIdx >= 0 && ckt->CKThead[rb_resIdx]) {
+            double *Ax = ckt->CKTmatrix->SMPkluMatrix->KLUmatrixAx;
+            unsigned int nz = ckt->CKTmatrix->SMPkluMatrix->KLUmatrixNZ;
+            if (rb.base && rb.ckt == ckt && rb.Ax == Ax && rb.nz == nz &&
+                (rb_noinval || rb.gen == RESgeneration) && rb.head == (void *) ckt->CKThead[rb_resIdx]) {
+                memcpy(Ax, rb.base, (size_t) nz * sizeof(double));
+                skipRes = rb_resIdx;
+            } else {
+                SMPclear(ckt->CKTmatrix);
+                error = DEVices[rb_resIdx]->DEVload(ckt->CKThead[rb_resIdx], ckt);
+                if (error) return(error);
+                free(rb.base);
+                rb.base = TMALLOC(double, nz);
+                memcpy(rb.base, Ax, (size_t) nz * sizeof(double));
+                rb.Ax = Ax; rb.nz = nz; rb.gen = RESgeneration; rb.ckt = ckt;
+                rb.head = (void *) ckt->CKThead[rb_resIdx];
+                skipRes = rb_resIdx;
+            }
+        }
+    }
+#endif
+    if (skipRes < 0)
+        SMPclear(ckt->CKTmatrix);
 #ifdef STEPDEBUG
     noncon = ckt->CKTnoncon;
 #endif /* STEPDEBUG */
 
     for (i = 0; i < DEVmaxnum; i++) {
+        if (i == skipRes) continue;
         if (DEVices[i] && DEVices[i]->DEVload && ckt->CKThead[i]) {
 #ifdef PER_DEVICE_STATS
             td0 = SPfrontEnd->IFseconds();
