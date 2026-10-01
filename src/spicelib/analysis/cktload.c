@@ -39,6 +39,24 @@ static int rb_enabled = -1;
 static int rb_resIdx = -2;
 static int rb_noinval = 0;   /* test-only red-proof: NGSPICE_RESBASE=2 ignores invalidation */
 static struct { double *Ax; unsigned int nz; unsigned long gen; void *head; double *base; CKTcircuit *ckt; } rb;
+
+/* card #532 (round 15): capacitor-base cache, on top of the resistor base.
+ * A linear capacitor's matrix stamp in MODETRAN is m*ag0*C (NIintegrate:
+ * geq = ag0*cap), so the summed unit stamp Cbase is cached and
+ * Ax = Rbase + ag0*Cbase is formed in one vector pass; CAPload then skips its
+ * matrix writes (state/rhs work unchanged).  Keyed on CAPgeneration (CAPtemp,
+ * CAPparam, CSC binds), matrix storage, ckt and the device list head.  Falls back
+ * if a capacitor stamp cannot be expressed as an offset into Ax.
+ * NGSPICE_CAPBASE=0 disables (NGSPICE_RESBASE=0 disables both); =2 is the
+ * test-only no-invalidation switch. */
+extern unsigned long CAPgeneration;
+extern int CAPskipMatrix;
+#include "../devices/cap/capflat.h"
+static int cb_enabled = -1;
+static int cb_capIdx = -2;
+static int cb_noinval = 0;
+static struct { double *Ax; unsigned int nz; unsigned long gen; void *head; double *base; CKTcircuit *ckt; int ok; CAPflat fl; } cb;
+static int cb_flat = -1;   /* NGSPICE_CAPFLAT=0: keep the instance-list CAPload (matrix writes skipped) */
 #endif
 
 static int ZeroNoncurRow(SMPmatrix *matrix, CKTnode *nodes, int rownum);
@@ -53,6 +71,8 @@ CKTload(CKTcircuit *ckt)
     CKTnode *node;
     int error;
     int skipRes;
+    int skipCap = -1;
+    int flatCap = 0;
 #ifdef STEPDEBUG
     int noncon;
 #endif /* STEPDEBUG */
@@ -114,6 +134,41 @@ CKTload(CKTcircuit *ckt)
                 rb.head = (void *) ckt->CKThead[rb_resIdx];
                 skipRes = rb_resIdx;
             }
+            if (cb_enabled < 0) {
+                const char *e = getenv("NGSPICE_CAPBASE");
+                cb_enabled = (e && atoi(e) == 0) ? 0 : 1;
+                cb_noinval = (e && atoi(e) == 2);
+            }
+            if (cb_enabled && cb_capIdx == -2) {
+                cb_capIdx = -1;
+                for (i = 0; i < DEVmaxnum; i++)
+                    if (DEVices[i] && DEVices[i]->DEVpublic.name &&
+                        strcmp(DEVices[i]->DEVpublic.name, "Capacitor") == 0 && DEVices[i]->DEVload)
+                        cb_capIdx = i;
+            }
+            if (cb_enabled && cb_capIdx >= 0 && ckt->CKThead[cb_capIdx]) {
+                if (!(cb.base && cb.ckt == ckt && cb.Ax == Ax && cb.nz == nz &&
+                      (cb_noinval || cb.gen == CAPgeneration) &&
+                      cb.head == (void *) ckt->CKThead[cb_capIdx])) {
+                    free(cb.base);
+                    CAPflatFree(&cb.fl);
+                    cb.base = TMALLOC(double, nz);
+                    cb.ok = CAPbuildBase(ckt->CKThead[cb_capIdx], Ax, nz, cb.base, &cb.fl);
+                    cb.Ax = Ax; cb.nz = nz; cb.gen = CAPgeneration; cb.ckt = ckt;
+                    cb.head = (void *) ckt->CKThead[cb_capIdx];
+                }
+                if (cb.ok) {
+                    const double *rbase = rb.base, *cbase = cb.base;
+                    const double a0 = ckt->CKTag[0];
+                    unsigned int k;
+                    for (k = 0; k < nz; k++)
+                        Ax[k] = rbase[k] + a0 * cbase[k];
+                    skipCap = cb_capIdx;
+                    CAPskipMatrix = 1;
+                    if (cb_flat < 0) { const char *e = getenv("NGSPICE_CAPFLAT"); cb_flat = !(e && atoi(e) == 0); }
+                    flatCap = cb_flat;
+                }
+            }
         }
     }
 #endif
@@ -129,7 +184,15 @@ CKTload(CKTcircuit *ckt)
 #ifdef PER_DEVICE_STATS
             td0 = SPfrontEnd->IFseconds();
 #endif
+#ifdef KLU
+            if (i == skipCap && flatCap && CAPloadFlat(ckt, &cb.fl))
+                error = OK;
+            else
+#endif
             error = DEVices[i]->DEVload (ckt->CKThead[i], ckt);
+#ifdef KLU
+            if (i == skipCap) CAPskipMatrix = 0;
+#endif
 #ifdef PER_DEVICE_STATS
             ckt->CKTstat->devTimes[i] += SPfrontEnd->IFseconds() - td0;
             ckt->CKTstat->devCounts[i]++;
@@ -143,9 +206,17 @@ CKTload(CKTcircuit *ckt)
                 noncon = ckt->CKTnoncon;
             }
 #endif /* STEPDEBUG */
-            if (error) return(error);
+            if (error) {
+#ifdef KLU
+                CAPskipMatrix = 0;
+#endif
+                return(error);
+            }
         }
     }
+#ifdef KLU
+    CAPskipMatrix = 0;
+#endif
 
 
 #ifdef XSPICE
