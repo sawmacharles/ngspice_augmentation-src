@@ -4189,6 +4189,46 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                     fprintf(stderr, "PROFILE: stage %d newton attempt (%d iters) "
                             "took %.4fs\n", stage, iter, SPfrontEnd->IFseconds() - _pnt0);
                 }
+                /* card #505 (composition with #525): the final stage's very
+                 * first baseline period run can fail outright (residual 0,
+                 * no Newton iteration done: "Timestep too small" at the
+                 * period's first edge) when the warm-up happened to end on
+                 * an unlucky phase state -- R4d after #525's early probe
+                 * exits changed the warm-up trajectory. Nothing is wrong
+                 * with the orbit, only with that x0, so before any rung
+                 * gives up, move x0 on by a few more free periods at the
+                 * deck's own tolerance and retry (up to 3 times). Only
+                 * reached on that no-iteration failure, so every deck that
+                 * ran its baseline is untouched. PSS_SHOOT_NO_X0_NUDGE=1
+                 * disables. */
+                if (!converged_flag && last_stage && iter == 0 && residual == 0.0 &&
+                    !getenv("PSS_SHOOT_NO_X0_NUDGE")) {
+                    int nudge;
+                    for (nudge = 1; nudge <= 3 && !converged_flag && iter == 0 && residual == 0.0; nudge++) {
+                        int seed_dummy2 = 0;
+                        double nlen = (4.0 * nudge + 1.0) * T;   /* 5, 9, 13 periods */
+                        fprintf(stdout, "PSS-SHOOT: [stage %d/final] the baseline period run did not complete; "
+                                "advancing x0 by %.0f free periods and retrying (nudge %d/3, card #505).\n",
+                                stage, nlen / T, nudge);
+                        fflush(stdout);
+                        pss_state_set_ic(&map, x0_stage_start);
+                        if (pss_run_period(ckt, nlen, "PSS shoot (x0 nudge)"))
+                            break;
+                        pss_state_get(&map, ckt, x0);
+                        for (k = 0; k < n; k++) x0_stage_start[k] = x0[k];
+                        pss_state_set_ic(&map, x0);
+                        ckt->CKTreltol = tight_reltol;
+                        ckt->CKTvoltTol = tight_vntol;
+                        converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
+                                                         this_maxiter, tol, eps,
+                                                         this_trust, broyden_enabled,
+                                                         broyden_period, label,
+                                                         &iter, &residual, Phi, use_analytic,
+                                                         NULL, &seed_dummy2);
+                        ckt->CKTreltol = save_reltol;
+                        ckt->CKTvoltTol = save_volttol;
+                    }
+                }
                 /* card #505: replay rung. The classic forced-grid map (every
                  * recorded time forced as a breakpoint => backward-Euler
                  * restart + LTE re-derivation per gap) is not the same
