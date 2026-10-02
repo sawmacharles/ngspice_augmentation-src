@@ -2040,6 +2040,59 @@ pac_init_from_prepass(CKTcircuit *ckt)
     }
 }
 
+/* state snapshot around the detection period */
+typedef struct {
+    double *rhs, *rhsold, *states[8];
+    int nstates, nrhs, nst;
+    double ag[7], deltaOld[7], delta, time;
+    long mode;
+    int order;
+    int ok;
+} PACsnap;
+
+static void
+pac_snap_take(CKTcircuit *ckt, PACsnap *sn)
+{
+    int i, neq = SMPmatSize(ckt->CKTmatrix);
+    memset(sn, 0, sizeof *sn);
+    sn->nrhs = neq + 1;
+    sn->nstates = ckt->CKTnumStates;
+    sn->nst = ckt->CKTmaxOrder + 2;
+    if (sn->nst > 8) sn->nst = 8;
+    sn->rhs = TMALLOC(double, sn->nrhs);
+    sn->rhsold = TMALLOC(double, sn->nrhs);
+    if (!sn->rhs || !sn->rhsold) return;
+    memcpy(sn->rhs, ckt->CKTrhs, (size_t) sn->nrhs * sizeof(double));
+    memcpy(sn->rhsold, ckt->CKTrhsOld, (size_t) sn->nrhs * sizeof(double));
+    for (i = 0; i < sn->nst && sn->nstates > 0; i++) {
+        if (!ckt->CKTstates[i]) continue;
+        sn->states[i] = TMALLOC(double, sn->nstates);
+        if (!sn->states[i]) return;
+        memcpy(sn->states[i], ckt->CKTstates[i], (size_t) sn->nstates * sizeof(double));
+    }
+    for (i = 0; i < 7; i++) { sn->ag[i] = ckt->CKTag[i]; sn->deltaOld[i] = ckt->CKTdeltaOld[i]; }
+    sn->delta = ckt->CKTdelta; sn->time = ckt->CKTtime; sn->mode = ckt->CKTmode; sn->order = ckt->CKTorder;
+    sn->ok = 1;
+}
+
+static void
+pac_snap_restore(CKTcircuit *ckt, PACsnap *sn, int restore)
+{
+    int i;
+    if (restore && sn->ok) {
+        memcpy(ckt->CKTrhs, sn->rhs, (size_t) sn->nrhs * sizeof(double));
+        memcpy(ckt->CKTrhsOld, sn->rhsold, (size_t) sn->nrhs * sizeof(double));
+        for (i = 0; i < sn->nst; i++)
+            if (sn->states[i] && ckt->CKTstates[i])
+                memcpy(ckt->CKTstates[i], sn->states[i], (size_t) sn->nstates * sizeof(double));
+        for (i = 0; i < 7; i++) { ckt->CKTag[i] = sn->ag[i]; ckt->CKTdeltaOld[i] = sn->deltaOld[i]; }
+        ckt->CKTdelta = sn->delta; ckt->CKTtime = sn->time; ckt->CKTmode = sn->mode; ckt->CKTorder = sn->order;
+    }
+    if (sn->rhs) tfree(sn->rhs);
+    if (sn->rhsold) tfree(sn->rhsold);
+    for (i = 0; i < 8; i++) if (sn->states[i]) tfree(sn->states[i]);
+}
+
 static int
 pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, double T,
                     int trig_node_num, const char *who)
@@ -2079,10 +2132,15 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     if (!getenv("PAC_FORCE_GENERIC") && !g_pp_has_mutual) {
         /* the only non-native devices may carry no charge at all: look (one cheap period) before leaving the
          * legacy native path, which is bit-identical to before and supports saltation / free-running */
+        /* The detection period must leave no trace on the legacy flow that follows (its first recorded period starts
+         * from whatever vectors and device states are left in the circuit): snapshot and restore them. */
+        PACsnap snap;
+        pac_snap_take(ckt, &snap);
         pac_state_set_ic(map, x0);
         g_pp_detect = 1; g_pp_detect_hit = 0; g_pp_active = 1; PSSpacActive = 1;
         err = pac_run_period(ckt, job, T, "TD-shoot model-charge detection (card #542)");
         PSSpacActive = 0; g_pp_active = 0; g_pp_detect = 0;
+        pac_snap_restore(ckt, &snap, g_pp_detect_hit ? 0 : 1);
         if (err) {
             fprintf(stderr, "%s: model-charge detection run failed (err=%d)\n", who, err);
             return E_INTERN;
