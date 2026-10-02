@@ -1150,11 +1150,35 @@ pac_complex_solve(PACc *A, PACc *rhs, int n, PACc *x)
  * mode -- the matrix content this clobbers is immediately superseded by
  * the fresh DCtran() the very next recording period run performs, so no
  * separate save/restore is needed). br/bi: [neq+1], 1-based. */
+/* card #533: under `.options klu` the complex stamp mode this function switches
+ * the matrix into (DEVbindCSCComplex: every device's stamp pointers re-bound
+ * to the interleaved complex CSC values) must be undone before returning: the
+ * recording/shooting runs that follow are REAL transients and would otherwise
+ * stamp through complex pointers into a real Ax (singular matrix at once).
+ * Same conversion acan.c does at the end of .ac (DEVbindCSCComplexToReal,
+ * KLUmatrixIsComplex = KLUmatrixReal). SPARSE path unchanged (byte-identical:
+ * nothing is compiled in or executed for it). */
+#ifdef KLU
+static void
+pac_klu_back_to_real(CKTcircuit *ckt)
+{
+    int i;
+    if (ckt->CKTmatrix->CKTkluMODE &&
+        ckt->CKTmatrix->SMPkluMatrix->KLUmatrixIsComplex) {
+        for (i = 0; i < DEVmaxnum; i++)
+            if (DEVices[i] && DEVices[i]->DEVbindCSCComplexToReal && ckt->CKThead[i])
+                DEVices[i]->DEVbindCSCComplexToReal(ckt->CKThead[i], ckt);
+        ckt->CKTmatrix->SMPkluMatrix->KLUmatrixIsComplex = KLUmatrixReal;
+    }
+}
+#endif
+
 static int
 pac_capture_b0(CKTcircuit *ckt, double *br, double *bi, int neq)
 {
     int i;
     long savedMode = ckt->CKTmode;
+    int err = 0;
 
 #ifdef KLU
     if (ckt->CKTmatrix->CKTkluMODE) {
@@ -1169,17 +1193,22 @@ pac_capture_b0(CKTcircuit *ckt, double *br, double *bi, int neq)
         spSetComplex(ckt->CKTmatrix->SPmatrix);
 
     ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODEDCOP | MODEINITSMSIG;
-    if (CKTload(ckt)) { ckt->CKTmode = savedMode; return 1; }
-    ckt->CKTomega = 1.0;
-    ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODEAC;
-    if (CKTacLoad(ckt)) { ckt->CKTmode = savedMode; return 1; }
-
-    for (i = 1; i <= neq; i++) {
-        br[i] = ckt->CKTrhs[i];
-        bi[i] = ckt->CKTirhs[i];
+    if (CKTload(ckt)) err = 1;
+    if (!err) {
+        ckt->CKTomega = 1.0;
+        ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODEAC;
+        if (CKTacLoad(ckt)) err = 1;
     }
+    if (!err)
+        for (i = 1; i <= neq; i++) {
+            br[i] = ckt->CKTrhs[i];
+            bi[i] = ckt->CKTirhs[i];
+        }
     ckt->CKTmode = savedMode;
-    return 0;
+#ifdef KLU
+    pac_klu_back_to_real(ckt);
+#endif
+    return err;
 }
 
 /* ------------------------------------------------------------------ */

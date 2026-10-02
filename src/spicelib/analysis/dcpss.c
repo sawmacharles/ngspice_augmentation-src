@@ -3392,6 +3392,39 @@ PhaseNoiseAnalyze(CKTcircuit *ckt, double fstart, double fstop, int npts, int ve
 }
 
 
+/* card #533: the shooting engines run under `.options klu`. While they run, KLU refactors are
+ * guarded: a refactor whose reciprocal pivot growth is below NGSPICE_KLU_RGTHR (default 1e-10)
+ * is reported singular and NIiter re-pivots the same matrix with klu_factor (SPARSE re-pivots a
+ * small pivot by itself; klu_refactor does not, and on the R4 peak-current-latch deck the reused
+ * pivot order degrades to growth 1e-18 -> "timestep too small" in the warm-up).
+ * NGSPICE_PSS_KLU_SCALED=1 additionally keeps KLU's row-scaled refactor (control for the
+ * round-13 unscaled default). SPARSE: no effect. */
+static int
+pss_shoot_klu_guard(CKTcircuit *ckt, PSSan *job, int freerun)
+{
+    int r;
+#ifdef KLU
+    const char *e = getenv("NGSPICE_PSS_KLU_SCALED");
+    int klu = ckt->CKTmatrix && ckt->CKTmatrix->CKTkluMODE;
+    int saved_guard = KLUrgrowthGuard, saved_scale = KLUrefScaleForce;
+    long fb0 = KLUrgrowthFallbacks;
+    if (klu) {
+        KLUrgrowthGuard = 1;
+        if (e && atoi(e))
+            KLUrefScaleForce = 1;
+    }
+#endif
+    r = freerun ? PSSshootFreerun(ckt, job) : PSSshootDriven(ckt, job);
+#ifdef KLU
+    KLUrgrowthGuard = saved_guard;
+    KLUrefScaleForce = saved_scale;
+    if (klu && KLUrgrowthFallbacks > fb0)
+        fprintf(stderr, "PSS-SHOOT: KLU pivot-growth guard re-pivoted %ld refactorization(s)\n",
+                KLUrgrowthFallbacks - fb0);
+#endif
+    return r;
+}
+
 int
 DCpss(CKTcircuit *ckt,
        int restart)   /* forced restart flag */
@@ -3447,19 +3480,6 @@ DCpss(CKTcircuit *ckt,
     int position;
     double max_freq;
 
-
-    /* Enhancement-117: PSS is a Sparse-1.3-domain analysis. Its shooting loop
-     * does not converge under the KLU solver -- it stalls at the first shooting
-     * cycle -- while a plain `.tran` on the same circuit runs fine under KLU, so
-     * the issue is specific to the periodic breakpoint/timestep machinery, not
-     * KLU transients in general. Fail fast with a clear message instead of
-     * spinning; `.pss` users simply keep the default Sparse solver. */
-    if (ckt->CKTmatrix && ckt->CKTmatrix->CKTkluMODE) {
-        fprintf(stderr, "Error: periodic steady state analysis (.pss) is not "
-                "supported with 'option KLU'; use 'option sparse' (the default "
-                "solver) for .pss.\n");
-        return(E_UNSUPP);
-    }
 
     /* Print some useful information */
     PSSDBG( "Periodic Steady State Analysis Started\n\n") ;
@@ -3547,7 +3567,7 @@ DCpss(CKTcircuit *ckt,
          * original free-running refusal (card #458 scope, smooth-switch-
          * only) is UNCHANGED for a deck with no trigger= at all. */
         if (job->PSStrigNode) {
-            return PSSshootFreerun(ckt, job);
+            return pss_shoot_klu_guard(ckt, job, 1);
         }
         if (!pss_driven) {
             fprintf(stderr, "Error: .pss method=shoot needs a driven "
@@ -3557,7 +3577,23 @@ DCpss(CKTcircuit *ckt,
                     "trigger= was given.\n");
             return (E_UNSUPP);
         }
-        return PSSshootDriven(ckt, job);
+        return pss_shoot_klu_guard(ckt, job, 0);
+    }
+
+    /* Enhancement-117 (narrowed, card #533): the Lannutti PSS (method=gear/trap, not
+     * method=shoot, which is dispatched above and runs under KLU) is a Sparse-1.3-domain analysis. Its shooting loop
+     * does not converge under the KLU solver -- it stalls at the first shooting
+     * cycle -- while a plain `.tran` on the same circuit runs fine under KLU, so
+     * the issue is specific to the periodic breakpoint/timestep machinery, not
+     * KLU transients in general. Fail fast with a clear message instead of
+     * spinning; `.pss` users simply keep the default Sparse solver. */
+    if (ckt->CKTmatrix && ckt->CKTmatrix->CKTkluMODE) {
+        fprintf(stderr, "Error: periodic steady state analysis (.pss) is not "
+                "supported with 'option KLU' unless method=shoot is given "
+                "(.pss/.pac/.pstb/.pxf/.pnoise with method=shoot run under KLU, "
+                "card #533); use method=shoot or 'option sparse' (the default "
+                "solver).\n");
+        return(E_UNSUPP);
     }
 
     oscnNode = job->PSSoscNode->number ;

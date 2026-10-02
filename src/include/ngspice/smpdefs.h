@@ -40,6 +40,9 @@ typedef struct sSMPmatrix {
 
 #ifdef KLU
 void spDeterminant_KLU (SMPmatrix *, int *, double *, double *) ;
+extern long KLUrgrowthFallbacks ;
+extern int KLUrgrowthGuard ;    /* card #533: nonzero = refactor with tiny pivot growth is re-pivoted */
+extern int KLUrefScaleForce ;   /* card #533: nonzero = klu_refactor keeps row scaling */
 void SMPconvertCOOtoCSC (SMPmatrix *) ;
 
 #ifdef CIDER

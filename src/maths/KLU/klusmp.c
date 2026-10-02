@@ -25,6 +25,13 @@ extern double logb(double);
 #include "ngspice/mif.h"
 #include "ngspice/evt.h"
 
+/* card #533: while nonzero, klu_refactor keeps KLU's row scaling (the pre-round-13 refactor).
+ * Only set (env NGSPICE_PSS_KLU_SCALED=1) as a control: the shooting engines run the unscaled
+ * refactor like every other KLU transient, protected by KLUrgrowthGuard below. */
+int KLUrefScaleForce = 0 ;
+int KLUrgrowthGuard = 0 ;        /* card #533: nonzero = refactor with reciprocal pivot growth < NGSPICE_KLU_RGTHR (1e-10) is re-pivoted */
+long KLUrgrowthFallbacks = 0 ;   /* count of guard-triggered re-pivots (diagnostic) */
+
 static int
 CircuitIsDigital (void)
 {
@@ -542,7 +549,7 @@ SMPcLUfac (SMPmatrix *Matrix, double PivTol)
                 const char *e = getenv ("NGSPICE_KLU_REFSCALE") ;
                 refscale = (e && atoi (e)) ? 1 : 0 ;
             }
-            if (kc && !refscale && save_scale > 0)
+            if (kc && !refscale && !KLUrefScaleForce && save_scale > 0)
                 kc->scale = -1 ;
             ret = klu_z_refactor (Matrix->SMPkluMatrix->KLUmatrixAp, Matrix->SMPkluMatrix->KLUmatrixAi, Matrix->SMPkluMatrix->KLUmatrixAxComplex,
                                   Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, kc) ;
@@ -621,11 +628,40 @@ SMPluFac (SMPmatrix *Matrix, double PivTol, double Gmin)
                 const char *e = getenv ("NGSPICE_KLU_REFSCALE") ;
                 refscale = (e && atoi (e)) ? 1 : 0 ;
             }
-            if (!refscale && save_scale > 0)
+            if (!refscale && !KLUrefScaleForce && save_scale > 0)
                 kc->scale = -1 ;
             ret = klu_refactor (Matrix->SMPkluMatrix->KLUmatrixAp, Matrix->SMPkluMatrix->KLUmatrixAi, Matrix->SMPkluMatrix->KLUmatrixAx,
                                 Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, kc) ;
             kc->scale = save_scale ;
+            /* card #533: pivot-growth guard for the periodic-steady-state shooting engines.
+             * klu_refactor reuses the pivot order of the last klu_factor with no threshold
+             * test (SPARSE's spFactor re-pivots a too-small pivot). On the stiff switching
+             * decks (R4 peak-current latch) the reused order degrades to growth 1e-18 and
+             * the shooting warm-up dies with "timestep too small". While KLUrgrowthGuard is
+             * set, a refactor whose reciprocal pivot growth is below the threshold is
+             * reported as E_SINGULAR, which NIiter answers with a full re-pivoting
+             * klu_factor of the same matrix (the existing KLU fallback). */
+            if (ret && KLUrgrowthGuard) {
+                /* the check traverses all of L and U (~10 % of a PEX-size PSS run if made on every
+                 * refactor); the degradation it catches persists over many refactors, so every
+                 * NGSPICE_KLU_RGEVERY-th (default 8) one is enough */
+                static double rgthr = -1.0 ;
+                static long rgevery = 8, rgcount = 0 ;
+                if (rgthr < 0) {
+                    const char *e = getenv ("NGSPICE_KLU_RGTHR") ;
+                    const char *ev = getenv ("NGSPICE_KLU_RGEVERY") ;
+                    rgthr = e ? atof (e) : 1e-10 ;
+                    if (ev && atol (ev) > 0)
+                        rgevery = atol (ev) ;
+                }
+                if (rgthr > 0 && (rgcount++ % rgevery) == 0 &&
+                    klu_rgrowth (Matrix->SMPkluMatrix->KLUmatrixAp, Matrix->SMPkluMatrix->KLUmatrixAi, Matrix->SMPkluMatrix->KLUmatrixAx,
+                                 Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, kc) &&
+                    kc->rgrowth < rgthr) {
+                    KLUrgrowthFallbacks++ ;
+                    return E_SINGULAR ;
+                }
+            }
         }
 
         if (ret == 0)
