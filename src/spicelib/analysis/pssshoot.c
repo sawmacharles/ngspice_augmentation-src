@@ -83,6 +83,7 @@ What this does NOT do (see the card #458 report for the full list):
 #include "ngspice/sperror.h"
 #include "ngspice/iferrmsg.h"
 #include "ngspice/fteext.h"
+#include "ngspice/devdefs.h"   /* card #544: DEVices[] for pss_trig_hidden_state() */
 
 #include "cap/capdefs.h"
 #include "ind/inddefs.h"
@@ -5512,6 +5513,7 @@ static double *g_trig_prev_x = NULL;   /* [n] */
 static double g_trig_t_lo = 0.0, g_trig_v_lo = 0.0;
 static double g_trig_t_hi = 0.0, g_trig_v_hi = 0.0;
 static double *g_trig_x_lo = NULL;     /* [n], snapshot at t_lo */
+static double *g_trig_x_hi = NULL;     /* [n], snapshot at t_hi (card #544: interpolated crossing for circuits with hidden state) */
 
 static void
 pss_trig_reset(PSSstateMap *map, int node_num, double val, int dir)
@@ -5524,6 +5526,7 @@ pss_trig_reset(PSSstateMap *map, int node_num, double val, int dir)
     g_trig_have_prev = 0;
     if (!g_trig_prev_x) g_trig_prev_x = TMALLOC(double, map->n);
     if (!g_trig_x_lo)   g_trig_x_lo   = TMALLOC(double, map->n);
+    if (!g_trig_x_hi)   g_trig_x_hi   = TMALLOC(double, map->n);
 }
 
 static void
@@ -5531,7 +5534,8 @@ pss_trig_free(void)
 {
     if (g_trig_prev_x) tfree(g_trig_prev_x);
     if (g_trig_x_lo)   tfree(g_trig_x_lo);
-    g_trig_prev_x = g_trig_x_lo = NULL;
+    if (g_trig_x_hi)   tfree(g_trig_x_hi);
+    g_trig_prev_x = g_trig_x_lo = g_trig_x_hi = NULL;
     g_trig_map = NULL;
     g_trig_node_num = -1;
     g_trig_found = g_trig_have_prev = 0;
@@ -5559,8 +5563,10 @@ PSStrigRecordStep(CKTcircuit *ckt)
         if (cross) {
             g_trig_t_lo = g_trig_prev_t; g_trig_v_lo = g_trig_prev_v;
             g_trig_t_hi = ckt->CKTtime;  g_trig_v_hi = v;
-            for (k = 0; k < g_trig_map->n; k++)
+            for (k = 0; k < g_trig_map->n; k++) {
                 g_trig_x_lo[k] = g_trig_prev_x[k];
+                g_trig_x_hi[k] = pss_state_value(&g_trig_map->refs[k], ckt);
+            }
             g_trig_found = 1;
             return;   /* freeze: first qualifying crossing only */
         }
@@ -5571,6 +5577,49 @@ PSStrigRecordStep(CKTcircuit *ckt)
     for (k = 0; k < g_trig_map->n; k++)
         g_trig_prev_x[k] = pss_state_value(&g_trig_map->refs[k], ckt);
     g_trig_have_prev = 1;
+}
+
+/* card #544: does the circuit carry dynamic state that the native C/L restart does not reproduce (device-model charge
+ * storage: MOS/BSIM, BJT, JFET, diodes with cjo or tt, ...)?  A restart from the native states alone resets every such
+ * node to zero, which is harmless at a period start (the restart artefact the driven engine documents) but destroys the
+ * dynamics when a free-running map refines the crossing time by restarting a few picoseconds before it: the trigger node
+ * then follows the restarted, wrong, derivative (measured on the transistor-level hysteretic buck: "Timestep too small"
+ * at t = 3e-16 s, or a refinement that never converges).  Such circuits interpolate the crossing from the two accepted
+ * steps that bracket it instead. */
+static int
+pss_trig_hidden_state(CKTcircuit *ckt)
+{
+    int i;
+    static const char *native[] = { "Resistor", "Capacitor", "Inductor", "mutual", "Vsource", "Isource", "VCVS", "VCCS",
+                                    "CCVS", "CCCS", "Switch", "CSwitch", "ASRC", "TransLine", "LTRA", "CplLines", "URC", NULL };
+    if (getenv("PSS_TRIG_RESTART_REFINE"))
+        return 0;
+    if (getenv("PSS_TRIG_INTERP"))
+        return 1;
+    for (i = 0; i < DEVmaxnum; i++) {
+        const char *nm;
+        int k, ok = 0;
+        if (!DEVices[i] || !ckt->CKThead[i])
+            continue;
+        nm = DEVices[i]->DEVpublic.name;
+        if (!nm)
+            return 1;
+        for (k = 0; native[k]; k++)
+            if (!strcmp(nm, native[k])) { ok = 1; break; }
+        if (ok)
+            continue;
+        if (!strcmp(nm, "Diode")) {
+            DIOmodel *dm;
+            int charged = 0;
+            for (dm = (DIOmodel *) ckt->CKThead[i]; dm; dm = DIOnextModel(dm))
+                if (dm->DIOjunctionCap != 0.0 || dm->DIOtransitTime != 0.0 || dm->DIOjunctionSWCap != 0.0)
+                    charged = 1;
+            if (!charged)
+                continue;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* The free-running period map: integrate from x0 (written into the device
@@ -5613,8 +5662,35 @@ pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
     PSStrigActive = 0;
 
     if (err || !g_trig_found) {
+        if (getenv("PSS_TRIG_TRACE")) {
+            int kk;
+            fprintf(stderr, "TRIG544 probe failed: err=%d found=%d max_period=%g x0:", err, g_trig_found, max_period);
+            for (kk = 0; kk < map->n; kk++)
+                fprintf(stderr, " %.6g", x0[kk]);
+            fprintf(stderr, "\n");
+        }
         pss_trig_free();
         return 1;
+    }
+
+    if (pss_trig_hidden_state(ckt)) {
+        double th = (g_trig_v_hi != g_trig_v_lo) ? (trigval - g_trig_v_lo) / (g_trig_v_hi - g_trig_v_lo) : 1.0;
+        int k;
+        if (th < 0.0) th = 0.0;
+        if (th > 1.0) th = 1.0;
+        for (k = 0; k < map->n; k++)
+            x_T[k] = g_trig_x_lo[k] + th * (g_trig_x_hi[k] - g_trig_x_lo[k]);
+        *T_measured = g_trig_t_lo + th * (g_trig_t_hi - g_trig_t_lo);
+        if (x_prev_out && t_prev_out && g_trig_have_prev) {
+            for (k = 0; k < map->n; k++)
+                x_prev_out[k] = g_trig_prev_x[k];
+            *t_prev_out = g_trig_prev_t;
+        }
+        if (getenv("PSS_TRIG_TRACE"))
+            fprintf(stderr, "TRIG544 interpolated crossing t_lo=%.12g t_hi=%.12g theta=%.6f T=%.12g\n",
+                    g_trig_t_lo, g_trig_t_hi, th, *T_measured);
+        pss_trig_free();
+        return 0;
     }
 
     dt_lo = 0.0;                          v_lo = g_trig_v_lo;
@@ -5727,7 +5803,7 @@ pss_fr_stability(CKTcircuit *ckt, PSSstateMap *map, int n, const double *x0, con
                  double *M, PSScomplex *eig, PSSfrStab *res)
 {
     double save_reltol = ckt->CKTreltol, save_trtol = ckt->CKTtrtol;
-    double st_reltol = getenv("PSS_FREERUN_STAB_RELTOL") ? atof(getenv("PSS_FREERUN_STAB_RELTOL")) : 1e-8;
+    double st_reltol = getenv("PSS_FREERUN_STAB_RELTOL") ? atof(getenv("PSS_FREERUN_STAB_RELTOL")) : (pss_trig_hidden_state(ckt) ? 1e-6 : 1e-8);
     double st_trtol = getenv("PSS_FREERUN_STAB_TRTOL") ? atof(getenv("PSS_FREERUN_STAB_TRTOL")) : 0.0;
     double eps0 = getenv("PSS_FREERUN_STAB_EPS") ? atof(getenv("PSS_FREERUN_STAB_EPS")) : 1e-5;
     double *Pt = TMALLOC(double, n), *hs = TMALLOC(double, n), *ic = TMALLOC(double, n);
@@ -6459,7 +6535,9 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                  * established, rather than dropping back to the coarser
                  * cap for that one call. */
                 double polish_reltol = getenv("PSS_FREERUN_POLISH_RELTOL") ?
-                    atof(getenv("PSS_FREERUN_POLISH_RELTOL")) : 1e-9;
+                    atof(getenv("PSS_FREERUN_POLISH_RELTOL")) : (pss_trig_hidden_state(ckt) ? 1e-6 : 1e-9);
+                /* card #544: 1e-9 is below the evaluation noise of a charge-conserving BSIM4 (the trigger run then
+                 * loses the crossing: "polish iteration lost the trigger crossing"); 1e-6 is what R7 tolerates. */
                 if (polish_reltol > 0.0 && polish_reltol < ckt->CKTreltol) {
                     ckt->CKTreltol = polish_reltol;
                     reltol_tightened = 1;
@@ -6641,7 +6719,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
              * required) uses this new forward difference. Both remain
              * behind PSS_FREERUN_PAC_EXPERIMENTAL -- this does not change
              * default (gated) behaviour either way. */
-            if (dt > 0.0 && !getenv("PSS_FREERUN_FT_BACKWARD")) {
+            if (dt > 0.0 && !getenv("PSS_FREERUN_FT_BACKWARD") && !pss_trig_hidden_state(ckt)) {
                 double dt_fine_req = getenv("PSS_FREERUN_FT_DT") ?
                     atof(getenv("PSS_FREERUN_FT_DT")) : 1e-13;
                 double *x_fine = TMALLOC(double, n);

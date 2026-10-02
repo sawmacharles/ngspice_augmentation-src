@@ -326,6 +326,12 @@ pac_find_trig_idx(const PACstateMap *map, int trig_node_num)
     int d;
     if (trig_node_num < 0)
         return -1;
+    if (map->generic) {   /* card #544: the trigger node must be one of the state rows (a column of C somewhere on the orbit) */
+        for (d = 0; d < map->ns; d++)
+            if (map->srows[d] == trig_node_num)
+                return d;
+        return -1;
+    }
     for (d = 0; d < map->n; d++)
         if (map->refs[d].isCap && map->refs[d].dev.cap->CAPposNode == trig_node_num)
             return d;
@@ -2295,12 +2301,9 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         if (!g_pp_detect_hit)
             return 0;   /* no device-model charge anywhere on the orbit: native C/L history is exact */
     }
-    if (trig_node_num >= 0) {
-        fprintf(stderr, "%s: REFUSED -- free-running (trigger=) orbits with device-model charge storage are "
-                "not supported: the period-variation projection needs f(T) at every charge state "
-                "(card #542).\n", who);
-        return E_UNSUPP;
-    }
+    /* card #544: free-running (trigger=) orbits with device-model charges are accepted. Their .pac/.pstb is the fixed-period
+     * engine on the polished orbit (the period-variation projection is opt-in, PAC_FREERUN_PROJ, and is not formed for a
+     * generic state set: f(T) over the charge rows is not available). The trigger node must be a state row (below). */
     g_pp_col = TMALLOC(unsigned char, neq + 1);
     if (!g_pp_col) return E_NOMEM;
     if (g_pp_xend) tfree(g_pp_xend);
@@ -2487,7 +2490,9 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
          * term actually changes the answer (not a silent no-op) by A/B
          * comparison against the same independent reference this pass's
          * own report validates against. Never set in production. */
-        if (fT && trig_idx >= 0 && fT[trig_idx] != 0.0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ")) {
+        if (map->generic && getenv("PAC_FREERUN_PROJ"))
+            fprintf(stderr, "PAC-TD: PAC_FREERUN_PROJ ignored: the period-variation projection is not formed on the generic (model-charge) state set (card #544).\n");
+        if (!map->generic && fT && trig_idx >= 0 && fT[trig_idx] != 0.0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ")) {
             double denom = fT[trig_idx];
             PhiCorr = TMALLOC(PACc, (size_t) n * n);
             zCorr = TMALLOC(PACc, (size_t) n * nfreq);
@@ -4102,7 +4107,7 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PAC-TD: REFUSED -- the trigger= node (free-running "
                 "orbit, card #489) is not a native capacitor's own positive "
-                "terminal among this circuit's reduced states, so the "
+                "terminal (or, on the generic model-charge path, a charge-carrying node row) among this circuit's states, so the "
                 "period-variation terminal projection this engine needs "
                 "(docs/pss-pac.md's free-running section) cannot be formed. "
                 "Not running the fixed-period engine uncorrected on a "
@@ -4268,7 +4273,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PSTB: REFUSED -- the trigger= node (free-running "
                 "orbit, card #489) is not a native capacitor's own positive "
-                "terminal among this circuit's reduced states, so the "
+                "terminal (or, on the generic model-charge path, a charge-carrying node row) among this circuit's states, so the "
                 "period-variation terminal projection this engine needs "
                 "(docs/pss-pac.md's free-running section) cannot be formed. "
                 "Not running the fixed-period engine uncorrected on a "
@@ -4610,7 +4615,7 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PXF-TD: REFUSED -- the trigger= node (free-running "
                 "orbit, card #489) is not a native capacitor's own positive "
-                "terminal among this circuit's reduced states, so the "
+                "terminal (or, on the generic model-charge path, a charge-carrying node row) among this circuit's states, so the "
                 "period-variation terminal projection this engine needs "
                 "(docs/pss-pac.md's free-running section) cannot be formed. "
                 "Not running the fixed-period engine uncorrected on a "
