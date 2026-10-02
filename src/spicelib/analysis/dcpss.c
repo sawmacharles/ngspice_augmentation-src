@@ -3509,14 +3509,16 @@ DCpss(CKTcircuit *ckt,
             VSRCinstance *vi ;
             for (vm = (VSRCmodel *) ckt->CKThead [vt] ; vm && !pss_driven ; vm = VSRCnextModel (vm))
                 for (vi = VSRCinstances (vm) ; vi ; vi = VSRCnextInstance (vi))
-                    if (vi->VSRCfuncTGiven) { pss_driven = 1 ; break ; }
+                    /* card #541: VSRCparam() clears VSRCfuncTGiven on EVERY parameter call, so a PWL with `r=0` (the
+                     * repeat key arrives after the function) loses the flag; the function type itself stays. */
+                    if (vi->VSRCfuncTGiven || vi->VSRCfunctionType != 0) { pss_driven = 1 ; break ; }
         }
         if (itk >= 0 && ckt->CKThead [itk] && !pss_driven) {
             ISRCmodel *im ;
             ISRCinstance *ii ;
             for (im = (ISRCmodel *) ckt->CKThead [itk] ; im && !pss_driven ; im = ISRCnextModel (im))
                 for (ii = ISRCinstances (im) ; ii ; ii = ISRCnextInstance (ii))
-                    if (ii->ISRCfuncTGiven) { pss_driven = 1 ; break ; }
+                    if (ii->ISRCfuncTGiven || ii->ISRCfunctionType != 0) { pss_driven = 1 ; break ; }
         }
         /* card #494: `driven=1` override -- see pssdefs.h's
          * PSSforceDriven comment. Applied AFTER the native scan so a deck

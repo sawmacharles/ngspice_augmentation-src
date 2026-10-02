@@ -869,6 +869,26 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
  * PSSsensRecordStep()'s own comment describes doing for the SW model --
  * see the card #465 THIRD pass report for exactly what was and was not
  * checked. Default OFF until that gap is closed. */
+/* card #541: copy the currently loaded (unfactored) matrix into the last trajectory entry (native path). */
+static void
+pac_traj_store_J(CKTcircuit *ckt)
+{
+    PACtrajStep *st = &g_pac_traj[g_pac_traj_n - 1];
+    int nnz = SMPnumElements(ckt->CKTmatrix);
+    const char *mx = getenv("PAC_TRAJ_MAX_MB");
+    double cap = (mx && atof(mx) > 0.0) ? atof(mx) * 1048576.0 : 3.0e9;
+    if (g_pac_traj_bytes + (double) nnz * 16.0 > cap) {
+        fprintf(stderr, "PAC-TD: adjoint trajectory would exceed %.0f MB (J_k of every step is kept for the "
+                "exact transpose; set PAC_TRAJ_MAX_MB higher or use fewer pacpoints).\n", cap / 1048576.0);
+        g_pac_traj_failed = 1;
+        return;
+    }
+    st->Jri = TMALLOC(int, nnz + 1); st->Jci = TMALLOC(int, nnz + 1); st->Jv = TMALLOC(double, nnz + 1);
+    if (!st->Jri || !st->Jci || !st->Jv) { g_pac_traj_failed = 1; return; }
+    st->nJ = SMPcopyElements(ckt->CKTmatrix, st->Jri, st->Jci, st->Jv);
+    g_pac_traj_bytes += (double) nnz * 16.0;
+}
+
 static int
 pac_refactor_at_accepted(CKTcircuit *ckt)
 {
@@ -876,6 +896,8 @@ pac_refactor_at_accepted(CKTcircuit *ckt)
     int nstates = ckt->CKTnumStates;
     double *save_rhs, *save_rhsold, *save_state0 = NULL;
     int err;
+    long save_mode;
+    int save_bypass, save_noncon;
 
     save_rhs = TMALLOC(double, neq + 1);
     save_rhsold = TMALLOC(double, neq + 1);
@@ -898,9 +920,24 @@ pac_refactor_at_accepted(CKTcircuit *ckt)
      * G(x_k)/C(x_k), not G(x_{k-1})/C(x_{k-1}). */
     memcpy(ckt->CKTrhsOld, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
 
+    /* card #541: at this hook CKTmode is MODETRAN|MODEINITPRED (dctran has already switched for the NEXT
+     * step), under which MOS1 and friends evaluate at the PREDICTED voltages extrapolated from CKTstate1/2,
+     * not at CKTrhsOld = x_k: the "exact" J_k was J at a predicted point (0.4462 vs 0.4677 on the #539 bug 3
+     * chain, 5 % on a threshold crossing). Load in MODEINITFLOAT, bypass off, like pac_gen_loads(). */
+    save_mode = ckt->CKTmode; save_bypass = ckt->CKTbypass; save_noncon = ckt->CKTnoncon;
+    ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODETRAN | MODEINITFLOAT;
+    ckt->CKTbypass = 0;
     err = CKTload(ckt);
+    ckt->CKTmode = save_mode;
+    /* card #541: native adjoint -- keep the exact J_k the forward pass used (loaded at x_k from the
+     * accepted device state) for the backward sweep, instead of reloading it in reverse order from device
+     * state (limiting / previous-iterate history) that no longer belongs to step k. Without this the
+     * adjoint of a MOS1 comparator chain was ~0 (#539 bug 3). */
+    if (!err && g_pac_traj_active && g_pac_traj_n > 0 && !g_pac_traj_failed)
+        pac_traj_store_J(ckt);
     if (!err)
         err = SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin);
+    ckt->CKTbypass = save_bypass; ckt->CKTnoncon = save_noncon;
 
     /* restore CKTrhs/CKTrhsOld/CKTstate0 exactly as dctran.c's own
      * subsequent code (CKTdump right after this hook returns, and the
@@ -2664,6 +2701,11 @@ pac_adj_refactor_at(CKTcircuit *ckt, const PACtrajStep *step)
     ckt->CKTag[0] = step->ag0;
     ckt->CKTag[1] = step->ag1;
 
+    if (step->nJ > 0) {      /* card #541: the forward pass's own J_k */
+        if (SMPsetElements(ckt->CKTmatrix, step->nJ, step->Jri, step->Jci, step->Jv))
+            return 1;
+        return SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin) ? 1 : 0;
+    }
     if (CKTload(ckt))
         return 1;
     return SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin) ? 1 : 0;
