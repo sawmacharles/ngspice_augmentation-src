@@ -49,6 +49,8 @@ int MIFmSize = sizeof(MIFmodel);
 /* This must be initialized so that EVTfindvec can check for */
 /* NULL pointer in g_mif_info.ckt */
 
+double g_xs_toff = 0.0;   /* card #551, see mif.h */
+
 Mif_Info_t  g_mif_info = {
   { MIF_FALSE, MIF_FALSE, MIF_DC, MIF_ANALOG, 0.0,},
   NULL,

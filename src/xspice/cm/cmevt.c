@@ -39,6 +39,8 @@ NON-STANDARD FEATURES
 =========================================================================== */
 
 #include "ngspice/ngspice.h"
+#include <float.h>
+#include <math.h>
 #include "ngspice/cktdefs.h"
 
 #include "ngspice/cm.h"
@@ -239,6 +241,14 @@ int  cm_event_queue(
     /* Get the address of the ckt and instance structs from g_mif_info */
     here = g_mif_info.instance;
     ckt  = g_mif_info.ckt;
+
+    if (g_xs_toff != 0.0) {   /* card #551: model time -> circuit time; the difference of two nearly equal large numbers must
+                               * not land a rounding error below the current event time (the event would be refused) */
+        double rel = time - g_xs_toff;
+        if (fabs(rel - g_mif_info.circuit.evt_step) <= 16.0 * DBL_EPSILON * (fabs(time) + fabs(g_xs_toff)))
+            rel = g_mif_info.circuit.evt_step;
+        time = rel;
+    }
 
     /* If breakpoint time < current event time, return error. */
 

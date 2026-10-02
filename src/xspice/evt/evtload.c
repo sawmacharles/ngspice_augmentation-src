@@ -140,8 +140,13 @@ int EVTload_with_event(
         }
         if (cm_data.circuit.t[1] < 0.0)
               cm_data.circuit.t[1] = 0.0;
+        if (g_xs_toff != 0.0) {   /* card #551: continuing model time */
+            cm_data.circuit.time += g_xs_toff;
+            cm_data.circuit.t[0] += g_xs_toff;
+            cm_data.circuit.t[1] += g_xs_toff;
+        }
     } else {
-        cm_data.circuit.time = 0.0;
+        cm_data.circuit.time = 0.0;   /* card #551: see mifload.c */
         cm_data.circuit.t[0] = cm_data.circuit.t[1] = 0.0;
     }
 

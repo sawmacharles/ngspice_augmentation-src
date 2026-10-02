@@ -424,6 +424,8 @@ int cm_analog_set_temp_bkpt(
     /* Get the address of the ckt and instance structs from g_mif_info */
     ckt  = g_mif_info.ckt;
 
+    time -= g_xs_toff;   /* card #551: model time -> circuit time */
+
     /* Make sure breakpoint is not prior to last accepted timepoint */
     if(time < ((ckt->CKTtime - ckt->CKTdelta) + ckt->CKTminBreak)) {
         g_mif_info.errmsg =
@@ -474,9 +476,11 @@ int cm_analog_set_perm_bkpt(
     /* Get the address of the ckt and instance structs from g_mif_info */
     ckt  = g_mif_info.ckt;
 
+    time -= g_xs_toff;   /* card #551: model time -> circuit time */
+
     /* Call cm_analog_set_temp_bkpt() to force backup if less than current time */
     if(time < (ckt->CKTtime + ckt->CKTminBreak))
-        return(cm_analog_set_temp_bkpt(time));
+        return(cm_analog_set_temp_bkpt(time + g_xs_toff));
     else
         CKTsetBreak(ckt,time);
 

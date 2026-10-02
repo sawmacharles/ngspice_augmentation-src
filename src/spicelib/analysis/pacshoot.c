@@ -157,6 +157,10 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 #include "ind/inddefs.h"
 #include "vsrc/vsrcdefs.h"
 #include "isrc/isrcdefs.h"
+#ifdef XSPICE
+#include "ngspice/miftypes.h"
+#include "ngspice/mif.h"
+#endif
 
 #include <math.h>
 #include <string.h>
@@ -479,6 +483,9 @@ pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
             ckt->CKTreltol = job->PACrecordReltol;
         else if (getenv("PAC_RECORD_RELTOL") && atof(getenv("PAC_RECORD_RELTOL")) > 0.0)
             ckt->CKTreltol = atof(getenv("PAC_RECORD_RELTOL"));   /* card #546: env form, tests */
+#ifdef XSPICE
+        g_xs_toff = 0.0;   /* card #551: the td recording passes only see stateless analog code models (PSSxspicePolicy) */
+#endif
         err = DCtran(ckt, 1);
         ckt->CKTreltol = save_reltol;
     }
@@ -1968,6 +1975,9 @@ pac_capture_b0(CKTcircuit *ckt, double *br, double *bi, int neq)
     int i;
     long savedMode = ckt->CKTmode;
     int err = 0;
+#ifdef XSPICE
+    Mif_Analysis_t saved_anal;
+#endif
 
 #ifdef KLU
     if (ckt->CKTmatrix->CKTkluMODE) {
@@ -1986,7 +1996,17 @@ pac_capture_b0(CKTcircuit *ckt, double *br, double *bi, int neq)
     if (!err) {
         ckt->CKTomega = 1.0;
         ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODEAC;
+#ifdef XSPICE
+        /* card #551: MIFload (the XSPICE DEVacLoad) takes its analysis type from g_mif_info, which only CKTload/acan set;
+         * after the CKTload above it still says DC, so every analog code model stamped its DC RHS (offset, output -
+         * partial*input) into the "small-signal" source vector and the td PAC response carried a constant error. */
+        saved_anal = g_mif_info.circuit.anal_type;
+        g_mif_info.circuit.anal_type = MIF_AC;
+#endif
         if (CKTacLoad(ckt)) err = 1;
+#ifdef XSPICE
+        g_mif_info.circuit.anal_type = saved_anal;
+#endif
     }
     if (!err)
         for (i = 1; i <= neq; i++) {
@@ -2354,6 +2374,9 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     int has, err, neq, i, ns, npass, force_gen;
     static int warned_native = 0;
     double tprep0 = SPfrontEnd->IFseconds();
+
+    if (PSSxspicePolicy(ckt, 2, who))   /* card #551: only stateless analog XSPICE code models have a td small-signal model */
+        return E_UNSUPP;
 
     if (getenv("PAC_NATIVE_HISTORY")) {
         if (!warned_native) {

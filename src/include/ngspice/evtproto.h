@@ -67,6 +67,17 @@ void EVTtermInsert(
 int EVTsetup(CKTcircuit *ckt);
 int EVTunsetup(CKTcircuit* ckt);
 
+/* card #551: restartable XSPICE state for `.pss method=shoot` (evtsetup.c) */
+typedef struct XSsnap XSsnap;
+int     XSPICEnumInstances(CKTcircuit *ckt);
+XSsnap *XSsnapNew(void);
+void    XSsnapFree(CKTcircuit *ckt, XSsnap *s);
+int     XSsnapValid(const XSsnap *s);
+void    XSsnapTake(CKTcircuit *ckt, XSsnap *s, double L, double base_toff);
+void    XSsnapPut(CKTcircuit *ckt, const XSsnap *s);
+int     XSsnapDigitalDiff(CKTcircuit *ckt, const XSsnap *a, const XSsnap *b);
+double  XSsnapAnalogDiff(const XSsnap *a, const XSsnap *b);
+
 int EVTdest(Evt_Ckt_Data_t *evt);
 
 int EVTiter(CKTcircuit *ckt);

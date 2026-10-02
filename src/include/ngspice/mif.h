@@ -83,6 +83,9 @@ extern int MIFmSize;
 
 
 extern Mif_Info_t      g_mif_info;
+/* card #551: model-time offset (s) of the current run: a `.pss method=shoot` period run restarts the circuit clock at 0 while the
+ * XSPICE models (event queue, stored change times, oscillator phases) must see a CONTINUING time; 0 except inside such an analysis. */
+extern double          g_xs_toff;
 extern Mif_Private_t   g_mif_noise_cm_data;
 
 #endif

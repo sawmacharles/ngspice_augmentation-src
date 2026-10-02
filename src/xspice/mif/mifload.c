@@ -200,9 +200,15 @@ MIFload(
            if(cm_data.circuit.t[i] < 0.0)
               cm_data.circuit.t[i] = 0.0;
        }
+       if (g_xs_toff != 0.0) {   /* card #551: continuing model time */
+           cm_data.circuit.time += g_xs_toff;
+           for(i = 0; i < 8; i++)
+               cm_data.circuit.t[i] += g_xs_toff;
+       }
     }
     else {
-       cm_data.circuit.time = 0.0;
+       cm_data.circuit.time = 0.0;   /* card #551: the t=0 pass of a restarted run still sees time 0 (models initialise from the
+                                      * inputs there); PSSxsPostInit() puts the carried state back right after it */
        for(i = 0; i < 8; i++) {
            cm_data.circuit.t[i] = 0.0;
        }

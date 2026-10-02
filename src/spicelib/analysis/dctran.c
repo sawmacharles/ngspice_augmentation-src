@@ -396,6 +396,12 @@ DCtran(CKTcircuit *ckt,
             return(converged);
         }
 #ifdef XSPICE
+#ifdef WITH_PSS
+        /* card #551: the t=0 pass above lets analog code models re-initialise their state from the inputs; a shooting period
+         * run puts the carried XSPICE state (analog state, event system, model time) back before the first time step. */
+        if (PSSxsPostInitHook)
+            PSSxsPostInitHook(ckt);
+#endif
         /* set anal_init and anal_type */
         g_mif_info.circuit.anal_init = MIF_TRUE;
 

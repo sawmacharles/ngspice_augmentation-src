@@ -80,6 +80,8 @@ extern int PSSlastStepOrder;     /* dctran.c: integration order of the step just
 void PSSreplayStep(CKTcircuit *ckt);   /* called once per fresh step, before the corrector */
 
 void PSSbreakInstallHook(CKTcircuit *ckt);
+extern void (*PSSxsPostInitHook)(CKTcircuit *ckt);   /* card #551: dctran.c calls it after the t=0 pass of a restarted run (XSPICE state put back) */
+extern void (*PSSxsPostInitHook)(CKTcircuit *ckt);   /* card #551: dctran.c calls it after the t=0 pass of a restarted run (XSPICE state put back) */
 extern int PSSeventLocateActive, PSSeventLocateRestart, PSSswLagActive, PSSeventLocateCrossed;   /* card #498 2nd pass: exact sw event location */
 int PSSeventLocate(CKTcircuit *ckt, double *newdelta);
 int PSSshootLagEnabled(void);   /* card #498: PAC/PSTB recording passes follow the PSS orbit's sw treatment */  /* called right after the restart-path breaks reset */
@@ -104,6 +106,7 @@ void PSSsensRecordStep(CKTcircuit *ckt);    /* called right after CKTaccept(), s
 
 extern int PSSrippleRecordActive;
 extern int PSShidActive;           /* card #546 */
+extern int PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who);   /* card #551: XSPICE model whitelist (0 ok, E_UNSUPP refused) */
 void PSShidRecordStep(CKTcircuit *ckt);
 
 void PSSrippleRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), same site as the hooks above */

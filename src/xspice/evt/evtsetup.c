@@ -51,6 +51,8 @@ NON-STANDARD FEATURES
 #include "ngspice/evtudn.h"
 #include "ngspice/mifproto.h"
 #include "ngspice/evtproto.h"
+#include "ngspice/devdefs.h"
+#include <math.h>
 
 
 
@@ -683,4 +685,436 @@ int EVTswitch_plot(CKTcircuit* ckt, const char* plottypename) {
         }
     }
     return 1;
+}
+
+
+/* ======================================================================================================================
+ * card #551: restartable XSPICE state for `.pss method=shoot`.
+ *
+ * A shooting period run is a fresh DCtran(restart=1) from t = 0 with the native C/L states put back.  For XSPICE circuits that
+ * lost (a) the analog code-model state (CKTstates entries allocated through cm_analog_alloc / cm_analog_integrate / the old
+ * input of every port), which was left at whatever the last run (trial, perturbation) ended with, and (b) the whole event
+ * system, which is only (re)initialised by EVTsetup() once per job: a second DCtran() restart crashed in the first hybrid
+ * model (output pointers still aimed at the previous run's event structs) and, had it not, would have run on stale queues.
+ *
+ * Here the logical state at the end of a run (analog state values, digital node values, the tail state block of every event
+ * instance, the pending instance and output events with their times relative to the end of the run) is copied into an XSsnap
+ * and put back before the next run.  Time: the models must see a CONTINUING time (g_xs_toff, see mif.h): their stored change
+ * times / phases stay valid and the `TIME == 0.0` initialisation branches run only in the very first run.
+ * ====================================================================================================================== */
+
+typedef struct { void *nv, *inv; void **out; } XSnodeVal;
+
+struct XSsnap {
+    int        valid;
+    double     toff;               /* g_xs_toff of a run that starts from this snapshot */
+    int        n_an;               /* analog: CKTstate indices and their values */
+    int       *an_idx;
+    double    *an_val;
+    int        num_nodes, num_insts;
+    XSnodeVal *rhs, *rhsold;       /* [num_nodes] */
+    void     **st_blk;             /* [num_insts] tail state block (or NULL) */
+    int       *st_size;
+    int        n_ie;               /* pending instance events */
+    int       *ie_inst;
+    double    *ie_t;
+    int        n_oe;               /* pending output events */
+    int       *oe_out;
+    double    *oe_t;
+    void     **oe_val;
+};
+
+static void
+xs_for_each_mif_instance(CKTcircuit *ckt, void (*fn)(MIFinstance *, void *), void *ctx)
+{
+    int i;
+    for (i = 0; i < DEVmaxnum; i++) {
+        GENmodel *m;
+        if (!DEVices[i] || !DEVices[i]->DEVpublic.cm_func || !ckt->CKThead[i])
+            continue;
+        for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+            GENinstance *g;
+            for (g = m->GENinstances; g; g = g->GENnextInstance)
+                fn((MIFinstance *) g, ctx);
+        }
+    }
+}
+
+int
+XSPICEnumInstances(CKTcircuit *ckt)
+{
+    int i, n = 0;
+    for (i = 0; i < DEVmaxnum; i++) {
+        GENmodel *m;
+        if (!DEVices[i] || !DEVices[i]->DEVpublic.cm_func || !ckt->CKThead[i])
+            continue;
+        for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+            GENinstance *g;
+            for (g = m->GENinstances; g; g = g->GENnextInstance)
+                n++;
+        }
+    }
+    return n;
+}
+
+typedef struct { int n, cap; int *idx; } XSidxList;
+
+static void
+xs_idx_add(XSidxList *l, int idx)
+{
+    if (l->n == l->cap) {
+        l->cap = l->cap ? 2 * l->cap : 64;
+        l->idx = TREALLOC(int, l->idx, l->cap);
+    }
+    l->idx[l->n++] = idx;
+}
+
+static void
+xs_collect_analog(MIFinstance *here, void *ctx)
+{
+    XSidxList *l = (XSidxList *) ctx;
+    int i, j, k, d;
+    for (k = 0; k < here->num_state; k++)
+        for (d = 0; d < here->state[k].doubles; d++)
+            xs_idx_add(l, here->state[k].index + d);
+    if (!here->analog)
+        return;
+    for (i = 0; i < here->num_conn; i++) {
+        if (here->conn[i]->is_null || !here->conn[i]->is_input)
+            continue;
+        for (j = 0; j < here->conn[i]->size; j++)
+            if (!here->conn[i]->port[j]->is_null)
+                xs_idx_add(l, here->conn[i]->port[j]->old_input);
+    }
+}
+
+static void *
+xs_udn_clone(int udn, void *src)
+{
+    void *p = NULL;
+    g_evt_udn_info[udn]->create(&p);
+    g_evt_udn_info[udn]->copy(src, p);
+    return p;
+}
+
+static void
+xs_udn_free(int udn, void *p)
+{
+    if (!p)
+        return;
+    if (g_evt_udn_info[udn]->dismantle)
+        g_evt_udn_info[udn]->dismantle(p);
+    tfree(p);
+}
+
+static void
+xs_nodeval_clone(CKTcircuit *ckt, int i, const Evt_Node_t *src, XSnodeVal *dst)
+{
+    Evt_Node_Info_t *ni = ckt->evt->info.node_table[i];
+    int j;
+    dst->nv = xs_udn_clone(ni->udn_index, src->node_value);
+    dst->inv = (ni->invert && src->inverted_value) ? xs_udn_clone(ni->udn_index, src->inverted_value) : NULL;
+    dst->out = NULL;
+    if (ni->num_outputs > 1 && src->output_value) {
+        dst->out = TMALLOC(void *, ni->num_outputs);
+        for (j = 0; j < ni->num_outputs; j++)
+            dst->out[j] = xs_udn_clone(ni->udn_index, src->output_value[j]);
+    }
+}
+
+static void
+xs_nodeval_free(CKTcircuit *ckt, int i, XSnodeVal *v)
+{
+    Evt_Node_Info_t *ni = ckt->evt->info.node_table[i];
+    int j;
+    xs_udn_free(ni->udn_index, v->nv);
+    xs_udn_free(ni->udn_index, v->inv);
+    if (v->out) {
+        for (j = 0; j < ni->num_outputs; j++)
+            xs_udn_free(ni->udn_index, v->out[j]);
+        tfree(v->out);
+    }
+    v->nv = v->inv = NULL;
+    v->out = NULL;
+}
+
+static void
+xs_nodeval_put(CKTcircuit *ckt, int i, const XSnodeVal *src, Evt_Node_t *dst)
+{
+    Evt_Node_Info_t *ni = ckt->evt->info.node_table[i];
+    int j;
+    g_evt_udn_info[ni->udn_index]->copy(src->nv, dst->node_value);
+    if (src->inv && dst->inverted_value)
+        g_evt_udn_info[ni->udn_index]->copy(src->inv, dst->inverted_value);
+    if (src->out && dst->output_value)
+        for (j = 0; j < ni->num_outputs; j++)
+            g_evt_udn_info[ni->udn_index]->copy(src->out[j], dst->output_value[j]);
+}
+
+XSsnap *
+XSsnapNew(void)
+{
+    return TMALLOC(XSsnap, 1);
+}
+
+static void
+xs_snap_clear(CKTcircuit *ckt, XSsnap *s)
+{
+    int i;
+    if (s->rhs)
+        for (i = 0; i < s->num_nodes; i++)
+            xs_nodeval_free(ckt, i, &s->rhs[i]);
+    if (s->rhsold)
+        for (i = 0; i < s->num_nodes; i++)
+            xs_nodeval_free(ckt, i, &s->rhsold[i]);
+    if (s->st_blk)
+        for (i = 0; i < s->num_insts; i++)
+            if (s->st_blk[i])
+                tfree(s->st_blk[i]);
+    if (s->oe_val)
+        for (i = 0; i < s->n_oe; i++) {
+            int out = s->oe_out[i];
+            int node = ckt->evt->info.output_table[out]->node_index;
+            xs_udn_free(ckt->evt->info.node_table[node]->udn_index, s->oe_val[i]);
+        }
+    tfree(s->an_idx); tfree(s->an_val); tfree(s->rhs); tfree(s->rhsold); tfree(s->st_blk); tfree(s->st_size);
+    tfree(s->ie_inst); tfree(s->ie_t); tfree(s->oe_out); tfree(s->oe_t); tfree(s->oe_val);
+    memset(s, 0, sizeof *s);
+}
+
+void
+XSsnapFree(CKTcircuit *ckt, XSsnap *s)
+{
+    if (!s)
+        return;
+    xs_snap_clear(ckt, s);
+    tfree(s);
+}
+
+int
+XSsnapValid(const XSsnap *s)
+{
+    return s && s->valid;
+}
+
+/* Take the logical XSPICE state at the end of a run of length L (CKTtime == L).  base_toff is the g_xs_toff the run used. */
+void
+XSsnapTake(CKTcircuit *ckt, XSsnap *s, double L, double base_toff)
+{
+    XSidxList l = { 0, 0, NULL };
+    int i, k;
+
+    xs_snap_clear(ckt, s);
+    s->toff = base_toff + L;
+
+    xs_for_each_mif_instance(ckt, xs_collect_analog, &l);
+    if (l.n && ckt->CKTstate0) {
+        s->n_an = l.n;
+        s->an_idx = l.idx;
+        s->an_val = TMALLOC(double, l.n);
+        for (k = 0; k < l.n; k++)
+            s->an_val[k] = ckt->CKTstate0[l.idx[k]];
+    } else {
+        tfree(l.idx);
+    }
+
+    if (ckt->evt && ckt->evt->counts.num_insts > 0 && ckt->evt->data.node) {
+        Evt_Node_Data_t *nd = ckt->evt->data.node;
+        Evt_State_Data_t *sd = ckt->evt->data.state;
+        Evt_Inst_Queue_t *iq = &ckt->evt->queue.inst;
+        Evt_Output_Queue_t *oq = &ckt->evt->queue.output;
+        int ni = ckt->evt->counts.num_nodes, ns = ckt->evt->counts.num_insts, no = ckt->evt->counts.num_outputs;
+        int cap;
+
+        s->num_nodes = ni;
+        s->num_insts = ns;
+        s->rhs = TMALLOC(XSnodeVal, ni);
+        s->rhsold = TMALLOC(XSnodeVal, ni);
+        for (i = 0; i < ni; i++) {
+            xs_nodeval_clone(ckt, i, &nd->rhs[i], &s->rhs[i]);
+            xs_nodeval_clone(ckt, i, &nd->rhsold[i], &s->rhsold[i]);
+        }
+        s->st_blk = TMALLOC(void *, ns);
+        s->st_size = TMALLOC(int, ns);
+        for (i = 0; i < ns; i++) {
+            Evt_State_t *st = sd->tail[i] ? *(sd->tail[i]) : NULL;
+            s->st_size[i] = sd->total_size[i];
+            if (st && st->block && sd->total_size[i] > 0) {
+                s->st_blk[i] = tmalloc((size_t) sd->total_size[i]);
+                memcpy(s->st_blk[i], st->block, (size_t) sd->total_size[i]);
+            }
+        }
+        cap = 0;
+        for (i = 0; i < ns; i++) {
+            Evt_Inst_Event_t *ev;
+            if (!iq->current[i])
+                continue;
+            for (ev = *(iq->current[i]); ev; ev = ev->next) {
+                if (s->n_ie == cap) {
+                    cap = cap ? 2 * cap : 16;
+                    s->ie_inst = TREALLOC(int, s->ie_inst, cap);
+                    s->ie_t = TREALLOC(double, s->ie_t, cap);
+                }
+                s->ie_inst[s->n_ie] = i;
+                s->ie_t[s->n_ie] = ev->event_time - L;
+                s->n_ie++;
+            }
+        }
+        cap = 0;
+        for (i = 0; i < no; i++) {
+            Evt_Output_Event_t *ev;
+            int node = ckt->evt->info.output_table[i]->node_index;
+            int udn = ckt->evt->info.node_table[node]->udn_index;
+            if (!oq->current[i])
+                continue;
+            for (ev = *(oq->current[i]); ev; ev = ev->next) {
+                if (ev->removed)
+                    continue;
+                if (s->n_oe == cap) {
+                    cap = cap ? 2 * cap : 16;
+                    s->oe_out = TREALLOC(int, s->oe_out, cap);
+                    s->oe_t = TREALLOC(double, s->oe_t, cap);
+                    s->oe_val = TREALLOC(void *, s->oe_val, cap);
+                }
+                s->oe_out[s->n_oe] = i;
+                s->oe_t[s->n_oe] = ev->event_time - L;
+                s->oe_val[s->n_oe] = xs_udn_clone(udn, ev->value);
+                s->n_oe++;
+            }
+        }
+    }
+    s->valid = 1;
+    if (getenv("PSS_XS_TRACE")) {
+        fprintf(stderr, "XS-TRACE take: toff_next=%.9g n_an=%d", s->toff, s->n_an);
+        for (k = 0; k < s->n_an && k < 8; k++)
+            fprintf(stderr, " [%d]=%.6g", s->an_idx[k], s->an_val[k]);
+        fprintf(stderr, " digital: nodes=%d insts=%d events inst=%d out=%d", s->num_nodes, s->num_insts, s->n_ie, s->n_oe);
+        for (k = 0; k < s->num_nodes && k < 12; k++) {
+            double rv = -1.0;
+            Evt_Node_Info_t *ni = ckt->evt->info.node_table[k];
+            if (g_evt_udn_info[ni->udn_index]->plot_val)
+                g_evt_udn_info[ni->udn_index]->plot_val(s->rhsold[k].nv, "state", &rv);
+            fprintf(stderr, " %s=%g", ni->name, rv);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+/* Put the snapshot back before a restarted run (DCtran restart = 1, CKTtime = 0). */
+void
+XSsnapPut(CKTcircuit *ckt, const XSsnap *s)
+{
+    int i, k;
+    if (!s || !s->valid)
+        return;
+    g_xs_toff = s->toff;
+    if (s->n_an && ckt->CKTstate0) {
+        for (k = 0; k < s->n_an; k++) {
+            ckt->CKTstate0[s->an_idx[k]] = s->an_val[k];
+            if (ckt->CKTstate1)
+                ckt->CKTstate1[s->an_idx[k]] = s->an_val[k];
+        }
+    }
+    if (ckt->evt && ckt->evt->counts.num_insts > 0 && ckt->evt->data.node && s->rhs) {
+        Evt_Node_Data_t *nd = ckt->evt->data.node;
+        Evt_State_Data_t *sd = ckt->evt->data.state;
+        int ni = ckt->evt->counts.num_nodes, ns = ckt->evt->counts.num_insts;
+        char *was_init = TMALLOC(char, ns);
+
+        for (i = 0; i < ns; i++)
+            was_init[i] = ckt->evt->info.inst_table[i]->inst_ptr->initialized ? 1 : 0;
+
+        EVTsetup_queues(ckt);
+        EVTsetup_load_ptrs(ckt);
+        for (i = 0; i < ns; i++)
+            ckt->evt->info.inst_table[i]->inst_ptr->initialized = was_init[i] ? MIF_TRUE : MIF_FALSE;
+        tfree(was_init);
+
+        for (i = 0; i < ni; i++) {
+            /* history list -> free list; EVTop_save() reseeds it from rhsold */
+            if (nd->head[i]) {
+                Evt_Node_t *last = nd->head[i];
+                while (last->next)
+                    last = last->next;
+                last->next = nd->free[i];
+                nd->free[i] = nd->head[i];
+                nd->head[i] = NULL;
+            }
+            nd->tail[i] = &(nd->head[i]);
+            nd->last_step[i] = &(nd->head[i]);
+            nd->modified[i] = MIF_FALSE;
+            xs_nodeval_put(ckt, i, &s->rhs[i], &nd->rhs[i]);
+            xs_nodeval_put(ckt, i, &s->rhsold[i], &nd->rhsold[i]);
+        }
+        nd->num_modified = 0;
+
+        for (i = 0; i < ns; i++) {
+            Evt_State_t *st = sd->tail[i] ? *(sd->tail[i]) : NULL;
+            if (!st || !st->block || !s->st_blk[i] || s->st_size[i] != sd->total_size[i])
+                continue;
+            memcpy(st->block, s->st_blk[i], (size_t) s->st_size[i]);
+            if (sd->head[i] != st) {              /* history still linked: older steps go to the free list, as EVTaccept() does */
+                if (st->prev) {
+                    st->prev->next = sd->free[i];
+                    sd->free[i] = sd->head[i];
+                }
+                sd->head[i] = st;
+            }
+            st->prev = NULL;                      /* (after EVTaccept() prev dangles into the free list; head == st already) */
+            st->next = NULL;
+            st->step = 0.0;
+            sd->tail[i] = &(sd->head[i]);
+            sd->last_step[i] = &(sd->head[i]);
+            sd->modified[i] = MIF_FALSE;
+        }
+        sd->num_modified = 0;
+
+        for (k = 0; k < s->n_ie; k++)
+            EVTqueue_inst(ckt, s->ie_inst[k], 0.0, s->ie_t[k]);
+        for (k = 0; k < s->n_oe; k++) {
+            int out = s->oe_out[k];
+            int node = ckt->evt->info.output_table[out]->node_index;
+            int udn = ckt->evt->info.node_table[node]->udn_index;
+            Evt_Output_Event_t *ev = TMALLOC(Evt_Output_Event_t, 1);
+            g_evt_udn_info[udn]->create(&ev->value);
+            g_evt_udn_info[udn]->copy(s->oe_val[k], ev->value);
+            EVTqueue_output(ckt, out, udn, ev, 0.0, s->oe_t[k]);
+        }
+        g_mif_info.circuit.evt_step = 0.0;
+        EVTop_save(ckt, MIF_FALSE, 0.0);   /* the (emptied) node history is seeded from rhsold exactly as after EVTop() */
+    }
+}
+
+/* Number of digital nodes whose resolved value differs between two snapshots (hidden-state periodicity check). */
+int
+XSsnapDigitalDiff(CKTcircuit *ckt, const XSsnap *a, const XSsnap *b)
+{
+    int i, n = 0;
+    if (!a || !b || !a->valid || !b->valid || !a->rhsold || !b->rhsold || a->num_nodes != b->num_nodes)
+        return 0;
+    for (i = 0; i < a->num_nodes; i++) {
+        Mif_Boolean_t eq = MIF_TRUE;
+        g_evt_udn_info[ckt->evt->info.node_table[i]->udn_index]->compare(a->rhsold[i].nv, b->rhsold[i].nv, &eq);
+        if (!eq)
+            n++;
+    }
+    return n;
+}
+
+/* Largest |a-b| over the analog state values of two snapshots, relative to max(|a|,|b|,floor) (diagnostic only). */
+double
+XSsnapAnalogDiff(const XSsnap *a, const XSsnap *b)
+{
+    int k;
+    double m = 0.0;
+    if (!a || !b || !a->n_an || a->n_an != b->n_an)
+        return 0.0;
+    for (k = 0; k < a->n_an; k++) {
+        double x = a->an_val[k], y = b->an_val[k];
+        double sc = fmax(fmax(fabs(x), fabs(y)), 1e-9);
+        double d = fabs(x - y) / sc;
+        if (d > m)
+            m = d;
+    }
+    return m;
 }
