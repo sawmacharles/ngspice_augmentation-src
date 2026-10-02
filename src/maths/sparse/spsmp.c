@@ -637,3 +637,27 @@ SMPmultiply(SMPmatrix *Matrix, double *RHS, double *Solution, double *iRHS, doub
 {
     spMultiply(Matrix->SPmatrix, RHS, Solution, iRHS, iSolution);
 }
+
+/* card #542 */
+int
+SMPnumElements(SMPmatrix *Matrix)
+{
+    return spNumElements(Matrix->SPmatrix);
+}
+
+int
+SMPcopyElements(SMPmatrix *Matrix, int *ri, int *ci, double *val)
+{
+    return spCopyElements(Matrix->SPmatrix, ri, ci, val);
+}
+
+/* card #542: inverse of SMPcopyElements: clear the matrix and set the listed elements (external numbering) */
+int
+SMPsetElements(SMPmatrix *Matrix, int n, const int *ri, const int *ci, const double *val)
+{
+    int i;
+    spClear(Matrix->SPmatrix);
+    for (i = 0; i < n; i++)
+        *spGetElement(Matrix->SPmatrix, ri[i], ci[i]) = val[i];
+    return spError(Matrix->SPmatrix);
+}

@@ -291,6 +291,8 @@ extern  void     spConstMult(MatrixPtr, double);
 
 extern  void     spDeterminant ( MatrixPtr, int*, spREAL*, spREAL* );
 extern  int      spFileVector( MatrixPtr, char * , spREAL*, spREAL*);
+extern  int      spNumElements( MatrixPtr );
+extern  int      spCopyElements( MatrixPtr, int*, int*, double* );
 extern  void     spMultiply( MatrixPtr, spREAL*, spREAL*, spREAL*, spREAL* );
 extern  void     spMultTransposed(MatrixPtr,spREAL*,spREAL*,spREAL*,spREAL*);
 extern  void     spSolve( MatrixPtr, spREAL*, spREAL*, spREAL*, spREAL* );

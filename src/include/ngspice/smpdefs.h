@@ -97,6 +97,9 @@ int SMPcAddCol(SMPmatrix *Matrix, int Accum_Col, int Addend_Col);
 int SMPzeroRow(SMPmatrix *Matrix, int Row);
 void SMPconstMult(SMPmatrix *, double);
 void SMPmultiply(SMPmatrix *, double *, double *, double *, double *);
+int SMPnumElements(SMPmatrix *);                         /* card #542 */
+int SMPcopyElements(SMPmatrix *, int *, int *, double *); /* card #542: (ext row, ext col, value), unfactored real matrix */
+int SMPsetElements(SMPmatrix *, int, const int *, const int *, const double *); /* card #542: clear + set the listed elements */
 
 #ifdef CIDER
 void SMPcSolveForCIDER (SMPmatrix *, double [], double [], double [], double []) ;

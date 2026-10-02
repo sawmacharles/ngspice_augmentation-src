@@ -210,9 +210,29 @@ typedef struct {
 } PACstateRef;
 
 typedef struct {
-    int n;
+    int n;               /* native reduced states (x0 / fT layout, same as pssshoot.c) */
     PACstateRef *refs;
+    /* card #542: GENERIC (charge-based) state set. When the circuit has device-model
+     * charge storage (MOS/BSIM/diode/BJT/... or mutual inductors) the Phi/xi/z state
+     * vector is the set of matrix rows (node voltages / branch currents) that appear
+     * as a COLUMN of the charge matrix C = dq/dx anywhere on the orbit (found by
+     * pac_generic_prepare()'s prepass); n above stays the native count only (it still
+     * sizes x0 and sets the recording runs' initial conditions). */
+    int generic;
+    int ns;
+    int *srows;          /* [ns] ascending 1-based rows */
 } PACstateMap;
+
+#define PAC_NST(map) ((map)->generic ? (map)->ns : (map)->n)
+
+static void
+pac_map_free(PACstateMap *map)
+{
+    if (map->refs) tfree(map->refs);
+    if (map->srows) tfree(map->srows);
+    map->refs = NULL; map->srows = NULL;
+    map->generic = 0; map->ns = 0;
+}
 
 static int
 pac_build_map(CKTcircuit *ckt, PACstateMap *map)
@@ -234,6 +254,7 @@ pac_build_map(CKTcircuit *ckt, PACstateMap *map)
 
     map->n = n;
     map->refs = NULL;
+    map->generic = 0; map->ns = 0; map->srows = NULL;
     if (n == 0)
         return OK;
     map->refs = TMALLOC(PACstateRef, n);
@@ -274,6 +295,13 @@ static int
 pac_state_row(const PACstateRef *ref)
 {
     return ref->isCap ? ref->dev.cap->CAPposNode : ref->dev.ind->INDbrEq;
+}
+
+/* row of state d in the Phi/xi/z state vector (card #542: generic maps list rows directly) */
+static int
+pac_map_row(const PACstateMap *map, int d)
+{
+    return map->generic ? map->srows[d] : pac_state_row(&map->refs[d]);
 }
 
 /* card #489 SECOND pass (plan T6.2, task 5): resolve a `trigger=` node
@@ -360,6 +388,18 @@ pac_find_trig_idx(const PACstateMap *map, int trig_node_num)
  * reruns) while pacpoints= independently asks for the fine grid task 2's
  * demodulation accuracy needs -- see the card #465 report for the
  * measured before/after on pac_lti.cir. */
+/* card #542: periodic-continuation start state of every recording run of the GENERIC path: the node/branch
+ * vector at the END of the prepass period. DCtran's UIC start takes ckt->CKTrhs as the initial solution (NIiter
+ * SWAPs it into CKTrhsOld) and the INITJCT load that follows initialises every device's charge history from the
+ * DEVICE-level initial conditions (MOS icVDS/icVGS/icVBS, diode icVD, BJT icVBE/icVCE, ... derived by CKTic()
+ * once, at job start, from zero node ICs). Left alone, nodes carried only by model charges start every recorded
+ * period far from their periodic value: the base trajectory then has a startup transient the orbit does not
+ * have (refs/README.md R7: "first ~15 ns of the orbit wrong") and the linearisation along it is off by about
+ * (startup duration)/T (measured: MOS1 amplifier DC gain 2.7e-4, with the device ics re-derived 6e-8).
+ * pac_run_period() therefore restores this vector and re-derives the device ics before each run. */
+static double *g_pac_xinit = NULL;
+static int g_pac_xinit_n = 0;
+
 static int
 pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
 {
@@ -409,6 +449,23 @@ pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
     ckt->CKTtime      = 0.0;
     ckt->CKTmode     |= MODEUIC;
 
+    if (g_pac_xinit && g_pac_xinit_n == SMPmatSize(ckt->CKTmatrix) + 1) {
+        int di;
+        memcpy(ckt->CKTrhs, g_pac_xinit, (size_t) g_pac_xinit_n * sizeof(double));
+        /* device-level initial conditions (MOS icVDS/icVGS/icVBS, diode icVD, BJT icVBE/icVCE, ...) are what the
+         * UIC start's INITJCT load uses for the history of every model charge; CKTic() derived them from the
+         * (zero) node ICs once at job start. Re-derive them from the periodic state (devices whose ic the
+         * deck gave explicitly keep it). Native C/L ICs are set by pac_state_set_ic() from the PSS orbit. */
+        for (di = 0; di < DEVmaxnum; di++) {
+            const char *dn;
+            if (!DEVices[di] || !DEVices[di]->DEVsetic || !ckt->CKThead[di])
+                continue;
+            dn = DEVices[di]->DEVpublic.name;
+            if (dn && (!strcmp(dn, "Capacitor") || !strcmp(dn, "Inductor")))
+                continue;
+            DEVices[di]->DEVsetic(ckt->CKThead[di], ckt);
+        }
+    }
     PSSeventLocateActive = PSSswLagActive = PSSshootLagEnabled();
     err = DCtran(ckt, 1);
     PSSeventLocateActive = PSSswLagActive = 0;
@@ -445,6 +502,49 @@ static PACc *g_pac_demod = NULL;                         /* [neq*M], sideband-0 
 static double g_pac_T = 0.0;                              /* period, for the 1/T normalisation */
 static double *g_pac_rhs_re = NULL, *g_pac_rhs_im = NULL, *g_pac_scratch = NULL; /* [neq+1] */
 static int g_pac_exact_jac = 0;   /* card #465 THIRD pass, task 1: see pac_refactor_at_accepted() */
+
+/* ------------------------------------------------------------------ */
+/* card #542: GENERIC CHARGE-BASED HISTORY.
+ *
+ * The linearised transient recursion is, for EVERY charge state (native C/L
+ * AND device-model charges: MOS/BSIM4 intrinsic+overlap+junction, diode cj/tt,
+ * BJT, JFET, mutual inductance, ...),
+ *
+ *     (G_k + ag0 C_k) y_k = b_k + ag0 Q_{k-1} + a1 T_{k-1}
+ *     Q_k = C_k y_k            (dq, a full row vector: row r holds dq entering KCL row r)
+ *     T_k = ag0 (Q_k - Q_{k-1}) - a1 T_{k-1}      (d qdot; a1 = ag1 for order 2, 0 for order 1)
+ *
+ * with J_k = G_k + ag0 C_k the loaded Jacobian and C_k = dq/dx the charge matrix of
+ * the SAME load.  C_k is obtained generically, with no per-device code: every
+ * charge-conserving device stamps its capacitive part through NIintegrate as
+ * geq = ag0*cap, so the loaded matrix is exactly affine in ag0, and
+ * C_k = (J(ag0) - J(ag0/2)) / (ag0/2) entry by entry.  A third load at 2*ag0
+ * checks the affinity (device loads that are not affine in ag0, e.g. NQS models,
+ * are REFUSED naming the device type).  The legacy native-only history (cap and
+ * ind instances only: Cprev/Tprev per reduced state) is kept for circuits without
+ * model charges (bit-identical to before) and under PAC_NATIVE_HISTORY=1 (red proof).
+ * The state vector of Phi/xi/z is the set of rows that are a column of some C_k
+ * (pac_generic_prepare()). */
+typedef struct { int n, cap; int *ri, *ci; double *v; } PACtrip;
+
+static int g_pac_gen = 0;                        /* generic recursion active for this pass */
+static PACc *g_pac_Qprev = NULL, *g_pac_Qnew = NULL;   /* [(neq+1)*M] */
+static PACtrip g_pac_C = { 0, 0, NULL, NULL, NULL };   /* C_k of the current step */
+static PACtrip g_pac_J1 = { 0, 0, NULL, NULL, NULL }, g_pac_J2 = { 0, 0, NULL, NULL, NULL },
+               g_pac_J3 = { 0, 0, NULL, NULL, NULL };
+static int g_pac_gen_warm = 0;                   /* pre-iterate loads to settle device limiting state (backward sweeps) */
+static int g_pac_gen_check = 0;                  /* do the third-ag0 affinity check this pass */
+static int g_pac_gen_bad = 0;                    /* nonaffine load seen */
+static char g_pac_gen_badname[96] = "";
+/* prepass (state-set discovery) */
+static int g_pp_active = 0, g_pp_neq = 0, g_pp_steps = 0;
+static unsigned char *g_pp_col = NULL;           /* [neq+1] 1 = column of some C_k */
+static double g_pp_cmax = 0.0;
+static void pac_gen_identify_bad(CKTcircuit *ckt, double ag0);
+static double *g_pp_xend = NULL;
+
+
+
 /* card #504: the true-adjoint engine's OWN forward Phi/G passes need the
  * SAME per-step J_k convention its backward sweep rebuilds (J_k at the
  * TRUE accepted x_k, not the legacy default's stale x_{k-1} -- see
@@ -500,7 +600,16 @@ typedef struct {
     double t, h, ag0, ag1;
     int order;
     double *x;   /* [neq+1], 1-based, OWNED (malloc'd) copy of ckt->CKTrhs */
+    /* card #542 (generic history only): the EXACT J_k (every stored matrix element) and charge
+     * matrix C_k of the forward pass, kept so the backward sweep transposes precisely the matrices the
+     * forward recursion used. Reloading them from the devices in reverse order is not exact for
+     * devices whose load reads CKTstate1 (MOS1 Meyer capacitance averaging uses the previous step's
+     * value) or limiting state. */
+    int nJ, nC;
+    int *Jri, *Jci; double *Jv;
+    int *Cri, *Cci; double *Cv;
 } PACtrajStep;
+static double g_pac_traj_bytes = 0.0;
 
 static int g_pac_traj_active = 0;     /* PSSpacRecordStep() appends when set */
 static PACtrajStep *g_pac_traj = NULL;
@@ -513,8 +622,15 @@ pac_traj_free(void)
 {
     int i;
     if (g_pac_traj) {
-        for (i = 0; i < g_pac_traj_n; i++)
+        for (i = 0; i < g_pac_traj_n; i++) {
             if (g_pac_traj[i].x) tfree(g_pac_traj[i].x);
+            if (g_pac_traj[i].Jri) tfree(g_pac_traj[i].Jri);
+            if (g_pac_traj[i].Jci) tfree(g_pac_traj[i].Jci);
+            if (g_pac_traj[i].Jv) tfree(g_pac_traj[i].Jv);
+            if (g_pac_traj[i].Cri) tfree(g_pac_traj[i].Cri);
+            if (g_pac_traj[i].Cci) tfree(g_pac_traj[i].Cci);
+            if (g_pac_traj[i].Cv) tfree(g_pac_traj[i].Cv);
+        }
         tfree(g_pac_traj);
     }
     g_pac_traj = NULL;
@@ -522,6 +638,7 @@ pac_traj_free(void)
     g_pac_traj_neq = 0;
     g_pac_traj_active = 0;
     g_pac_traj_failed = 0;
+    g_pac_traj_bytes = 0.0;
 }
 
 static void
@@ -558,6 +675,11 @@ pac_traj_append(CKTcircuit *ckt, double t, double h, double ag0, double ag1, int
     g_pac_traj[g_pac_traj_n].ag1 = ag1;
     g_pac_traj[g_pac_traj_n].order = order;
     g_pac_traj[g_pac_traj_n].x = xcopy;
+    g_pac_traj[g_pac_traj_n].nJ = g_pac_traj[g_pac_traj_n].nC = 0;
+    g_pac_traj[g_pac_traj_n].Jri = g_pac_traj[g_pac_traj_n].Jci = NULL;
+    g_pac_traj[g_pac_traj_n].Jv = NULL;
+    g_pac_traj[g_pac_traj_n].Cri = g_pac_traj[g_pac_traj_n].Cci = NULL;
+    g_pac_traj[g_pac_traj_n].Cv = NULL;
     g_pac_traj_n++;
 }
 
@@ -588,6 +710,10 @@ pac_free(void)
     if (g_pac_rhs_im) tfree(g_pac_rhs_im);
     if (g_pac_scratch) tfree(g_pac_scratch);
     if (g_pac_first_y) tfree(g_pac_first_y);
+    if (g_pac_Qprev) tfree(g_pac_Qprev);
+    if (g_pac_Qnew) tfree(g_pac_Qnew);
+    g_pac_Qprev = g_pac_Qnew = NULL;
+    g_pac_gen = 0;
     g_pac_Cprev = g_pac_Cnew = NULL;
     g_pac_Tprev = g_pac_Tnew = NULL;
     g_pac_omega = NULL; g_pac_useforce = NULL; g_pac_demod = NULL;
@@ -613,7 +739,7 @@ static int
 pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const double *bi,
           const double *omega, const int *useforce, const PACc *ic0, int demod_active, double T)
 {
-    int n = map->n, neq, d, m;
+    int n = PAC_NST(map), neq, d, m;
 
     pac_free();
 
@@ -628,8 +754,20 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
 
     g_pac_Cprev = TMALLOC(PACc, (size_t) (neq + 1) * M);
     g_pac_Cnew  = TMALLOC(PACc, (size_t) (neq + 1) * M);
-    g_pac_Tprev = TMALLOC(PACc, (size_t) n * M);
-    g_pac_Tnew  = TMALLOC(PACc, (size_t) n * M);
+    g_pac_gen = map->generic;
+    {
+        size_t tsz = g_pac_gen ? (size_t) (neq + 1) : (size_t) n;
+        g_pac_Tprev = TMALLOC(PACc, tsz * M);
+        g_pac_Tnew  = TMALLOC(PACc, tsz * M);
+        if (g_pac_gen) {
+            g_pac_Qprev = TMALLOC(PACc, (size_t) (neq + 1) * M);
+            g_pac_Qnew  = TMALLOC(PACc, (size_t) (neq + 1) * M);
+            if (g_pac_Qprev) memset(g_pac_Qprev, 0, (size_t) (neq + 1) * M * sizeof(PACc));
+            if (g_pac_Qnew)  memset(g_pac_Qnew, 0, (size_t) (neq + 1) * M * sizeof(PACc));
+            if (g_pac_Tprev) memset(g_pac_Tprev, 0, tsz * M * sizeof(PACc));
+            if (g_pac_Tnew)  memset(g_pac_Tnew, 0, tsz * M * sizeof(PACc));
+        }
+    }
     g_pac_omega = TMALLOC(double, M);
     g_pac_useforce = TMALLOC(int, M);
     g_pac_rhs_re = TMALLOC(double, (size_t) (neq + 1));
@@ -642,6 +780,10 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
         g_pac_first_y = TMALLOC(PACc, (size_t) (neq + 1) * M);
     }
 
+    if (g_pac_gen && (!g_pac_Qprev || !g_pac_Qnew)) {
+        pac_free();
+        return 1;
+    }
     if (!g_pac_Cprev || !g_pac_Cnew || !g_pac_Tprev || !g_pac_Tnew || !g_pac_omega ||
         !g_pac_useforce || !g_pac_rhs_re || !g_pac_rhs_im || !g_pac_scratch ||
         (demod_active && (!g_pac_demod || !g_pac_first_y))) {
@@ -650,7 +792,7 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
     }
 
     memset(g_pac_Cprev, 0, (size_t) (neq + 1) * M * sizeof(PACc));
-    memset(g_pac_Tprev, 0, (size_t) n * M * sizeof(PACc));
+    memset(g_pac_Tprev, 0, (size_t) (g_pac_gen ? (neq + 1) : n) * M * sizeof(PACc));
     if (demod_active) {
         memset(g_pac_demod, 0, (size_t) neq * M * sizeof(PACc));
         memset(g_pac_first_y, 0, (size_t) (neq + 1) * M * sizeof(PACc));
@@ -662,11 +804,12 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
         g_pac_useforce[m] = useforce[m];
     }
     for (d = 0; d < n; d++) {
-        int row = pac_state_row(&map->refs[d]);
+        int row = pac_map_row(map, d);
         for (m = 0; m < M; m++)
             pac_set(g_pac_Cprev, row, M, m, ic0[(size_t) d * M + m]);
     }
     g_pac_exact_jac = getenv("PAC_EXACT_JACOBIAN") != NULL;
+    g_pac_gen_bad = 0;
     g_pac_failed = 0;
     PSSsaltReset();   /* card #494 third pass: fresh run -- filter the first step's event */
     return 0;
@@ -772,6 +915,368 @@ pac_refactor_at_accepted(CKTcircuit *ckt)
     return err ? 1 : 0;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* card #542: generic charge matrix extraction and the generic recursion
+ * (see the design note by g_pac_gen above). */
+
+static int
+pac_trip_fit(PACtrip *t, int n)
+{
+    if (n > t->cap) {
+        int c = n + n / 4 + 64;
+        if (t->ri) tfree(t->ri);
+        if (t->ci) tfree(t->ci);
+        if (t->v) tfree(t->v);
+        t->ri = TMALLOC(int, c);
+        t->ci = TMALLOC(int, c);
+        t->v = TMALLOC(double, c);
+        t->cap = c;
+        if (!t->ri || !t->ci || !t->v) { t->cap = 0; t->n = 0; return 1; }
+    }
+    t->n = 0;
+    return 0;
+}
+
+static void
+pac_trip_free(PACtrip *t)
+{
+    if (t->ri) tfree(t->ri);
+    if (t->ci) tfree(t->ci);
+    if (t->v) tfree(t->v);
+    t->ri = t->ci = NULL; t->v = NULL; t->n = t->cap = 0;
+}
+
+/* One load of the Jacobian with CKTag[0]=a, copied to t (every stored element). */
+static int
+pac_jload(CKTcircuit *ckt, double a, PACtrip *t)
+{
+    double sag0 = ckt->CKTag[0];
+    int err, nnz;
+
+    ckt->CKTag[0] = a;
+    err = CKTload(ckt);
+    ckt->CKTag[0] = sag0;
+    if (err)
+        return 1;
+    nnz = SMPnumElements(ckt->CKTmatrix);
+    if (pac_trip_fit(t, nnz))
+        return 1;
+    t->n = SMPcopyElements(ckt->CKTmatrix, t->ri, t->ci, t->v);
+    return 0;
+}
+
+/* Affinity test of one set of three loads (ag0/2, ag0, 2*ag0): J3 = 3 J1 - 2 J2. */
+static int
+pac_affine_ok(const PACtrip *J1, const PACtrip *J2, const PACtrip *J3, const char *tname)
+{
+    int i;
+    /* test hook (red proof of the honesty guard): PAC_GEN_TEST_NONAFFINE=<device type name> makes that
+     * type's load look non-affine in ag0 (the whole-circuit check fails if any is set) */
+    {
+        const char *tn = getenv("PAC_GEN_TEST_NONAFFINE");
+        if (tn && (tname == NULL || !strcmp(tn, tname)))
+            return 0;
+    }
+    if (J1->n != J2->n || J1->n != J3->n)
+        return 0;
+    for (i = 0; i < J1->n; i++) {
+        double a = J1->v[i], b = J2->v[i], c = J3->v[i];
+        double pred = 3.0 * a - 2.0 * b;
+        double scale = fabs(a) + fabs(b) + fabs(c);
+        if (fabs(c - pred) > 1e-7 * scale)
+            return 0;
+    }
+    return 1;
+}
+
+/* A load that is not affine in ag0 was seen at ag0: find the device TYPE whose own load is the
+ * culprit (loads each type alone into a cleared matrix).  Caller has saved ckt state. */
+static void
+pac_gen_identify_bad(CKTcircuit *ckt, double ag0)
+{
+    int i, neq = SMPmatSize(ckt->CKTmatrix), r;
+    PACtrip A = { 0, 0, NULL, NULL, NULL }, B = A, C3 = A;
+
+    g_pac_gen_badname[0] = '\0';
+    for (i = 0; i < DEVmaxnum && !g_pac_gen_badname[0]; i++) {
+        PACtrip *tt[3]; double ag[3]; int k, err = 0;
+        if (!DEVices[i] || !DEVices[i]->DEVload || !ckt->CKThead[i])
+            continue;
+        tt[0] = &B; tt[1] = &A; tt[2] = &C3;
+        ag[0] = 0.5 * ag0; ag[1] = ag0; ag[2] = 2.0 * ag0;
+        for (k = 0; k < 3 && !err; k++) {
+            double sag0 = ckt->CKTag[0];
+            int nnz;
+            SMPclear(ckt->CKTmatrix);
+            for (r = 0; r <= neq; r++) ckt->CKTrhs[r] = 0.0;
+            ckt->CKTag[0] = ag[k];
+            err = DEVices[i]->DEVload(ckt->CKThead[i], ckt);
+            ckt->CKTag[0] = sag0;
+            if (err) break;
+            nnz = SMPnumElements(ckt->CKTmatrix);
+            if (pac_trip_fit(tt[k], nnz)) { err = 1; break; }
+            tt[k]->n = SMPcopyElements(ckt->CKTmatrix, tt[k]->ri, tt[k]->ci, tt[k]->v);
+        }
+        if (!err && !pac_affine_ok(&A, &B, &C3, DEVices[i]->DEVpublic.name ? DEVices[i]->DEVpublic.name : "?"))
+            snprintf(g_pac_gen_badname, sizeof g_pac_gen_badname, "%s",
+                     DEVices[i]->DEVpublic.name ? DEVices[i]->DEVpublic.name : "?");
+    }
+    pac_trip_free(&A); pac_trip_free(&B); pac_trip_free(&C3);
+    if (!g_pac_gen_badname[0])
+        snprintf(g_pac_gen_badname, sizeof g_pac_gen_badname, "(not isolated to one device type)");
+}
+
+/* Load J(ag0) and C = dq/dx at the TRUE accepted point x_k = CKTrhs.  Leaves ckt->CKTmatrix holding
+ * the factored J_k (if do_factor) -- exactly pac_refactor_at_accepted()'s contract -- and the
+ * charge matrix in g_pac_C.  Everything the loads touch (CKTrhs, CKTrhsOld, CKTstate0, noncon,
+ * mode, bypass) is saved and restored.  Returns 1 on a hard failure; a non-affine load sets
+ * g_pac_gen_bad (+ g_pac_gen_badname). */
+static int
+pac_gen_loads(CKTcircuit *ckt, double a1, int check, int do_factor)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix), nstates = ckt->CKTnumStates, i, err = 0, n;
+    double *save_rhs, *save_rhsold, *save_state0 = NULL;
+    long save_mode = ckt->CKTmode;
+    int save_noncon = ckt->CKTnoncon, save_bypass = ckt->CKTbypass;
+    PACtrip *C = &g_pac_C;
+    double d12 = 0.5 * a1;
+
+    save_rhs = TMALLOC(double, neq + 1);
+    save_rhsold = TMALLOC(double, neq + 1);
+    if (nstates > 0)
+        save_state0 = TMALLOC(double, nstates);
+    if (!save_rhs || !save_rhsold || (nstates > 0 && !save_state0)) {
+        if (save_rhs) tfree(save_rhs);
+        if (save_rhsold) tfree(save_rhsold);
+        if (save_state0) tfree(save_state0);
+        return 1;
+    }
+    memcpy(save_rhs, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+    if (nstates > 0)
+        memcpy(save_state0, ckt->CKTstate0, (size_t) nstates * sizeof(double));
+
+    memcpy(ckt->CKTrhsOld, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
+    ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODETRAN | MODEINITFLOAT;
+    ckt->CKTbypass = 0;
+
+    ckt->CKTnoncon = 0;
+    if (g_pac_gen_warm) {
+        /* backward sweep: CKTstate0 is stale (end of the recorded period). Device limiting reads it, so
+         * iterate the load at fixed x_k until no device limits: state0 then equals the operating point
+         * at x_k. (Forward, state0 IS the converged iterate and this is skipped.) */
+        int it;
+        for (it = 0; it < 80 && !err; it++) {
+            ckt->CKTnoncon = 0;
+            if (CKTload(ckt)) { err = 1; break; }
+            if (!ckt->CKTnoncon) break;
+        }
+        ckt->CKTnoncon = 0;
+    }
+    if (!err)
+        err = pac_jload(ckt, 0.5 * a1, &g_pac_J2);
+    if (!err && ckt->CKTnoncon) {
+        /* device limiting / convergence checks read CKTstate0 (the previous iterate's operating
+         * point). Forward, state0 is the converged iterate and this never triggers; in the backward
+         * sweep state0 is stale, so iterate the load at fixed x_k until no device limits (state0
+         * then equals the operating point at x_k) -- otherwise the loaded G and C would be those of a
+         * LIMITED (wrong) bias. */
+        int it;
+        for (it = 0; it < 60; it++) {
+            ckt->CKTnoncon = 0;
+            if (CKTload(ckt)) { err = 1; break; }
+            if (!ckt->CKTnoncon) break;
+        }
+        if (!err)
+            err = pac_jload(ckt, 0.5 * a1, &g_pac_J2);
+    }
+    if (!err && check)
+        err = pac_jload(ckt, 2.0 * a1, &g_pac_J3);
+    if (!err)
+        err = pac_jload(ckt, a1, &g_pac_J1);       /* last: the matrix now holds J_k */
+    if (!err) {
+        if (g_pac_J1.n != g_pac_J2.n || (check && g_pac_J1.n != g_pac_J3.n)) {
+            err = 1;
+        } else {
+            n = g_pac_J1.n;
+            if (pac_trip_fit(C, n)) {
+                err = 1;
+            } else {
+                for (i = 0; i < n; i++) {
+                    double a = g_pac_J1.v[i], b = g_pac_J2.v[i], diff = a - b;
+                    if (g_pac_J1.ri[i] != g_pac_J2.ri[i] || g_pac_J1.ci[i] != g_pac_J2.ci[i]) { err = 1; break; }
+                    if (fabs(diff) <= 1e-14 * (fabs(a) + fabs(b)))
+                        continue;
+                    C->ri[C->n] = g_pac_J1.ri[i];
+                    C->ci[C->n] = g_pac_J1.ci[i];
+                    C->v[C->n] = diff / d12;
+                    C->n++;
+                }
+            }
+        }
+    }
+    if (!err && check && !pac_affine_ok(&g_pac_J1, &g_pac_J2, &g_pac_J3, NULL)) {
+        g_pac_gen_bad = 1;
+        pac_gen_identify_bad(ckt, a1);
+    }
+    if (!err && do_factor && !g_pac_gen_bad) {
+        /* the last pac_jload() was the J1 load, but pac_gen_identify_bad() (bad path only) clobbers */
+        err = SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin) ? 1 : 0;
+    }
+
+    ckt->CKTmode = save_mode;
+    ckt->CKTbypass = save_bypass;
+    ckt->CKTnoncon = save_noncon;
+    memcpy(ckt->CKTrhs, save_rhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+    if (nstates > 0)
+        memcpy(ckt->CKTstate0, save_state0, (size_t) nstates * sizeof(double));
+    tfree(save_rhs); tfree(save_rhsold);
+    if (save_state0) tfree(save_state0);
+    return err ? 1 : 0;
+}
+
+/* Q = C y for the M complex columns of y (both [(neq+1)*M], row-major by row). */
+static void
+pac_C_mul(const PACtrip *C, const PACc *y, PACc *Q, int neq, int M)
+{
+    int i, m;
+    memset(Q, 0, (size_t) (neq + 1) * M * sizeof(PACc));
+    for (i = 0; i < C->n; i++) {
+        int r = C->ri[i], c = C->ci[i];
+        double v = C->v[i];
+        if (r <= 0 || c <= 0) continue;
+        for (m = 0; m < M; m++) {
+            Q[(size_t) r * M + m].re += v * y[(size_t) c * M + m].re;
+            Q[(size_t) r * M + m].im += v * y[(size_t) c * M + m].im;
+        }
+    }
+}
+
+static void
+pac_gen_refuse_message(const char *who)
+{
+    fprintf(stderr, "%s: REFUSED -- the load of device type '%s' is not affine in the integration "
+            "coefficient ag0 (3-point check at ag0/2, ag0, 2*ag0), so its charge matrix C = dq/dx cannot be "
+            "separated from G generically. Not returning a curve that would silently omit that "
+            "device's charge history (card #542).\n", who, g_pac_gen_badname);
+}
+
+/* One accepted step of the generic recursion for all M columns. */
+static int
+pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new)
+{
+    int neq = g_pac_neq, M = g_pac_M, m, row;
+    double a1 = (order == 2) ? ag1 : 0.0;
+
+    if (pac_gen_loads(ckt, ag0, g_pac_gen_check, 1)) {
+        fprintf(stderr, "PAC-TD: generic charge extraction/refactor failed at t=%g; abandoning this pass.\n", t_new);
+        return 1;
+    }
+    if (g_pac_gen_bad) {
+        pac_gen_refuse_message("PAC-TD");
+        return 1;
+    }
+    if (first && getenv("PAC_GEN_TRACE"))
+        fprintf(stderr, "PAC-TD: generic recursion, first step: nnz(C)=%d nnz(J)=%d M=%d ag0=%g\n",
+                g_pac_C.n, g_pac_J1.n, M, ag0);
+    if (first)   /* Q_0 = C_1 y_0 (C_0 := C_1, see the design note), T_0 = 0 (first step is order 1) */
+        pac_C_mul(&g_pac_C, g_pac_Cprev, g_pac_Qprev, neq, M);
+
+    for (m = 0; m < M; m++) {
+        memset(g_pac_rhs_re, 0, (size_t) (neq + 1) * sizeof(double));
+        memset(g_pac_rhs_im, 0, (size_t) (neq + 1) * sizeof(double));
+        for (row = 1; row <= neq; row++) {
+            PACc Qp = g_pac_Qprev[(size_t) row * M + m];
+            PACc Tp = g_pac_Tprev[(size_t) row * M + m];
+            g_pac_rhs_re[row] = ag0 * Qp.re + a1 * Tp.re;
+            g_pac_rhs_im[row] = ag0 * Qp.im + a1 * Tp.im;
+        }
+        if (g_pac_useforce[m] && g_pac_br && g_pac_bi) {
+            double w = g_pac_omega[m];
+            double ph = w * t_new;
+            double c = cos(ph), s = sin(ph);
+            for (row = 1; row <= neq; row++) {
+                double br = g_pac_br[row], bi = g_pac_bi[row];
+                if (br == 0.0 && bi == 0.0) continue;
+                g_pac_rhs_re[row] += br * c - bi * s;
+                g_pac_rhs_im[row] += br * s + bi * c;
+            }
+        }
+        SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
+        SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
+        for (row = 1; row <= neq; row++) {
+            PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
+            pac_set(g_pac_Cnew, row, M, m, v);
+        }
+    }
+    pac_C_mul(&g_pac_C, g_pac_Cnew, g_pac_Qnew, neq, M);
+    for (row = 1; row <= neq; row++)
+        for (m = 0; m < M; m++) {
+            size_t ix = (size_t) row * M + m;
+            PACc Tn;
+            Tn.re = ag0 * (g_pac_Qnew[ix].re - g_pac_Qprev[ix].re) - a1 * g_pac_Tprev[ix].re;
+            Tn.im = ag0 * (g_pac_Qnew[ix].im - g_pac_Qprev[ix].im) - a1 * g_pac_Tprev[ix].im;
+            g_pac_Tnew[ix] = Tn;
+        }
+    { PACc *tmp = g_pac_Qprev; g_pac_Qprev = g_pac_Qnew; g_pac_Qnew = tmp; }
+    return 0;
+}
+
+/* card #542: keep this step's exact J and C (the forward pass just used them) with the trajectory entry
+ * that pac_traj_append() created for it. Refuses (sets g_pac_traj_failed) beyond PAC_TRAJ_MAX_MB. */
+static void
+pac_traj_attach_generic(void)
+{
+    PACtrajStep *st;
+    double bytes;
+    const char *mx = getenv("PAC_TRAJ_MAX_MB");
+    double cap = (mx && atof(mx) > 0.0) ? atof(mx) * 1048576.0 : 3.0e9;
+    if (g_pac_traj_failed || g_pac_traj_n < 1)
+        return;
+    st = &g_pac_traj[g_pac_traj_n - 1];
+    bytes = (double) g_pac_J1.n * 16.0 + (double) g_pac_C.n * 16.0;
+    if (g_pac_traj_bytes + bytes > cap) {
+        fprintf(stderr, "PAC-TD: adjoint/noise trajectory would exceed %.0f MB (J_k and C_k of every step are kept "
+                "for the exact transpose; set PAC_TRAJ_MAX_MB higher or use fewer pacpoints).\n", cap / 1048576.0);
+        g_pac_traj_failed = 1;
+        return;
+    }
+    st->nJ = g_pac_J1.n; st->nC = g_pac_C.n;
+    st->Jri = TMALLOC(int, st->nJ + 1); st->Jci = TMALLOC(int, st->nJ + 1); st->Jv = TMALLOC(double, st->nJ + 1);
+    st->Cri = TMALLOC(int, st->nC + 1); st->Cci = TMALLOC(int, st->nC + 1); st->Cv = TMALLOC(double, st->nC + 1);
+    if (!st->Jri || !st->Jci || !st->Jv || !st->Cri || !st->Cci || !st->Cv) { g_pac_traj_failed = 1; return; }
+    memcpy(st->Jri, g_pac_J1.ri, (size_t) st->nJ * sizeof(int));
+    memcpy(st->Jci, g_pac_J1.ci, (size_t) st->nJ * sizeof(int));
+    memcpy(st->Jv, g_pac_J1.v, (size_t) st->nJ * sizeof(double));
+    memcpy(st->Cri, g_pac_C.ri, (size_t) st->nC * sizeof(int));
+    memcpy(st->Cci, g_pac_C.ci, (size_t) st->nC * sizeof(int));
+    memcpy(st->Cv, g_pac_C.v, (size_t) st->nC * sizeof(double));
+    g_pac_traj_bytes += bytes;
+}
+
+/* prepass step: accumulate the set of columns of C (state-set discovery) and run the affinity check. */
+static void
+pac_prepass_step(CKTcircuit *ckt)
+{
+    int i;
+    if (ckt->CKTtime <= 0.0 || g_pac_gen_bad || !g_pp_col)
+        return;
+    if (pac_gen_loads(ckt, ckt->CKTag[0], 1, 0)) {
+        g_pac_gen_bad = -1;   /* hard failure */
+        return;
+    }
+    g_pp_steps++;
+    if (g_pp_xend)
+        memcpy(g_pp_xend, ckt->CKTrhs, (size_t) (g_pp_neq + 1) * sizeof(double));
+    for (i = 0; i < g_pac_C.n; i++) {
+        int c = g_pac_C.ci[i];
+        if (c > 0 && c <= g_pp_neq) g_pp_col[c] = 1;
+        if (fabs(g_pac_C.v[i]) > g_pp_cmax) g_pp_cmax = fabs(g_pac_C.v[i]);
+    }
+}
+
 void
 PSSpacRecordStep(CKTcircuit *ckt)
 {
@@ -779,6 +1284,10 @@ PSSpacRecordStep(CKTcircuit *ckt)
     double ag0, ag1, t_new, h;
     int is_first_call;
 
+    if (g_pp_active) {   /* card #542: state-set discovery prepass */
+        pac_prepass_step(ckt);
+        return;
+    }
     if (g_pac_failed || !g_pac_map)
         return;
     if (ckt->CKTtime <= 0.0)
@@ -840,7 +1349,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
      * pac_refactor_at_accepted()'s header for why this is needed and why
      * it is safe to do here (unlike pssshoot.c's Newton-loop-scoped
      * case). No-op unless PAC_EXACT_JACOBIAN is set. */
-    if (g_pac_exact_jac || g_pac_force_exact_jac) {
+    if (!g_pac_gen && (g_pac_exact_jac || g_pac_force_exact_jac)) {
         if (pac_refactor_at_accepted(ckt)) {
             fprintf(stderr, "PAC-TD: exact-Jacobian refactor failed at "
                     "t=%g; abandoning this pass.\n", ckt->CKTtime);
@@ -874,6 +1383,25 @@ PSSpacRecordStep(CKTcircuit *ckt)
     if (PSSsaltForceOrder1(ckt))
         order = 1;
 
+    if (g_pac_gen) {
+        /* card #542: generic charge-based recursion. Saltation (ideal-switch events) is built on the
+         * native capacitor/inductor state jump (Fang's formula uses dx across the control-node
+         * states); the model charges at an event would need their own jump (dq continuity through
+         * the switched topology), which is not derived here -> REFUSED, never silently dropped. */
+        if (n_salt > 0) {
+            fprintf(stderr, "PAC-TD: REFUSED -- an ideal-switch (saltation) event at t=%g in a circuit with "
+                    "device-model charge storage: the state jump at an event is only implemented for native "
+                    "capacitor/inductor states, not for model charges (card #542).\n", t_new);
+            g_pac_failed = 1;
+            return;
+        }
+        if (pac_step_generic(ckt, is_first_call, ag0, ag1, order, t_new)) {
+            g_pac_failed = 1;
+            return;
+        }
+        if (g_pac_traj_active)
+            pac_traj_attach_generic();
+    } else {
     for (m = 0; m < M; m++) {
         memset(g_pac_rhs_re, 0, (size_t) (neq + 1) * sizeof(double));
         memset(g_pac_rhs_im, 0, (size_t) (neq + 1) * sizeof(double));
@@ -964,9 +1492,10 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
     }
+    }   /* card #542: closes the legacy native branch */
     }   /* card #494: closes the salt_ev/n_salt scope opened above */
 
-    for (d = 0; d < n; d++) {
+    for (d = 0; d < (g_pac_gen ? 0 : n); d++) {
         PACstateRef *ref = &g_pac_map->refs[d];
         for (m = 0; m < M; m++) {
             PACc val;
@@ -1345,6 +1874,150 @@ pac_sweep_fill(int stepType, int np, double fstart, double fstop, double *freqs,
     }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* card #542: decide native vs generic history and, for generic, find the state set.
+ *
+ * Native-only circuits (every storage element is a C or L instance and nothing else carries
+ * charge) keep the legacy per-C/L recursion bit-for-bit.  Otherwise (any device type outside the
+ * memoryless/native list, e.g. MOS, BJT, diode, JFET; or a mutual inductor) the generic recursion
+ * is used.  PAC_FORCE_GENERIC=1 forces it on native circuits (cross-check), PAC_NATIVE_HISTORY=1
+ * forces the legacy history on any circuit (red proof: it reproduces the card #539 bug).
+ * Returns 0 (ok, map->generic set or not), or an SPICE error code to return (REFUSED). */
+static int
+pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
+{
+    static const char *const nocharge[] = { "Resistor", "Capacitor", "Inductor", "Vsource",
+        "Isource", "VCVS", "VCCS", "CCVS", "CCCS", "Switch", "CSwitch", "ASRC", NULL };
+    int i, k, has = 0;
+    *delay_dev = NULL;
+    for (i = 0; i < DEVmaxnum; i++) {
+        const char *nm;
+        int known = 0;
+        if (!DEVices[i] || !ckt->CKThead[i] || !DEVices[i]->DEVpublic.name)
+            continue;
+        nm = DEVices[i]->DEVpublic.name;
+        if (!strcmp(nm, "Tranline") || !strcmp(nm, "TransLine") || !strcmp(nm, "CplLines") ||
+            !strcmp(nm, "LTRA")) {
+            *delay_dev = nm;
+            return 1;
+        }
+        for (k = 0; nocharge[k]; k++)
+            if (!strcmp(nm, nocharge[k])) { known = 1; break; }
+        if (!known)
+            has = 1;
+    }
+    return has;
+}
+
+/* card #542: periodic-continuation start of the recording runs (see g_pac_xinit). */
+static void
+pac_init_free(void)
+{
+    if (g_pac_xinit) tfree(g_pac_xinit);
+    g_pac_xinit = NULL;
+    g_pac_xinit_n = 0;
+}
+
+static void
+pac_init_from_prepass(CKTcircuit *ckt)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix);
+    pac_init_free();
+    if (getenv("PAC_NO_IC_INJECT") || !g_pp_xend)
+        return;
+    g_pac_xinit = TMALLOC(double, neq + 1);
+    if (g_pac_xinit) {
+        memcpy(g_pac_xinit, g_pp_xend, (size_t) (neq + 1) * sizeof(double));
+        g_pac_xinit_n = neq + 1;
+    }
+}
+
+static int
+pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, double T,
+                    int trig_node_num, const char *who)
+{
+    const char *delay = NULL;
+    int has, err, neq, i, ns, npass;
+    static int warned_native = 0;
+
+    if (getenv("PAC_NATIVE_HISTORY")) {
+        if (!warned_native) {
+            fprintf(stderr, "%s: PAC_NATIVE_HISTORY set -- using the LEGACY native C/L-only history "
+                    "(device-model charges ignored: wrong on MOS/BJT/diode circuits, card #539 red proof)\n", who);
+            warned_native = 1;
+        }
+        return 0;
+    }
+    has = pac_circuit_has_model_charges(ckt, &delay);
+    if (delay) {
+        fprintf(stderr, "%s: REFUSED -- device type '%s' carries delay history that is not a charge state; "
+                "td small-signal analysis of it is not implemented (card #542).\n", who, delay);
+        return E_UNSUPP;
+    }
+    if (!has && !getenv("PAC_FORCE_GENERIC"))
+        return 0;
+    if (trig_node_num >= 0) {
+        fprintf(stderr, "%s: REFUSED -- free-running (trigger=) orbits with device-model charge storage are "
+                "not supported: the period-variation projection needs f(T) at every charge state "
+                "(card #542).\n", who);
+        return E_UNSUPP;
+    }
+    neq = SMPmatSize(ckt->CKTmatrix);
+    g_pp_col = TMALLOC(unsigned char, neq + 1);
+    if (!g_pp_col) return E_NOMEM;
+    if (g_pp_xend) tfree(g_pp_xend);
+    g_pp_xend = TMALLOC(double, neq + 1);
+    if (!g_pp_xend) { tfree(g_pp_col); g_pp_col = NULL; return E_NOMEM; }
+    g_pp_neq = neq;
+    /* two prepass periods: the first from whatever state the PSS left, the second from the first one's
+     * end state (periodic continuation, see g_pac_xinit); the second one is what the recording passes
+     * reproduce, so its steps/columns define the state set. */
+    for (npass = 0; npass < 2; npass++) {
+        memset(g_pp_col, 0, (size_t) neq + 1);
+        memset(g_pp_xend, 0, (size_t) (neq + 1) * sizeof(double));
+        g_pp_steps = 0; g_pp_cmax = 0.0;
+        g_pac_gen_bad = 0; g_pac_gen_badname[0] = '\0';
+        pac_state_set_ic(map, x0);
+        g_pp_active = 1;
+        PSSpacActive = 1;
+        err = pac_run_period(ckt, job, T, "TD-shoot charge-state prepass (card #542)");
+        PSSpacActive = 0;
+        g_pp_active = 0;
+        if (g_pac_gen_bad > 0 || err || g_pac_gen_bad < 0 || g_pp_steps < 1)
+            break;
+        pac_init_from_prepass(ckt);
+    }
+    if (g_pac_gen_bad > 0) {
+        pac_gen_refuse_message(who);
+        tfree(g_pp_col); g_pp_col = NULL;
+        tfree(g_pp_xend); g_pp_xend = NULL;
+        pac_init_free();
+        return E_UNSUPP;
+    }
+    if (err || g_pac_gen_bad < 0 || g_pp_steps < 1) {
+        fprintf(stderr, "%s: charge-state prepass failed (err=%d steps=%d)\n", who, err, g_pp_steps);
+        tfree(g_pp_col); g_pp_col = NULL;
+        tfree(g_pp_xend); g_pp_xend = NULL;
+        pac_init_free();
+        return E_INTERN;
+    }
+    ns = 0;
+    for (i = 1; i <= neq; i++) if (g_pp_col[i]) ns++;
+    map->srows = TMALLOC(int, ns > 0 ? ns : 1);
+    if (!map->srows) { tfree(g_pp_col); g_pp_col = NULL; return E_NOMEM; }
+    ns = 0;
+    for (i = 1; i <= neq; i++) if (g_pp_col[i]) map->srows[ns++] = i;
+    map->ns = ns;
+    map->generic = 1;
+    tfree(g_pp_col); g_pp_col = NULL;
+    tfree(g_pp_xend); g_pp_xend = NULL;
+    fprintf(stderr, "%s: generic charge-based history (card #542): %d native C/L + model-charge states -> "
+            "%d state rows (columns of dq/dx on the orbit, %d steps, affine-in-ag0 check passed, max|C|=%.3g)\n",
+            who, map->n, ns, g_pp_steps, g_pp_cmax);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Core engine: given ONE forcing pattern (br/bi, shared across the whole
  * sweep) and NFREQ frequencies, returns Phi (n*n, real part only -- see
@@ -1366,7 +2039,7 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
                                 order, -1 = no correction (driven case, or
                                 fT==NULL) */)
 {
-    int n = map->n, neq = SMPmatSize(ckt->CKTmatrix);
+    int n = PAC_NST(map), neq = SMPmatSize(ckt->CKTmatrix);
     int M1 = n + nfreq, f, d, j, err;
     double *omega1, *ic_zero_placeholder = NULL;
     int *useforce1;
@@ -1414,7 +2087,7 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
     if (err || g_pac_failed) { err = 1; goto cleanup; }
 
     for (d = 0; d < n; d++) {
-        int row_d = pac_state_row(&map->refs[d]);
+        int row_d = pac_map_row(map, d);
         for (j = 0; j < n; j++)
             Phi[(size_t) d * n + j] = pac_get(g_pac_Cprev, row_d, M1, j);
         for (f = 0; f < nfreq; f++)
@@ -1805,6 +2478,35 @@ pac_adj_refactor_at(CKTcircuit *ckt, const PACtrajStep *step)
     return SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin) ? 1 : 0;
 }
 
+/* card #542: generic-history analogue: x_k from the trajectory, exact J_k factored and the charge matrix
+ * C_k in g_pac_C (see pac_gen_loads). */
+static int
+pac_adj_refactor_generic(CKTcircuit *ckt, const PACtrajStep *step, int devparams)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix);
+    memcpy(ckt->CKTrhs, step->x, (size_t) (neq + 1) * sizeof(double));
+    ckt->CKTtime  = step->t;
+    ckt->CKTdelta = step->h;
+    ckt->CKTag[0] = step->ag0;
+    ckt->CKTag[1] = step->ag1;
+    if (devparams) {
+        /* the noise engine's DEVnoise() reads device instance quantities (gm, ...) from the last load:
+         * run one load at x_k (limiting-warmed); the matrix is then replaced by the stored J_k below. */
+        g_pac_gen_bad = 0;
+        g_pac_gen_warm = 1;
+        if (pac_gen_loads(ckt, step->ag0, 0, 0)) { g_pac_gen_warm = 0; return 1; }
+        g_pac_gen_warm = 0;
+    }
+    if (pac_trip_fit(&g_pac_C, step->nC)) return 1;
+    memcpy(g_pac_C.ri, step->Cri, (size_t) step->nC * sizeof(int));
+    memcpy(g_pac_C.ci, step->Cci, (size_t) step->nC * sizeof(int));
+    memcpy(g_pac_C.v, step->Cv, (size_t) step->nC * sizeof(double));
+    g_pac_C.n = step->nC;
+    if (SMPsetElements(ckt->CKTmatrix, step->nJ, step->Jri, step->Jci, step->Jv))
+        return 1;
+    return SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin) ? 1 : 0;
+}
+
 static int
 pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, double T,
                         const double *freqs, int nfreq, int outrow,
@@ -1812,7 +2514,7 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
                         PACc *Y0_out /* [nsrc_use * nfreq] */,
                         int trig_idx)
 {
-    int n = map->n, neq = SMPmatSize(ckt->CKTmatrix);
+    int n = PAC_NST(map), neq = SMPmatSize(ckt->CKTmatrix);
     int d, e, f, k, s, row, err;
     double *br_all = NULL, *bi_all = NULL;    /* [nsrc_use*(neq+1)] */
     PACc *Phi = NULL, *G = NULL, *Mw = NULL;
@@ -1884,9 +2586,10 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
         g_pac_traj_active = 0;   /* stop recording -- buffer itself kept */
 
         if (err || g_pac_failed || g_pac_traj_failed) {
+            int memrefuse = (!err && !g_pac_failed && g_pac_traj_failed && map->generic);
             tfree(omega1); tfree(useforce1); tfree(ic0_1);
             pac_free(); pac_traj_free();
-            err = PAC_ADJOINT_FAIL; goto done;
+            err = memrefuse ? PAC_ADJOINT_REFUSED : PAC_ADJOINT_FAIL; goto done;
         }
 
         /* saltation/free-running scope cut (see header) -- refuse
@@ -1904,7 +2607,7 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
             err = PAC_ADJOINT_FAIL; goto done;
         }
         for (d = 0; d < n; d++) {
-            int row_d = pac_state_row(&map->refs[d]);
+            int row_d = pac_map_row(map, d);
             for (e = 0; e < n; e++)
                 Phi[(size_t) d * n + e] = pac_get(g_pac_Cprev, row_d, n, e);
         }
@@ -2027,8 +2730,8 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
      * forward passes' own "one factorization per accepted step, many
      * columns" reuse). */
     Lambda = TMALLOC(PACc, (size_t) nfreq * (neq + 1));
-    abarS  = TMALLOC(PACc, (size_t) n * nfreq);
-    abarT  = TMALLOC(PACc, (size_t) n * nfreq);
+    abarS  = TMALLOC(PACc, (size_t) (map->generic ? neq + 1 : n) * nfreq);
+    abarT  = TMALLOC(PACc, (size_t) (map->generic ? neq + 1 : n) * nfreq);
     tdu_re = TMALLOC(double, (size_t) (neq + 1));
     tdu_im = TMALLOC(double, (size_t) (neq + 1));
     scratch = TMALLOC(double, (size_t) (neq + 1));
@@ -2038,8 +2741,8 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
         err = PAC_ADJOINT_FAIL; goto done;
     }
     memset(Lambda, 0, (size_t) nfreq * (neq + 1) * sizeof(PACc));
-    memset(abarS, 0, (size_t) n * nfreq * sizeof(PACc));
-    memset(abarT, 0, (size_t) n * nfreq * sizeof(PACc));
+    memset(abarS, 0, (size_t) (map->generic ? neq + 1 : n) * nfreq * sizeof(PACc));
+    memset(abarT, 0, (size_t) (map->generic ? neq + 1 : n) * nfreq * sizeof(PACc));
 
     memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
     save_time = ckt->CKTtime; save_delta = ckt->CKTdelta;
@@ -2052,13 +2755,13 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
         double h_next = is_last ? g_pac_traj[0].h : g_pac_traj[k + 1].h;
         double ag1eff = (step->order == 2) ? step->ag1 : 0.0;
 
-        if (pac_adj_refactor_at(ckt, step)) {
+        if (map->generic ? pac_adj_refactor_generic(ckt, step, 0) : pac_adj_refactor_at(ckt, step)) {
             fprintf(stderr, "PXF-TD-ADJ: refactor failed at t=%.9g (backward step %d)\n",
                     step->t, k);
             err = PAC_ADJOINT_FAIL; goto done;
         }
 
-        for (e = 0; e < n; e++) {
+        for (e = 0; !map->generic && e < n; e++) {
             const PACstateRef *ref = &map->refs[e];
             Cdiag[e] = ref->isCap ? step->ag0 * ref->dev.cap->CAPcapac
                                    : step->ag0 * ref->dev.ind->INDinduct;
@@ -2097,14 +2800,28 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
                  * itself never reads the negNode, so M(w)'s own scatter
                  * here must not either. */
                 for (e = 0; e < n; e++) {
-                    const PACstateRef *ref = &map->refs[e];
                     PACc Mv = Mw[(size_t) e * nfreq + f];
-                    int row = pac_state_row(ref);
+                    int row = pac_map_row(map, e);
                     if (row > 0) { tdu_re[row] += Mv.re; tdu_im[row] += Mv.im; }
                 }
             }
 
-            for (e = 0; e < n; e++) {
+            if (map->generic) {
+                /* card #542: z += C_k^T (alpha + ag0 beta) over every row (alpha/beta: adjoints of Q_k, T_k
+                 * from the later steps, see the generic recursion in the design note) */
+                int ti;
+                for (ti = 0; ti < g_pac_C.n; ti++) {
+                    int r = g_pac_C.ri[ti], c = g_pac_C.ci[ti];
+                    PACc al, be;
+                    double v = g_pac_C.v[ti];
+                    if (r <= 0 || c <= 0) continue;
+                    al = abarS[(size_t) r * nfreq + f];
+                    be = abarT[(size_t) r * nfreq + f];
+                    tdu_re[c] += v * (al.re + step->ag0 * be.re);
+                    tdu_im[c] += v * (al.im + step->ag0 * be.im);
+                }
+            }
+            for (e = 0; !map->generic && e < n; e++) {
                 const PACstateRef *ref = &map->refs[e];
                 PACc abT = abarT[(size_t) e * nfreq + f];
                 PACc abS_ext = abarS[(size_t) e * nfreq + f];
@@ -2131,7 +2848,16 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
                 Lambda[idx] = pc_add(Lambda[idx], contrib);
             }
 
-            for (e = 0; e < n; e++) {
+            if (map->generic) {
+                /* gamma = nu - beta_old; alpha_{k-1} = ag0 gamma; beta_{k-1} = a1 gamma */
+                for (row = 1; row <= neq; row++) {
+                    PACc be = abarT[(size_t) row * nfreq + f];
+                    PACc gm = { tdu_re[row] - be.re, tdu_im[row] - be.im };
+                    abarS[(size_t) row * nfreq + f] = pc_scale(gm, step->ag0);
+                    abarT[(size_t) row * nfreq + f] = pc_scale(gm, ag1eff);
+                }
+            }
+            for (e = 0; !map->generic && e < n; e++) {
                 const PACstateRef *ref = &map->refs[e];
                 PACc beta, gamma;
                 if (ref->isCap) {
@@ -2336,7 +3062,7 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
                               IFuid **gen_names_out /* OUT [ngen], malloc'd, NULL if !want_table/ngen==0 */,
                               int *ngen_out)
 {
-    int n = map->n, neq = SMPmatSize(ckt->CKTmatrix);
+    int n = PAC_NST(map), neq = SMPmatSize(ckt->CKTmatrix);
     int d, e, f, k, row, err;
     PACc *Phi = NULL, *G = NULL, *Mw = NULL;
     double *tdu_re = NULL, *tdu_im = NULL, *scratch = NULL;
@@ -2412,7 +3138,7 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
             return PAC_ADJOINT_FAIL;
         }
         for (d = 0; d < n; d++) {
-            int row_d = pac_state_row(&map->refs[d]);
+            int row_d = pac_map_row(map, d);
             for (e = 0; e < n; e++)
                 Phi[(size_t) d * n + e] = pac_get(g_pac_Cprev, row_d, n, e);
         }
@@ -2537,8 +3263,8 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
     /* ---- backward-sweep buffers (same sizes pac_engine_run_adjoint()
      * allocates for its own backward sweep). */
     Cdiag  = TMALLOC(double, n);
-    abarS  = TMALLOC(PACc, (size_t) n * nfreq);
-    abarT  = TMALLOC(PACc, (size_t) n * nfreq);
+    abarS  = TMALLOC(PACc, (size_t) (map->generic ? neq + 1 : n) * nfreq);
+    abarT  = TMALLOC(PACc, (size_t) (map->generic ? neq + 1 : n) * nfreq);
     tdu_re = TMALLOC(double, (size_t) (neq + 1));
     tdu_im = TMALLOC(double, (size_t) (neq + 1));
     scratch = TMALLOC(double, (size_t) (neq + 1));
@@ -2546,8 +3272,8 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
     if (!Cdiag || !abarS || !abarT || !tdu_re || !tdu_im || !scratch || !save_rhsold) {
         err = PAC_ADJOINT_FAIL; goto done;
     }
-    memset(abarS, 0, (size_t) n * nfreq * sizeof(PACc));
-    memset(abarT, 0, (size_t) n * nfreq * sizeof(PACc));
+    memset(abarS, 0, (size_t) (map->generic ? neq + 1 : n) * nfreq * sizeof(PACc));
+    memset(abarT, 0, (size_t) (map->generic ? neq + 1 : n) * nfreq * sizeof(PACc));
 
     memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
     save_time = ckt->CKTtime; save_delta = ckt->CKTdelta;
@@ -2596,13 +3322,13 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
         double h_next = is_last ? g_pac_traj[0].h : g_pac_traj[k + 1].h;
         double ag1eff = (step->order == 2) ? step->ag1 : 0.0;
 
-        if (pac_adj_refactor_at(ckt, step)) {
+        if (map->generic ? pac_adj_refactor_generic(ckt, step, 1) : pac_adj_refactor_at(ckt, step)) {
             fprintf(stderr, "PNOISE-TD: refactor failed at t=%.9g (backward step %d)\n",
                     step->t, k);
             err = PAC_ADJOINT_FAIL; goto done;
         }
 
-        for (e = 0; e < n; e++) {
+        for (e = 0; !map->generic && e < n; e++) {
             const PACstateRef *ref = &map->refs[e];
             Cdiag[e] = ref->isCap ? step->ag0 * ref->dev.cap->CAPcapac
                                    : step->ag0 * ref->dev.ind->INDinduct;
@@ -2619,14 +3345,28 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
 
             if (is_last) {
                 for (e = 0; e < n; e++) {
-                    const PACstateRef *ref = &map->refs[e];
                     PACc Mv = Mw[(size_t) e * nfreq + f];
-                    int row2 = pac_state_row(ref);
+                    int row2 = pac_map_row(map, e);
                     if (row2 > 0) { tdu_re[row2] += Mv.re; tdu_im[row2] += Mv.im; }
                 }
             }
 
-            for (e = 0; e < n; e++) {
+            if (map->generic) {
+                /* card #542: z += C_k^T (alpha + ag0 beta) over every row (alpha/beta: adjoints of Q_k, T_k
+                 * from the later steps, see the generic recursion in the design note) */
+                int ti;
+                for (ti = 0; ti < g_pac_C.n; ti++) {
+                    int r = g_pac_C.ri[ti], c = g_pac_C.ci[ti];
+                    PACc al, be;
+                    double v = g_pac_C.v[ti];
+                    if (r <= 0 || c <= 0) continue;
+                    al = abarS[(size_t) r * nfreq + f];
+                    be = abarT[(size_t) r * nfreq + f];
+                    tdu_re[c] += v * (al.re + step->ag0 * be.re);
+                    tdu_im[c] += v * (al.im + step->ag0 * be.im);
+                }
+            }
+            for (e = 0; !map->generic && e < n; e++) {
                 const PACstateRef *ref = &map->refs[e];
                 PACc abT = abarT[(size_t) e * nfreq + f];
                 PACc abS_ext = abarS[(size_t) e * nfreq + f];
@@ -2710,7 +3450,16 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
                             k, step->t, step->h, h_next, dens, tdu_re[outrow], tdu_im[outrow], onoise_out[f]);
             }
 
-            for (e = 0; e < n; e++) {
+            if (map->generic) {
+                /* gamma = nu - beta_old; alpha_{k-1} = ag0 gamma; beta_{k-1} = a1 gamma */
+                for (row = 1; row <= neq; row++) {
+                    PACc be = abarT[(size_t) row * nfreq + f];
+                    PACc gm = { tdu_re[row] - be.re, tdu_im[row] - be.im };
+                    abarS[(size_t) row * nfreq + f] = pc_scale(gm, step->ag0);
+                    abarT[(size_t) row * nfreq + f] = pc_scale(gm, ag1eff);
+                }
+            }
+            for (e = 0; !map->generic && e < n; e++) {
                 const PACstateRef *ref = &map->refs[e];
                 PACc beta, gamma;
                 if (ref->isCap) {
@@ -2807,23 +3556,27 @@ pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     if (pac_noise_check_devices(ckt))
         return E_UNSUPP;
 
-    map.n = n; map.refs = NULL;
+    map.n = n; map.refs = NULL; map.generic = 0; map.ns = 0; map.srows = NULL;
     if (pac_build_map(ckt, &map) || map.n != n) {
         fprintf(stderr, "PNOISE-TD: internal state-map mismatch -- skipped\n");
-        if (map.refs) tfree(map.refs);
+        pac_map_free(&map);
         return E_INTERN;
+    }
+    {
+        int perr = pac_generic_prepare(ckt, job, &map, x0, T, trig_node_num, "PNOISE-TD");
+        if (perr) { pac_map_free(&map); return perr; }
     }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PNOISE-TD: REFUSED -- free-running (trigger=) orbit, no "
                 "period-variation-aware adjoint noise engine (same scope cut as "
                 ".pxf adjoint=1) -- see docs/pss-pac.md.\n");
-        tfree(map.refs);
+        pac_map_free(&map);
         return E_UNSUPP;
     }
 
     nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
-    if (nfreq < 1) { tfree(map.refs); return E_PARMVAL; }
+    if (nfreq < 1) { pac_map_free(&map); return E_PARMVAL; }
     freqs = TMALLOC(double, nfreq);
     pac_sweep_fill(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop, freqs, nfreq);
     onoise = TMALLOC(double, nfreq);
@@ -2847,14 +3600,14 @@ pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                 "on this orbit; this engine needs the smooth-switch-only adjoint "
                 "(card #504's own scope cut) -- no fallback engine exists for "
                 "pnoise (unlike .pxf's adjoint=0). See docs/pss-pac.md.\n");
-        tfree(map.refs); tfree(freqs); tfree(onoise);
+        pac_map_free(&map); tfree(freqs); tfree(onoise);
         if (gen_dens) tfree(gen_dens);
         if (gen_names) tfree(gen_names);
         return E_UNSUPP;
     }
     if (err != PAC_ADJOINT_OK) {
         fprintf(stderr, "PNOISE-TD: engine failed\n");
-        tfree(map.refs); tfree(freqs); tfree(onoise);
+        pac_map_free(&map); tfree(freqs); tfree(onoise);
         if (gen_dens) tfree(gen_dens);
         if (gen_names) tfree(gen_names);
         return E_INTERN;
@@ -2907,7 +3660,7 @@ pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         tfree(nameList);
     }
 
-    tfree(map.refs); tfree(freqs); tfree(onoise);
+    pac_map_free(&map); tfree(freqs); tfree(onoise);
     if (gen_dens) tfree(gen_dens);
     if (gen_names) tfree(gen_names);
     return err ? E_INTERN : OK;
@@ -2937,13 +3690,17 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         return E_PARMVAL;
     }
 
-    map.n = n; map.refs = NULL;
+    map.n = n; map.refs = NULL; map.generic = 0; map.ns = 0; map.srows = NULL;
     if (pac_build_map(ckt, &map) || map.n != n) {
         fprintf(stderr, "PAC-TD: internal state-map mismatch -- skipped\n");
-        if (map.refs) tfree(map.refs);
+        pac_map_free(&map);
         return E_INTERN;
     }
 
+    {
+        int perr = pac_generic_prepare(ckt, job, &map, x0, T, trig_node_num, "PAC-TD");
+        if (perr) { pac_map_free(&map); return perr; }
+    }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PAC-TD: REFUSED -- the trigger= node (free-running "
@@ -2953,29 +3710,29 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                 "(docs/pss-pac.md's free-running section) cannot be formed. "
                 "Not running the fixed-period engine uncorrected on a "
                 "moving-period orbit.\n");
-        tfree(map.refs);
+        pac_map_free(&map);
         return E_UNSUPP;
     }
 
     br = TMALLOC(double, neq + 1);
     bi = TMALLOC(double, neq + 1);
-    if (!br || !bi) { if (br) tfree(br); if (bi) tfree(bi); tfree(map.refs); return E_NOMEM; }
+    if (!br || !bi) { if (br) tfree(br); if (bi) tfree(bi); pac_map_free(&map); return E_NOMEM; }
     memset(br, 0, (size_t) (neq + 1) * sizeof(double));
     memset(bi, 0, (size_t) (neq + 1) * sizeof(double));
     if (pac_capture_b0(ckt, br, bi, neq)) {
         fprintf(stderr, "PAC-TD: failed to capture the netlist AC-source stimulus\n");
-        tfree(br); tfree(bi); tfree(map.refs);
+        tfree(br); tfree(bi); pac_map_free(&map);
         return E_INTERN;
     }
 
     nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
-    if (nfreq < 1) { tfree(br); tfree(bi); tfree(map.refs); return E_PARMVAL; }
+    if (nfreq < 1) { tfree(br); tfree(bi); pac_map_free(&map); return E_PARMVAL; }
     freqs = TMALLOC(double, nfreq);
     pac_sweep_fill(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop, freqs, nfreq);
 
     if (CKTnames(ckt, &numNames, &nameList) || numNames != neq) {
         fprintf(stderr, "PAC-TD: CKTnames() mismatch -- skipped\n");
-        tfree(br); tfree(bi); tfree(map.refs); tfree(freqs);
+        tfree(br); tfree(bi); pac_map_free(&map); tfree(freqs);
         return E_INTERN;
     }
     outrows = TMALLOC(int, numNames);
@@ -3019,7 +3776,7 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         }
     }
 
-    tfree(br); tfree(bi); tfree(map.refs); tfree(freqs); tfree(outrows); tfree(Y0); tfree(nameList);
+    tfree(br); tfree(bi); pac_map_free(&map); tfree(freqs); tfree(outrows); tfree(Y0); tfree(nameList);
     return err ? E_INTERN : OK;
 }
 
@@ -3099,13 +3856,17 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         return E_PARMVAL;
     }
 
-    map.n = n; map.refs = NULL;
+    map.n = n; map.refs = NULL; map.generic = 0; map.ns = 0; map.srows = NULL;
     if (pac_build_map(ckt, &map) || map.n != n) {
         fprintf(stderr, "PSTB: internal state-map mismatch -- skipped\n");
-        if (map.refs) tfree(map.refs);
+        pac_map_free(&map);
         return E_INTERN;
     }
 
+    {
+        int perr = pac_generic_prepare(ckt, job, &map, x0, T, trig_node_num, "PSTB");
+        if (perr) { pac_map_free(&map); return perr; }
+    }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PSTB: REFUSED -- the trigger= node (free-running "
@@ -3115,7 +3876,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                 "(docs/pss-pac.md's free-running section) cannot be formed. "
                 "Not running the fixed-period engine uncorrected on a "
                 "moving-period orbit.\n");
-        tfree(map.refs);
+        pac_map_free(&map);
         return E_UNSUPP;
     }
 
@@ -3123,7 +3884,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     br2 = TMALLOC(double, neq + 1); bi2 = TMALLOC(double, neq + 1);
     if (!br1 || !bi1 || !br2 || !bi2) {
         if (br1) tfree(br1); if (bi1) tfree(bi1); if (br2) tfree(br2); if (bi2) tfree(bi2);
-        tfree(map.refs);
+        pac_map_free(&map);
         return E_NOMEM;
     }
     memset(br1, 0, (size_t) (neq + 1) * sizeof(double)); memset(bi1, 0, (size_t) (neq + 1) * sizeof(double));
@@ -3147,7 +3908,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
 
     nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
     if (nfreq < 1) {
-        tfree(br1); tfree(bi1); tfree(br2); tfree(bi2); tfree(map.refs);
+        tfree(br1); tfree(bi1); tfree(br2); tfree(bi2); pac_map_free(&map);
         return E_PARMVAL;
     }
     freqs = TMALLOC(double, nfreq);
@@ -3166,7 +3927,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
             n, n == 1 ? "" : "s");
 
     t0 = SPfrontEnd->IFseconds();
-    err = pac_engine_run(ckt, job, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, Phi, Y1,
+    err = pac_engine_run(ckt, job, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, NULL, Y1,
                           fT, trig_idx);
     if (!err)
         err = pac_engine_run(ckt, job, &map, x0, T, br2, bi2, freqs, nfreq, outrows, 2, NULL, Y2,
@@ -3348,7 +4109,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         }
     }
 
-    tfree(br1); tfree(bi1); tfree(br2); tfree(bi2); tfree(map.refs); tfree(freqs);
+    tfree(br1); tfree(bi1); tfree(br2); tfree(bi2); pac_map_free(&map); tfree(freqs);
     tfree(Phi); tfree(Y1); tfree(Y2); tfree(Tarr); tfree(LGarr);
     return err ? E_INTERN : OK;
 }
@@ -3438,11 +4199,15 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         return E_PARMVAL;
     }
 
-    map.n = n; map.refs = NULL;
+    map.n = n; map.refs = NULL; map.generic = 0; map.ns = 0; map.srows = NULL;
     if (pac_build_map(ckt, &map) || map.n != n) {
         fprintf(stderr, "PXF-TD: internal state-map mismatch -- skipped\n");
-        if (map.refs) tfree(map.refs);
+        pac_map_free(&map);
         return E_INTERN;
+    }
+    {
+        int perr = pac_generic_prepare(ckt, job, &map, x0, T, trig_node_num, "PXF-TD");
+        if (perr) { pac_map_free(&map); return perr; }
     }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
     if (trig_node_num >= 0 && trig_idx < 0) {
@@ -3453,7 +4218,7 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                 "(docs/pss-pac.md's free-running section) cannot be formed. "
                 "Not running the fixed-period engine uncorrected on a "
                 "moving-period orbit.\n");
-        tfree(map.refs);
+        pac_map_free(&map);
         return E_UNSUPP;
     }
 
@@ -3461,7 +4226,7 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     if (nsrc_total <= 0) {
         fprintf(stderr, "PXF-TD: no independent V/I source instances found in "
                 "the circuit -- skipped\n");
-        tfree(map.refs);
+        pac_map_free(&map);
         return E_PARMVAL;
     }
 
@@ -3488,13 +4253,13 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         if (nsrc_use == 0) {
             fprintf(stderr, "PXF-TD: no requested sources= matched an "
                     "independent V/I source -- skipped\n");
-            tfree(map.refs); tfree(srclist); tfree(use_idx);
+            pac_map_free(&map); tfree(srclist); tfree(use_idx);
             return E_PARMVAL;
         }
     }
 
     nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
-    if (nfreq < 1) { tfree(map.refs); tfree(srclist); tfree(use_idx); return E_PARMVAL; }
+    if (nfreq < 1) { pac_map_free(&map); tfree(srclist); tfree(use_idx); return E_PARMVAL; }
     freqs = TMALLOC(double, nfreq);
     pac_sweep_fill(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop, freqs, nfreq);
 
@@ -3632,7 +4397,7 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         }
     }
 
-    tfree(map.refs); tfree(srclist); tfree(use_idx); tfree(freqs); tfree(Y0); tfree(nameList);
+    pac_map_free(&map); tfree(srclist); tfree(use_idx); tfree(freqs); tfree(Y0); tfree(nameList);
     return err ? E_INTERN : OK;
 }
 
@@ -3660,6 +4425,7 @@ pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         int e = pac_td_pnoise(ckt, job, x0, n, T, fT, trig_node_num);
         if (e) err = e;
     }
+    pac_init_free();   /* card #542 */
     return err;
 }
 

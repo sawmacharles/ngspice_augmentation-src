@@ -544,6 +544,38 @@ MatrixPtr  Matrix;
 
 
 
+
+/*
+ *  card #542: ELEMENT EXTRACTION (unfactored matrix, external numbering).
+ *  spNumElements: number of stored elements (incl. fill-in, which hold 0 after spClear).
+ *  spCopyElements: writes (ext row, ext col, value) of every stored element; returns the count.
+ *  Used by the time-domain PAC engine to split the loaded Jacobian J = G + ag0*C into C
+ *  (difference of two loads at different ag0).  Real matrices only; must not be factored.
+ */
+int
+spNumElements(MatrixPtr Matrix)
+{
+    return Matrix->Elements;
+}
+
+int
+spCopyElements(MatrixPtr Matrix, int *ri, int *ci, double *val)
+{
+    int I, n = 0;
+    ElementPtr pElement;
+
+    assert( IS_SPARSE( Matrix ) && !Matrix->Factored && !Matrix->Complex );
+    for (I = 1; I <= Matrix->Size; I++) {
+        for (pElement = Matrix->FirstInCol[I]; pElement != NULL; pElement = pElement->NextInCol) {
+            ri[n] = Matrix->IntToExtRowMap[pElement->Row];
+            ci[n] = Matrix->IntToExtColMap[I];
+            val[n] = pElement->Real;
+            n++;
+        }
+    }
+    return n;
+}
+
 #if MULTIPLICATION
 /*
  *  MATRIX MULTIPLICATION

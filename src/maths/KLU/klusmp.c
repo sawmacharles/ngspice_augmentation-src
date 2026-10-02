@@ -2115,6 +2115,65 @@ SMPconstMult (SMPmatrix *Matrix, double constant)
     }
 }
 
+/* card #542: element extraction for the time-domain PAC engine (see spCopyElements) */
+int
+SMPnumElements (SMPmatrix *Matrix)
+{
+    if (Matrix->CKTkluMODE)
+        return (int) Matrix->SMPkluMatrix->KLUmatrixNZ ;
+    return spNumElements (Matrix->SPmatrix) ;
+}
+
+int
+SMPcopyElements (SMPmatrix *Matrix, int *ri, int *ci, double *val)
+{
+    if (Matrix->CKTkluMODE)
+    {
+        int n = (int) Matrix->SMPkluMatrix->KLUmatrixN, j, p, cnt = 0 ;
+        int *Ap = (int *) Matrix->SMPkluMatrix->KLUmatrixAp ;
+        int *Ai = (int *) Matrix->SMPkluMatrix->KLUmatrixAi ;
+        double *Ax = Matrix->SMPkluMatrix->KLUmatrixAx ;
+        for (j = 0 ; j < n ; j++)
+            for (p = Ap [j] ; p < Ap [j + 1] ; p++) {
+                ri [cnt] = Ai [p] + 1 ;
+                ci [cnt] = j + 1 ;
+                val [cnt] = Ax [p] ;
+                cnt++ ;
+            }
+        return cnt ;
+    }
+    return spCopyElements (Matrix->SPmatrix, ri, ci, val) ;
+}
+
+/* card #542: inverse of SMPcopyElements: clear the matrix and set the listed elements (external numbering).
+ * KLU: the CSC pattern is fixed, every listed element must exist (returns 1 otherwise). */
+int
+SMPsetElements (SMPmatrix *Matrix, int n, const int *ri, const int *ci, const double *val)
+{
+    int i;
+    if (Matrix->CKTkluMODE)
+    {
+        int *Ap = (int *) Matrix->SMPkluMatrix->KLUmatrixAp ;
+        int *Ai = (int *) Matrix->SMPkluMatrix->KLUmatrixAi ;
+        double *Ax = Matrix->SMPkluMatrix->KLUmatrixAx ;
+        unsigned int z ;
+        for (z = 0 ; z < Matrix->SMPkluMatrix->KLUmatrixNZ ; z++)
+            Ax [z] = 0.0 ;
+        for (i = 0 ; i < n ; i++) {
+            int j = ci [i] - 1, p, found = 0 ;
+            for (p = Ap [j] ; p < Ap [j + 1] ; p++)
+                if (Ai [p] == ri [i] - 1) { Ax [p] = val [i] ; found = 1 ; break ; }
+            if (!found && val [i] != 0.0)
+                return 1 ;
+        }
+        return 0 ;
+    }
+    spClear (Matrix->SPmatrix) ;
+    for (i = 0 ; i < n ; i++)
+        *spGetElement (Matrix->SPmatrix, ri [i], ci [i]) = val [i] ;
+    return spError (Matrix->SPmatrix) ;
+}
+
 /*
  * SMPmultiply()
  */
