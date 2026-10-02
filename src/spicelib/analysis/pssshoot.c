@@ -4964,7 +4964,10 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                  * PSS_KRYLOV_NO_REPLAY=1 restores the old behaviour. */
                 if (!converged_flag && g_pss_krylov && last_stage && !g_pss_kry_failed &&
                     !pss_replay_enabled() && getenv("PSS_REPLAY") == NULL && g_rp_n > 0 && !g_pss_has_switch &&
-                    getenv("PSS_KRYLOV_NO_REPLAY") == NULL) {
+                    getenv("PSS_KRYLOV_NO_REPLAY") == NULL && residual <= 100.0 * tol) {
+                    /* residual <= 100 tol: a stall near the target (4e-6 vs tol 1e-6 here), not a wrong basin: the R4 D=0.55
+                     * period-doubling deck ends the matrix-free attempt at residual ~1 and the replay rung only finds the
+                     * unobservable unstable period-1 fixed point there (rho 1.47, refused), which must stay with the dense path. */
                     int seed_dummyk = 0;
                     g_replay_auto_used = 1;
                     fprintf(stdout, "PSS-SHOOT: [stage %d/final] the matrix-free forced-grid attempt did not converge "
