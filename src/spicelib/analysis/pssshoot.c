@@ -4952,6 +4952,42 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                  * monodromy), exactly as an analysis without krylov=1 would.
                  * A probe stage that merely ran out of its short iteration
                  * budget stays on the Krylov path (the normal escalation). */
+                /* card #550: matrix-free replay rung. On a slow-mode deck (rho 0.994 PEX buck) the matrix-free
+                 * final stage can plateau a few x tol above the target: the forced-grid map is not the function the
+                 * free baseline run evaluated (the same mismatch card #505's replay rung removes on the dense path),
+                 * and the product differences of a noisy map stall the line search near 4e-6. Whether it stepped
+                 * across the line or not was luck of the last bits of exp/log (one machine converged in 6 iterations, another
+                 * with a different libm did not and fell back to the dense path: 405 instead of 126 period runs).
+                 * Before leaving the matrix-free path, retry the same stage once, still matrix-free, with the exact
+                 * step/order replay from the last accepted iterate. Only reached when the matrix-free final-stage
+                 * attempt FAILED without a broken Krylov solve, so every run that converged before is untouched.
+                 * PSS_KRYLOV_NO_REPLAY=1 restores the old behaviour. */
+                if (!converged_flag && g_pss_krylov && last_stage && !g_pss_kry_failed &&
+                    !pss_replay_enabled() && getenv("PSS_REPLAY") == NULL && g_rp_n > 0 && !g_pss_has_switch &&
+                    getenv("PSS_KRYLOV_NO_REPLAY") == NULL) {
+                    int seed_dummyk = 0;
+                    g_replay_auto_used = 1;
+                    fprintf(stdout, "PSS-SHOOT: [stage %d/final] the matrix-free forced-grid attempt did not converge "
+                            "(residual %.3e); retrying once matrix-free with exact step-sequence replay (card #550).\n",
+                            stage, residual);
+                    fflush(stdout);
+                    g_replay_mode = 1;
+                    snprintf(label, sizeof label, "[stage %d/final+kry-replay]", stage);
+                    ckt->CKTreltol = tight_reltol;
+                    ckt->CKTvoltTol = tight_vntol;
+                    converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
+                                                     this_maxiter, tol, eps,
+                                                     this_trust, broyden_enabled,
+                                                     broyden_period, label,
+                                                     &iter, &residual, Phi, use_analytic,
+                                                     NULL, &seed_dummyk);
+                    ckt->CKTreltol = save_reltol;
+                    ckt->CKTvoltTol = save_volttol;
+                    if (!converged_flag) {
+                        g_replay_mode = -1;        /* the dense fallback below starts as it always did */
+                        g_replay_auto_used = 0;
+                    }
+                }
                 if (!converged_flag && g_pss_krylov && (g_pss_kry_failed || last_stage)) {
                     int seed_dummy3 = 0;
                     fprintf(stdout, "PSS-SHOOT: [stage %d] the matrix-free Newton attempt did not converge%s; "
