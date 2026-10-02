@@ -880,11 +880,15 @@ pss_replay_enabled(void)
     return g_replay_mode > 0;
 }
 
+static long g_pss_nruns = 0;
+static double g_pss_warm_periods = 0.0;   /* card #537: warm-up transient periods in this analysis */   /* card #537: period runs made through pss_run_period_ex() in this analysis */
 static int
 pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
                    int record, int force)
 {
     int err;
+
+    g_pss_nruns++;
 
     if (getenv("PSS_SHOOT_NO_FORCE") != NULL)
         force = 0;   /* debug/isolation switch, card #458 second pass */
@@ -2516,6 +2520,356 @@ pss_sens_get_phi(PSSstateMap *map, double *Phi)
 }
 
 
+/* ==================================================================== */
+/* card #537: matrix-free Newton-GMRES shooting (Telichevesky, Kundert &
+ * White, DAC 1995) -- opt-in `krylov=1` on the .pss/.pac/.pstb/.pxf/.pnoise
+ * card or NGSPICE_PSS_KRYLOV=1 in the environment.
+ *
+ * Why: the dense engine builds the monodromy M one column per retained
+ * state, 2 perturbed period runs per column (centred difference), every
+ * Newton iteration -- and, on a converter with extracted parasitics
+ * (R3 buck + 2418 R/C = ~1150 capacitor states), pss_detect_fast_states()'s
+ * one-time full sweep of 2*1150+ period runs is what the fast-state
+ * reduction costs to learn that only ~5 states matter. Parasitic states
+ * decay inside the period (multiplier ~0), so M has only a handful of
+ * non-negligible eigenvalues and a Krylov method needs only about
+ * (slow modes + a few) products M*v, each ONE period run pair from the
+ * current iterate. Nothing of M is assembled and no fast-state detection
+ * runs; every state is a Newton unknown.
+ *
+ * What is shared with the dense engine (so F and the products are one map):
+ * the baseline P(x0) block of pss_newton_run (recorded grid, forced rerun
+ * for switch decks), pss_run_period_ex_safe(..., force=1) for every product
+ * (same recorded grid / replay as the FD columns and the damped-step
+ * trials), the ripple-relative scale[] that defines the residual norm, the
+ * trust-radius cap, the damped line search, the degenerate-fixed-point
+ * guard, the staged warm-up and the replay ladder (all unchanged: only the
+ * linear solve for the Newton direction is replaced).
+ *
+ * Linear solve: inexact Newton, (M - I) dx = -F by GMRES in the
+ * scale[]-weighted variables y = x/scale (the same weights the residual
+ * test max_k |F_k|/scale_k uses), x0 = 0, modified Gram-Schmidt with one
+ * re-orthogonalisation, Givens least squares. Stop at relative residual eta
+ * (PSS_KRYLOV_ETA, default 1e-3) or at the Krylov dimension limit
+ * (PSS_KRYLOV_MAXDIM, default 40, no restart); if the limit is reached with
+ * a relative residual still above 0.5, that is stagnation and the whole
+ * analysis falls back to the dense path (fast-state detection + dense
+ * Newton, see PSSshootDriven), as does a product whose period runs fail.
+ *
+ * Product M*v: v (unit 2-norm in the weighted variables) maps to the
+ * physical direction d_k = scale_k v_k; the perturbation is p = sigma d with
+ * sigma such that max_k |p_k| / h_k = 1, h_k being the engine's own per-state
+ * finite-difference step (|x|*eps, floor 1e-6, 1 % of the ripple for a state
+ * smaller than its ripple -- the exact logic of the dense FD columns), i.e.
+ * no state is ever moved by more than its dense FD step. Centred difference
+ * (P(x0+p) - P(x0-p))/2 (the dense engine found one-sided differences give
+ * no usable direction on R3); PSS_KRYLOV_ONESIDED=1 uses P(x0+p) - P(x0)
+ * with the baseline's own P(x0). A failing product retries at sigma/4
+ * (every deck: the product only sets the direction, never the verdict).
+ *
+ * Stability: no M exists, so the Floquet report comes from Arnoldi: after
+ * convergence a dedicated Arnoldi process (products M*v from a fixed
+ * pseudo-random start vector, grown until the spectral radius settles, at
+ * most PSS_KRYLOV_ARNOLDI = 40 products, see pss_kry_arnoldi()) gives the
+ * Hessenberg matrix whose eigenvalues (Ritz values) approximate the leading
+ * Floquet multipliers. It is reported as an "Arnoldi estimate", with the
+ * change of the spectral radius between the last and the last-but-4
+ * dimension as the convergence indicator; if that change exceeds 1 %, or
+ * the eigen-solve fails, stability is reported "not computed" (the radius is
+ * never invented). When the Krylov dimension equals the number of states the
+ * Hessenberg spectrum is the whole spectrum. */
+
+static int g_pss_krylov = 0;        /* this analysis runs matrix-free */
+static int g_pss_kry_failed = 0;    /* set when the last pss_newton_run failed in the Krylov solve itself */
+
+typedef struct {
+    CKTcircuit *ckt;
+    PSSstateMap *map;
+    double T;
+    int n;
+    const double *x0;     /* the point the products are taken at (n_full states) */
+    const double *w;      /* weights (ripple-relative scale) */
+    const double *hs;     /* per-state FD step ceiling */
+    const double *P0;     /* P(x0) for the one-sided variant, else NULL */
+    int onesided;
+    double *icbuf, *outp, *outm;
+    long nprod, nshrink;
+} PSSkry;
+
+static double
+pss_kry_dot(const double *a, const double *b, int n)
+{
+    double s = 0.0;
+    int i;
+    for (i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+/* the dense engine's own per-state FD step (pss_newton_run FD columns) */
+static double
+pss_kry_hstep(double x0j, double ripple_j, double eps)
+{
+    double h = fabs(x0j) * eps;
+    if (h < 1e-6) h = 1e-6;
+    if (ripple_j > 0.0 && fabs(x0j) < ripple_j && 0.01 * ripple_j > h &&
+        getenv("PSS_SHOOT_NO_BIGH") == NULL)
+        h = 0.01 * ripple_j;
+    return h;
+}
+
+/* Mv = M~ v in weighted variables. Returns 0, or the failing ngspice error. */
+static int
+pss_kry_matvec(PSSkry *c, const double *v, double *Mv)
+{
+    int n = c->n, k, tries, retry_max, err = 0;
+    double nv = sqrt(pss_kry_dot(v, v, n)), mx = 0.0, sigma;
+    static int retry_base = -1;
+
+    if (retry_base < 0) {
+        retry_base = getenv("PSS_FD_RETRY_MAX") ? atoi(getenv("PSS_FD_RETRY_MAX")) : 5;
+        if (retry_base < 1) retry_base = 1;
+    }
+    /* a failing product retries at sigma/4 on every deck (unlike the dense FD
+     * columns' switch-only rule): the product only sets the Newton DIRECTION,
+     * the convergence test is always the true residual, so a smaller step
+     * cannot turn a non-converging orbit into a converged one. */
+    retry_max = retry_base;
+    for (k = 0; k < n; k++) Mv[k] = 0.0;
+    if (!(nv > 0.0)) return 0;
+    for (k = 0; k < n; k++) {
+        double r = fabs(c->w[k] * v[k]) / nv / c->hs[k];
+        if (r > mx) mx = r;
+    }
+    if (!(mx > 0.0)) return 0;
+    sigma = 1.0 / mx;
+
+    for (tries = 0; tries < retry_max; tries++) {
+        for (k = 0; k < n; k++) c->icbuf[k] = c->x0[k] + sigma * c->w[k] * v[k] / nv;
+        pss_state_set_ic(c->map, c->icbuf);
+        err = pss_run_period_ex_safe(c->ckt, c->T, "PSS shoot (Krylov product +)", 0, 1);
+        if (!err) {
+            pss_state_get(c->map, c->ckt, c->outp);
+            if (!c->onesided) {
+                for (k = 0; k < n; k++) c->icbuf[k] = c->x0[k] - sigma * c->w[k] * v[k] / nv;
+                pss_state_set_ic(c->map, c->icbuf);
+                err = pss_run_period_ex_safe(c->ckt, c->T, "PSS shoot (Krylov product -)", 0, 1);
+                if (!err) pss_state_get(c->map, c->ckt, c->outm);
+            }
+        }
+        if (!err) break;
+        if (getenv("PSS_SHOOT_DEBUG"))
+            fprintf(stderr, "DEBUG Krylov product sigma=%.6g failed (ngspice error %d); shrinking "
+                    "(try %d/%d).\n", sigma, err, tries + 1, retry_max);
+        sigma *= 0.25;
+        c->nshrink++;
+    }
+    if (err) return err;
+    for (k = 0; k < n; k++) {
+        double q = c->onesided ? (c->outp[k] - c->P0[k]) : 0.5 * (c->outp[k] - c->outm[k]);
+        Mv[k] = q * nv / (sigma * c->w[k]);
+    }
+    c->nprod++;
+    return 0;
+}
+
+/* GMRES for (M~ - I) y = b. y gets the solution. *relres_out: final relative
+ * residual estimate, *dim_out: Krylov dimension used. Returns 0, or nonzero if a
+ * product failed. */
+static int
+pss_kry_gmres(PSSkry *c, const double *b, double *y, double eta, double abs_floor,
+              int maxdim, double *relres_out, int *dim_out)
+{
+    int n = c->n, m = maxdim < n ? maxdim : n, i, j, k, jdim = 0, err = 0;
+    double beta = sqrt(pss_kry_dot(b, b, n)), res;
+    double *V = NULL, *H = NULL, *cs = NULL, *sn = NULL, *g = NULL, *Av = NULL, *cc = NULL;
+
+    for (k = 0; k < n; k++) y[k] = 0.0;
+    *relres_out = 0.0;
+    *dim_out = 0;
+    if (!(beta > 0.0) || m < 1) return 0;
+    V  = TMALLOC(double, (size_t) (m + 1) * n);
+    H  = TMALLOC(double, (size_t) (m + 1) * m);
+    cs = TMALLOC(double, m);
+    sn = TMALLOC(double, m);
+    g  = TMALLOC(double, m + 1);
+    Av = TMALLOC(double, n);
+    cc = TMALLOC(double, m);
+    if (!V || !H || !cs || !sn || !g || !Av || !cc) { err = E_NOMEM; goto done; }
+    for (k = 0; k < (m + 1) * m; k++) H[k] = 0.0;
+    for (k = 0; k < n; k++) V[k] = b[k] / beta;
+    g[0] = beta;
+    res = beta;
+    for (j = 0; j < m; j++) {
+        double hn;
+        err = pss_kry_matvec(c, V + (size_t) j * n, Av);
+        if (err) goto done;
+        for (k = 0; k < n; k++) Av[k] -= V[(size_t) j * n + k];   /* (M~ - I) v_j */
+        {
+            int pass;
+            for (pass = 0; pass < 2; pass++)
+                for (i = 0; i <= j; i++) {
+                    double h = pss_kry_dot(Av, V + (size_t) i * n, n);
+                    H[i * m + j] += h;
+                    for (k = 0; k < n; k++) Av[k] -= h * V[(size_t) i * n + k];
+                }
+        }
+        hn = sqrt(pss_kry_dot(Av, Av, n));
+        H[(j + 1) * m + j] = hn;
+        for (i = 0; i < j; i++) {   /* earlier rotations */
+            double t = cs[i] * H[i * m + j] + sn[i] * H[(i + 1) * m + j];
+            H[(i + 1) * m + j] = -sn[i] * H[i * m + j] + cs[i] * H[(i + 1) * m + j];
+            H[i * m + j] = t;
+        }
+        {
+            double a = H[j * m + j], bb = H[(j + 1) * m + j], r = hypot(a, bb);
+            if (r > 0.0) { cs[j] = a / r; sn[j] = bb / r; } else { cs[j] = 1.0; sn[j] = 0.0; }
+            H[j * m + j] = r;
+            H[(j + 1) * m + j] = 0.0;
+            g[j + 1] = -sn[j] * g[j];
+            g[j] = cs[j] * g[j];
+        }
+        jdim = j + 1;
+        res = fabs(g[j + 1]);
+        if (getenv("PSS_KRYLOV_DEBUG"))
+            fprintf(stderr, "DEBUG gmres j=%d relres=%.3e (hn=%.3e)\n", j, res / beta, hn);
+        if (res <= eta * beta || res <= abs_floor || hn <= 1e-13 * beta)
+            break;
+        for (k = 0; k < n; k++) V[(size_t) (j + 1) * n + k] = Av[k] / hn;
+    }
+    for (i = jdim - 1; i >= 0; i--) {
+        double s = g[i];
+        for (k = i + 1; k < jdim; k++) s -= H[i * m + k] * cc[k];
+        cc[i] = (H[i * m + i] != 0.0) ? s / H[i * m + i] : 0.0;
+    }
+    for (i = 0; i < jdim; i++)
+        for (k = 0; k < n; k++) y[k] += cc[i] * V[(size_t) i * n + k];
+    *relres_out = res / beta;
+    *dim_out = jdim;
+ done:
+    if (V) tfree(V);
+    if (H) tfree(H);
+    if (cs) tfree(cs);
+    if (sn) tfree(sn);
+    if (g) tfree(g);
+    if (Av) tfree(Av);
+    if (cc) tfree(cc);
+    return err;
+}
+
+/* Arnoldi estimate of the leading Floquet multipliers of M at c->x0, from a
+ * fixed pseudo-random start vector, grown in steps: after dimension 8, 12, 16,
+ * 20, 24, 32, 40, ... (up to mmax, and n) the spectral radius of the Hessenberg
+ * block is compared with that of its leading block of dimension-4; the process
+ * stops at the first checkpoint where they agree to 2e-3 (relative) on the same
+ * side of 1, at dimension n (the whole spectrum), or at an invariant subspace
+ * (breakdown, also exact). Fills ritz[0..*m_eff), *rad (radius at m_eff),
+ * *rad_prev (radius of the leading (m_eff-4)-block, -1 if m_eff < 8), *exact.
+ * Returns 0, or the failing error / 1000 for an eigen-solve failure. */
+static int
+pss_kry_arnoldi(PSSkry *c, int mmax, PSScomplex *ritz, int *m_eff, double *rad,
+                double *rad_prev, int *exact)
+{
+    int n = c->n, i, j, k, err = 0, mm = 0, m;
+    double *V = NULL, *H = NULL, *Av = NULL, *Hm = NULL;
+    PSScomplex *e2 = NULL;
+    double nrm = 0.0;
+
+    *m_eff = 0; *rad = -1.0; *rad_prev = -1.0; *exact = 0;
+    m = mmax > n ? n : mmax;
+    if (m < 1) return 1;
+    V  = TMALLOC(double, (size_t) (m + 1) * n);
+    H  = TMALLOC(double, (size_t) (m + 1) * m);
+    Hm = TMALLOC(double, (size_t) m * m);
+    Av = TMALLOC(double, n);
+    e2 = TMALLOC(PSScomplex, m);
+    if (!V || !H || !Hm || !Av || !e2) { err = E_NOMEM; goto done; }
+    for (k = 0; k < (m + 1) * m; k++) H[k] = 0.0;
+    {
+        unsigned long s = 2463534242UL;
+        for (k = 0; k < n; k++) {
+            s ^= s << 13; s &= 0xffffffffUL; s ^= s >> 17; s ^= s << 5; s &= 0xffffffffUL;
+            V[k] = ((double) (s % 20001UL) / 10000.0) - 1.0;
+            nrm += V[k] * V[k];
+        }
+        nrm = sqrt(nrm);
+        for (k = 0; k < n; k++) V[k] /= nrm;
+    }
+    for (j = 0; j < m; j++) {
+        double hn;
+        int pass, dim, checkpoint, r1 = 0, r2 = 0, stop = 0;
+        err = pss_kry_matvec(c, V + (size_t) j * n, Av);
+        if (err) goto done;
+        for (pass = 0; pass < 2; pass++)
+            for (i = 0; i <= j; i++) {
+                double h = pss_kry_dot(Av, V + (size_t) i * n, n);
+                H[i * m + j] += h;
+                for (k = 0; k < n; k++) Av[k] -= h * V[(size_t) i * n + k];
+            }
+        hn = sqrt(pss_kry_dot(Av, Av, n));
+        H[(j + 1) * m + j] = hn;
+        dim = j + 1;
+        mm = dim;
+        if (hn < 1e-12) { *exact = 1; stop = 1; }
+        if (dim == n) *exact = 1;
+        checkpoint = (dim >= 8 && (dim <= 24 ? dim % 4 == 0 : dim % 8 == 0));
+        if (*exact || dim == m || checkpoint) {
+            for (i = 0; i < dim; i++)
+                for (k = 0; k < dim; k++) Hm[i * dim + k] = H[i * m + k];
+            if (pss_eigenvalues(Hm, dim, ritz) != 0) { err = 1000; goto done; }
+            r1 = 1;
+            {
+                double r = 0.0;
+                for (i = 0; i < dim; i++) { double a = hypot(ritz[i].re, ritz[i].im); if (a > r) r = a; }
+                *rad = r;
+            }
+            *rad_prev = -1.0;
+            if (dim >= 8) {
+                int m2 = dim - 4;
+                double *Hs = TMALLOC(double, (size_t) m2 * m2);
+                if (Hs) {
+                    double r = 0.0;
+                    for (i = 0; i < m2; i++)
+                        for (k = 0; k < m2; k++) Hs[i * m2 + k] = H[i * m + k];
+                    if (pss_eigenvalues(Hs, m2, e2) == 0) {
+                        for (i = 0; i < m2; i++) { double a = hypot(e2[i].re, e2[i].im); if (a > r) r = a; }
+                        *rad_prev = r;
+                        r2 = 1;
+                    }
+                    tfree(Hs);
+                }
+            }
+            *m_eff = dim;
+            if (*exact) stop = 1;
+            else if (r1 && r2 && fabs(*rad - *rad_prev) <= 2e-3 * (*rad > 1e-3 ? *rad : 1e-3) &&
+                     (*rad - 1.0) * (*rad_prev - 1.0) > 0.0)
+                stop = 1;
+        }
+        if (stop || dim == m) break;
+        for (k = 0; k < n; k++) V[(size_t) (j + 1) * n + k] = Av[k] / hn;
+    }
+    (void) mm;
+ done:
+    if (V) tfree(V);
+    if (H) tfree(H);
+    if (Hm) tfree(Hm);
+    if (Av) tfree(Av);
+    if (e2) tfree(e2);
+    return err;
+}
+
+/* the identity "slow set" (every state a Newton unknown) the Krylov mode uses */
+static int *
+pss_kry_identity(int n, int *n_slow_out)
+{
+    int *idx = TMALLOC(int, n), k;
+    for (k = 0; k < n; k++) idx[k] = k;
+    *n_slow_out = n;
+    fprintf(stdout, "PSS-SHOOT: krylov=1: matrix-free Newton-GMRES on all %d states -- no fast-state "
+            "detection sweep, no assembled monodromy (card #537).\n", n);
+    fflush(stdout);
+    return idx;
+}
+
 /* SUSPECTED CAUSE 1 fix: the former spectral-radius estimator (power
  * iteration) is gone -- it cannot resolve a complex-conjugate dominant
  * multiplier pair, which is exactly what a slow oscillation (the R3 x20
@@ -2706,6 +3060,22 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     if (use_analytic)
         broyden_enabled = 0;
 
+    /* card #537: matrix-free Newton-GMRES for the Newton direction (see the
+     * block comment above pss_kry_matvec()). Only on the full, un-reduced
+     * unknown set (the caller passes the identity slow_idx in this mode) and
+     * never with the analytic Jacobian. No Broyden: there is no M to update;
+     * the Krylov solve is redone every iteration from fresh products. */
+    int kry = g_pss_krylov && !use_analytic && (n == n_full);
+    PSSkry kctx;
+    double *khs = NULL, *kb = NULL, *ky = NULL, *kic = NULL, *kop = NULL, *kom = NULL;
+    memset(&kctx, 0, sizeof kctx);
+    g_pss_kry_failed = 0;
+    if (kry) {
+        broyden_enabled = 0;
+        khs = TMALLOC(double, n); kb = TMALLOC(double, n); ky = TMALLOC(double, n);
+        kic = TMALLOC(double, n); kop = TMALLOC(double, n); kom = TMALLOC(double, n);
+    }
+
     x0      = TMALLOC(double, n);
     x1      = TMALLOC(double, n);
     F       = TMALLOC(double, n);
@@ -2713,21 +3083,21 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     delta_x = TMALLOC(double, n);
     xtrial  = TMALLOC(double, n);
     x1trial = TMALLOC(double, n);
-    A       = TMALLOC(double, n * n);
+    A       = TMALLOC(double, kry ? 1 : n * n);
     b       = TMALLOC(double, n);
-    M       = TMALLOC(double, n * n);
+    M       = TMALLOC(double, kry ? 1 : n * n);
     s       = TMALLOC(double, n);
     y       = TMALLOC(double, n);
     Ms      = TMALLOC(double, n);
     icbuf       = TMALLOC(double, n_full);
     outbuf      = TMALLOC(double, n_full);
     ripple_full = TMALLOC(double, n_full);
-    Phi_full    = TMALLOC(double, (size_t) n_full * n_full);
+    Phi_full    = TMALLOC(double, kry ? (size_t) 1 : (size_t) n_full * n_full);
     is_slow     = TMALLOC(int, n_full);
     plus_raw    = TMALLOC(double, n);
     if (!x0 || !x1 || !F || !scale || !delta_x || !xtrial || !x1trial || !A || !b ||
         !M || !s || !y || !Ms || !icbuf || !outbuf || !ripple_full || !Phi_full || !is_slow ||
-        !plus_raw) {
+        !plus_raw || (kry && (!khs || !kb || !ky || !kic || !kop || !kom))) {
         fprintf(stderr, "PSS-SHOOT: %s out of memory allocating Newton "
                 "scratch space.\n", stage_label);
         result = 0;
@@ -2959,7 +3329,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                 fprintf(stderr, "DEBUG %s iter=0: seeded Jacobian from "
                         "fast-state detection's own sweep (skipped a fresh "
                         "FD recompute).\n", stage_label);
-        } else if (recompute && !use_analytic) {
+        } else if (recompute && !use_analytic && !kry) {
             /* finite-difference monodromy: 2n extra period runs (centred
              * differences, not the cheaper n forward differences the
              * card's "n+1 period runs per Newton step" description allows
@@ -3130,6 +3500,48 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
              * below, same as the pre-third-pass code did. */
         }
 
+        if (kry) {
+            /* card #537: inexact Newton by GMRES, no assembled M */
+            double relres = 0.0, eta = 1e-3, abs_floor = 0.01 * tol;
+            int kdim = 0, maxdim = 40, gerr, bad = 0;
+            long runs0 = g_pss_nruns;
+            if (getenv("PSS_KRYLOV_ETA")) eta = atof(getenv("PSS_KRYLOV_ETA"));
+            if (eta <= 0.0 || eta >= 1.0) eta = 1e-3;
+            if (getenv("PSS_KRYLOV_MAXDIM")) maxdim = atoi(getenv("PSS_KRYLOV_MAXDIM"));
+            if (maxdim < 2) maxdim = 2;
+            for (k = 0; k < n; k++) {
+                khs[k] = pss_kry_hstep(x0[k], ripple_full[k], eps);
+                kb[k] = -F[k] / scale[k];
+            }
+            kctx.ckt = ckt; kctx.map = map; kctx.T = T; kctx.n = n;
+            kctx.x0 = x0; kctx.w = scale; kctx.hs = khs; kctx.P0 = x1;
+            kctx.onesided = getenv("PSS_KRYLOV_ONESIDED") && atoi(getenv("PSS_KRYLOV_ONESIDED")) != 0;
+            kctx.icbuf = kic; kctx.outp = kop; kctx.outm = kom;
+            gerr = pss_kry_gmres(&kctx, kb, ky, eta, abs_floor, maxdim, &relres, &kdim);
+            if (gerr) {
+                fprintf(stdout, "PSS-SHOOT: %s iter=%d krylov: a product period run did not complete "
+                        "(ngspice error %d); falling back to the dense path.\n", stage_label, iter, gerr);
+                fflush(stdout);
+                g_pss_kry_failed = 1;
+                result = 0;
+                goto newton_done;
+            }
+            for (k = 0; k < n; k++) {
+                delta_x[k] = scale[k] * ky[k];
+                if (!(fabs(delta_x[k]) < 1e300)) bad = 1;
+            }
+            fprintf(stdout, "PSS-SHOOT: %s iter=%d krylov: GMRES dim %d relres %.2e, %ld period runs in the solve\n",
+                    stage_label, iter, kdim, relres, g_pss_nruns - runs0);
+            fflush(stdout);
+            if (bad || relres > 0.5) {
+                fprintf(stdout, "PSS-SHOOT: %s iter=%d krylov: GMRES stagnated (relres %.2e after dim %d); "
+                        "falling back to the dense path.\n", stage_label, iter, relres, kdim);
+                fflush(stdout);
+                g_pss_kry_failed = 1;
+                result = 0;
+                goto newton_done;
+            }
+        } else {
         for (k = 0; k < n * n; k++) A[k] = M[k];
         for (k = 0; k < n; k++) A[k * n + k] -= 1.0;
         for (k = 0; k < n; k++) b[k] = -F[k];
@@ -3154,6 +3566,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
             result = 0;
             goto newton_done;
         }
+        }   /* card #537: end of the dense (non-Krylov) solve */
 
         {
             double maxratio = 0.0, alpha;
@@ -3429,8 +3842,14 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
  newton_done:
     *iter_out = iter;
     *residual_out = residual;
-    if (Phi_out && M)
+    if (Phi_out && M && !kry)
         for (k = 0; k < n * n; k++) Phi_out[k] = M[k];
+    if (khs) tfree(khs);
+    if (kb) tfree(kb);
+    if (ky) tfree(ky);
+    if (kic) tfree(kic);
+    if (kop) tfree(kop);
+    if (kom) tfree(kom);
     if (x0) tfree(x0);
     if (x1) tfree(x1);
     if (F) tfree(F);
@@ -3762,8 +4181,28 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * pss_detect_fast_states() call set it; freed at shoot_cleanup. */
     int n_slow = 0;
     int *slow_idx = NULL;
+    int kry_requested = 0, kry_fellback = 0;   /* card #537 */
 
     t_wall_start = SPfrontEnd->IFseconds();
+
+    /* card #537: matrix-free Newton-GMRES requested? card key krylov=1, or
+     * NGSPICE_PSS_KRYLOV=1 in the environment (=0 in the environment forces
+     * it off even if the card asks). Not with the analytic Jacobian. */
+    g_pss_nruns = 0;
+    g_pss_warm_periods = 0.0;
+    g_pss_kry_failed = 0;
+    {
+        int want = job->PSSkrylov != 0;
+        if (getenv("NGSPICE_PSS_KRYLOV"))
+            want = atoi(getenv("NGSPICE_PSS_KRYLOV")) != 0;
+        if (want && getenv("PSS_SHOOT_JACOBIAN") && strcmp(getenv("PSS_SHOOT_JACOBIAN"), "analytic") == 0) {
+            fprintf(stdout, "PSS-SHOOT: krylov=1 is not combined with PSS_SHOOT_JACOBIAN=analytic; "
+                    "using the analytic Jacobian.\n");
+            want = 0;
+        }
+        g_pss_krylov = want;
+        kry_requested = want;
+    }
 
     /* Integration resolution within a period: match the sampling the
      * deck asked for (Points), or a fixed default. */
@@ -3829,12 +4268,12 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     x0      = TMALLOC(double, n);
     x1      = TMALLOC(double, n);
     F       = TMALLOC(double, n);
-    Phi     = TMALLOC(double, n * n);
+    Phi     = TMALLOC(double, g_pss_krylov ? 1 : n * n);   /* card #537: no dense matrices in Krylov mode */
     delta_x = TMALLOC(double, n);
     xtrial  = TMALLOC(double, n);
     x1trial = TMALLOC(double, n);
     scale   = TMALLOC(double, n);
-    A       = TMALLOC(double, n * n);
+    A       = TMALLOC(double, g_pss_krylov ? 1 : n * n);
     b       = TMALLOC(double, n);
     eig     = TMALLOC(PSScomplex, n);
 
@@ -4014,8 +4453,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * n_slow*n_slow slice pss_newton_run() actually wants, built once
          * right after detection returns and reused for exactly one call
          * (the first Newton attempt after detection -- see below). */
-        double *phi_full_detect = TMALLOC(double, (size_t) n * n);
-        double *M_init = TMALLOC(double, (size_t) n * n);   /* n*n upper bound; only n_slow*n_slow used */
+        double *phi_full_detect = TMALLOC(double, g_pss_krylov ? (size_t) 1 : (size_t) n * n);
+        double *M_init = TMALLOC(double, g_pss_krylov ? (size_t) 1 : (size_t) n * n);   /* n*n upper bound; only n_slow*n_slow used */
         int phi_full_detect_valid = 0;
 
         if (ckt->CKTstabTime <= 0.0) {
@@ -4025,7 +4464,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
              * pss_detect_fast_states()'s header comment for why this is a
              * one-time cost. */
             n_slow = n;
-            slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow,
+            slow_idx = g_pss_krylov ? pss_kry_identity(n, &n_slow) :
+                       pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow,
                                                phi_full_detect, &phi_full_detect_valid);
             if (phi_full_detect_valid && M_init)
                 for (k = 0; k < n_slow; k++)
@@ -4042,6 +4482,35 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                                              NULL);
             ckt->CKTreltol = save_reltol;
             ckt->CKTvoltTol = save_volttol;   /* card #505 */
+            if (!converged_flag && g_pss_krylov) {
+                /* card #537: dense fallback (see the stage loop's identical block) */
+                fprintf(stdout, "PSS-SHOOT: [no warm-up] the matrix-free Newton attempt did not converge%s; "
+                        "continuing on the dense path (fast-state detection + dense monodromy).\n",
+                        g_pss_kry_failed ? " (Krylov solve failed)" : "");
+                fflush(stdout);
+                g_pss_krylov = 0; g_pss_kry_failed = 0; kry_fellback = 1;
+                tfree(phi_full_detect); tfree(M_init); tfree(Phi);
+                phi_full_detect = TMALLOC(double, (size_t) n * n);
+                M_init = TMALLOC(double, (size_t) n * n);
+                Phi = TMALLOC(double, (size_t) n * n);
+                tfree(slow_idx);
+                n_slow = n;
+                slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow, phi_full_detect, &phi_full_detect_valid);
+                if (phi_full_detect_valid && M_init) {
+                    for (k = 0; k < n_slow; k++)
+                        for (j = 0; j < n_slow; j++)
+                            M_init[k * n_slow + j] = phi_full_detect[slow_idx[k] * n + slow_idx[j]];
+                }
+                ckt->CKTreltol = tight_reltol;
+                ckt->CKTvoltTol = tight_vntol;
+                converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
+                                                 maxiter, tol, eps, -1.0, broyden_enabled,
+                                                 broyden_period, "[no warm-up/dense]",
+                                                 &iter, &residual, Phi, use_analytic,
+                                                 (phi_full_detect_valid && M_init) ? M_init : NULL, NULL);
+                ckt->CKTreltol = save_reltol;
+                ckt->CKTvoltTol = save_volttol;
+            }
         } else {
             double stage_len = warmup_periods * T;
             double cumulative = 0.0;
@@ -4160,6 +4629,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                         ckt->CKTmaxStep = saved_maxstep * warmup_maxstep_factor;
                         ckt->CKTstep    = ckt->CKTmaxStep;
                     }
+                    g_pss_warm_periods += stage_len / T;
                     err = pss_run_period(ckt, stage_len,
                                           "PSS shoot (pre-stabilization transient)");
                     ckt->CKTmaxStep = saved_maxstep;
@@ -4210,7 +4680,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 if (stage == 1) {
                     double _pt0 = getenv("PSS_SHOOT_PROFILE") ? SPfrontEnd->IFseconds() : 0.0;
                     n_slow = n;
-                    slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow,
+                    slow_idx = g_pss_krylov ? pss_kry_identity(n, &n_slow) :
+                               pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow,
                                                        phi_full_detect, &phi_full_detect_valid);
                     if (phi_full_detect_valid && M_init) {
                         for (k = 0; k < n_slow; k++)
@@ -4262,6 +4733,48 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 if (getenv("PSS_SHOOT_PROFILE"))
                     fprintf(stderr, "PROFILE: stage %d newton attempt (%d iters) "
                             "took %.4fs\n", stage, iter, SPfrontEnd->IFseconds() - _pnt0);
+                }
+                /* card #537: the matrix-free attempt failed -- either its Krylov
+                 * solve did (a product run did not complete, GMRES stagnated),
+                 * or this is the final stage and Newton did not converge --
+                 * continue this stage and every later one on the dense path
+                 * (fast-state detection from the current x0, dense FD
+                 * monodromy), exactly as an analysis without krylov=1 would.
+                 * A probe stage that merely ran out of its short iteration
+                 * budget stays on the Krylov path (the normal escalation). */
+                if (!converged_flag && g_pss_krylov && (g_pss_kry_failed || last_stage)) {
+                    int seed_dummy3 = 0;
+                    fprintf(stdout, "PSS-SHOOT: [stage %d] the matrix-free Newton attempt did not converge%s; "
+                            "continuing on the dense path (fast-state detection + dense monodromy).\n",
+                            stage, g_pss_kry_failed ? " (Krylov solve failed)" : "");
+                    fflush(stdout);
+                    g_pss_krylov = 0; g_pss_kry_failed = 0; kry_fellback = 1;
+                    tfree(phi_full_detect); tfree(M_init); tfree(Phi);
+                    phi_full_detect = TMALLOC(double, (size_t) n * n);
+                    M_init = TMALLOC(double, (size_t) n * n);
+                    Phi = TMALLOC(double, (size_t) n * n);
+                    tfree(slow_idx);
+                    n_slow = n;
+                    slow_idx = pss_detect_fast_states(ckt, &map, T, x0, eps, &n_slow,
+                                                       phi_full_detect, &phi_full_detect_valid);
+                    if (phi_full_detect_valid && M_init)
+                        for (k = 0; k < n_slow; k++)
+                            for (j = 0; j < n_slow; j++)
+                                M_init[k * n_slow + j] =
+                                    phi_full_detect[slow_idx[k] * n + slow_idx[j]];
+                    snprintf(label, sizeof label, "[stage %d/%s+dense]", stage,
+                             last_stage ? "final" : "probe");
+                    ckt->CKTreltol = tight_reltol;
+                    ckt->CKTvoltTol = tight_vntol;
+                    converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
+                                                     this_maxiter, tol, eps,
+                                                     this_trust, broyden_enabled,
+                                                     broyden_period, label,
+                                                     &iter, &residual, Phi, use_analytic,
+                                                     (phi_full_detect_valid && M_init) ? M_init : NULL,
+                                                     &seed_dummy3);
+                    ckt->CKTreltol = save_reltol;
+                    ckt->CKTvoltTol = save_volttol;
                 }
                 /* card #505 (composition with #525): the final stage's very
                  * first baseline period run can fail outright (residual 0,
@@ -4410,7 +4923,70 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * the comment above save_reltol's capture). Falls back to the
      * Newton-loop's own last Phi if
      * this dedicated pass fails to run. */
-    {
+    if (g_pss_krylov) {
+        /* card #537: no monodromy exists -- Arnoldi estimate of the leading
+         * Floquet multipliers from products at the converged orbit point
+         * (see the block comment above pss_kry_matvec()). */
+        int m_req = 40, m_eff = 0, exact = 0, aerr, k2;
+        double rad = -1.0, radp = -1.0;
+        long r0 = g_pss_nruns;
+        double *rip = TMALLOC(double, n), *wk = TMALLOC(double, n), *hk = TMALLOC(double, n);
+        double *ic = TMALLOC(double, n), *op = TMALLOC(double, n), *om = TMALLOC(double, n);
+        double *P0 = TMALLOC(double, n);
+        double rfloor = getenv("PSS_SHOOT_RIPPLE_FLOOR") ? atof(getenv("PSS_SHOOT_RIPPLE_FLOOR")) : 1e-2;
+        PSSkry kc;
+        memset(&kc, 0, sizeof kc);
+        if (rfloor <= 0.0) rfloor = 1e-2;
+        if (getenv("PSS_KRYLOV_ARNOLDI")) m_req = atoi(getenv("PSS_KRYLOV_ARNOLDI"));
+        if (m_req < 2) m_req = 2;
+        floq.valid = 0;
+        if (rip && wk && hk && ic && op && om && P0) {
+            pss_ripple_get(&map, rip);
+            for (k2 = 0; k2 < n; k2++) {
+                wk[k2] = (rip[k2] > rfloor) ? rip[k2] : rfloor;
+                hk[k2] = pss_kry_hstep(x0[k2], rip[k2], eps);
+            }
+            kc.ckt = ckt; kc.map = &map; kc.T = T; kc.n = n; kc.x0 = x0; kc.w = wk; kc.hs = hk;
+            kc.icbuf = ic; kc.outp = op; kc.outm = om; kc.P0 = P0;
+            kc.onesided = getenv("PSS_KRYLOV_ONESIDED") && atoi(getenv("PSS_KRYLOV_ONESIDED")) != 0;
+            aerr = 0;
+            if (kc.onesided) {
+                pss_state_set_ic(&map, x0);
+                aerr = pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet baseline)", 0, 1);
+                if (!aerr) pss_state_get(&map, ckt, P0);
+            }
+            if (!aerr)
+                aerr = pss_kry_arnoldi(&kc, m_req, eig, &m_eff, &rad, &radp, &exact);
+            if (aerr) {
+                fprintf(stdout, "PSS-SHOOT: stability NOT computed (Arnoldi estimate failed, error %d).\n", aerr);
+            } else {
+                int ok = 1;
+                pss_classify_floquet(eig, m_eff, &floq);
+                if (!exact) {
+                    double diff = (radp >= 0.0) ? fabs(rad - radp) : 1e30;
+                    if (!(diff <= 1e-2 * (rad > 1e-3 ? rad : 1e-3)) || (rad - 1.0) * (radp - 1.0) <= 0.0)
+                        ok = 0;   /* not converged by the maximum dimension, or ambiguous around 1 */
+                }
+                char cmp[64];
+                if (radp >= 0.0) snprintf(cmp, sizeof cmp, " (%.6f at dimension %d)", radp, m_eff - 4);
+                else cmp[0] = '\0';
+                fprintf(stdout, "PSS-SHOOT: Arnoldi estimate of the Floquet multipliers: dimension %d of %d%s, "
+                        "%ld period runs; spectral radius %.6f%s%s\n",
+                        m_eff, n, exact ? " (whole spectrum)" : "", g_pss_nruns - r0, rad, cmp,
+                        ok ? "" : " -- NOT converged / ambiguous around 1: stability not computed");
+                if (!ok) floq.valid = 0;
+            }
+        } else {
+            fprintf(stdout, "PSS-SHOOT: stability NOT computed (out of memory in the Arnoldi estimate).\n");
+        }
+        if (rip) tfree(rip);
+        if (wk) tfree(wk);
+        if (hk) tfree(hk);
+        if (ic) tfree(ic);
+        if (op) tfree(op);
+        if (om) tfree(om);
+        if (P0) tfree(P0);
+    } else {
         /* Reuse the Newton loop's own eps (not a separate, untested
          * constant): it is already tuned above to be small enough to be
          * accurate under the forced grid, and large enough to clear the
@@ -4604,18 +5180,39 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         goto shoot_fail;
     }
 
-    fprintf(stdout, "\nPSS-SHOOT: CONVERGED iter=%d residual=%.6e "
-            "spectral_radius=%.6f %s wall_time=%.3fs\n",
-            iter, residual, floq.valid ? floq.spectral_radius : -1.0,
-            !floq.valid ? "UNKNOWN(eigensolve-failed)" :
-            floq.unstable ? (floq.period_doubling ? "UNSTABLE(period-doubling)" :
-                              floq.oscillation ? "UNSTABLE(oscillation)" : "UNSTABLE")
-                          : "stable",
-            t_wall_end - t_wall_start);
+    {
+        /* card #537: in Krylov mode the verdict token carries the "arnoldi"
+         * marker (the spectral radius is an estimate from the Hessenberg
+         * matrix, not from an assembled monodromy) and an unknown stability
+         * says "not-computed" -- never a made-up radius. */
+        char vbuf[64];
+        const char *verdict;
+        if (!floq.valid)
+            verdict = g_pss_krylov ? "UNKNOWN(not-computed)" : "UNKNOWN(eigensolve-failed)";
+        else {
+            const char *base = floq.unstable ? (floq.period_doubling ? "UNSTABLE(period-doubling)" :
+                                                 floq.oscillation ? "UNSTABLE(oscillation)" : "UNSTABLE")
+                                             : "stable";
+            if (g_pss_krylov) {
+                snprintf(vbuf, sizeof vbuf, "%s[arnoldi]", base);
+                verdict = vbuf;
+            } else
+                verdict = base;
+        }
+        fprintf(stdout, "\nPSS-SHOOT: CONVERGED iter=%d residual=%.6e "
+                "spectral_radius=%.6f %s wall_time=%.3fs\n",
+                iter, residual, floq.valid ? floq.spectral_radius : -1.0, verdict,
+                t_wall_end - t_wall_start);
+    }
     if (floq.valid)
         fprintf(stdout, "PSS-SHOOT: FLOQUET dominant_multiplier=%.6g%+.6gi "
-                "angle_deg=%.3f\n", floq.dominant.re, floq.dominant.im,
-                atan2(floq.dominant.im, floq.dominant.re) * 180.0 / M_PI);
+                "angle_deg=%.3f%s\n", floq.dominant.re, floq.dominant.im,
+                atan2(floq.dominant.im, floq.dominant.re) * 180.0 / M_PI,
+                g_pss_krylov ? " (Arnoldi estimate)" : "");
+    if (kry_requested || getenv("PSS_SHOOT_COUNT_RUNS"))
+        fprintf(stdout, "PSS-SHOOT: period runs=%ld (+ %.0f warm-up transient periods), mode=%s\n",
+                g_pss_nruns, g_pss_warm_periods,
+                !kry_requested ? "dense" : kry_fellback ? "krylov-fell-back-to-dense" : "krylov");
 
     /* Emit the converged trajectory as an ordinary time-domain plot, same
      * title the existing driven-mode algorithm uses. card #488 fix: force
@@ -4671,6 +5268,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     g_pss_loose_reltol = 0.0;   /* card #498: disable the fallback outside this call */
     g_pss_has_switch = 0;
     g_pss_lag_enabled = 1;
+    g_pss_krylov = 0; g_pss_kry_failed = 0;   /* card #537 */
     PSSbreakRecordActive = PSSbreakInstallActive = 0;
     PSSreplayActive = 0;
     g_replay_mode = -1;   /* card #505: replay choice is per analysis */
@@ -5010,6 +5608,11 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     double t_wall_start, t_wall_end;
 
     map.n = 0; map.refs = NULL;
+
+    if (job->PSSkrylov || (getenv("NGSPICE_PSS_KRYLOV") && atoi(getenv("NGSPICE_PSS_KRYLOV")) != 0))
+        fprintf(stderr, "PSS-FREERUN: krylov=1 is not supported for free-running (trigger=) shooting "
+                "(the Poincare-section map carries the period as an extra unknown); this run uses "
+                "the dense monodromy (card #537).\n");
 
     if (!job->PSStrigNode) {
         fprintf(stderr, "PSS-FREERUN: internal error -- dispatched with no "

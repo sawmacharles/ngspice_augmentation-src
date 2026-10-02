@@ -191,6 +191,11 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->PSSforceDriven = value->iValue;
         break;
 
+    /* card #537: `krylov=1` -- see pssdefs.h's PSSkrylov comment. */
+    case PSS_KRYLOV:
+        job->PSSkrylov = value->iValue;
+        break;
+
     default:
         return(E_BADPARM);
     }
@@ -231,6 +236,7 @@ static IFparm PSSparms[] = {
     { "trigdir",      TRIG_DIR,	IF_SET|IF_STRING,	"card #489: trigger crossing direction, rise (default) or fall" },
     { "driven",       PSS_FORCE_DRIVEN, IF_SET|IF_INTEGER,	"card #494: force driven-mode shooting at fguess even if no native V/I source has a time function (XSPICE-clocked decks, e.g. d_pwm)" },
     { "adjoint",      PXF_ADJOINT,	IF_SET|IF_INTEGER,	"card #504: .pxf true adjoint/transposed engine (1=force on, 0=force off, unset=auto by source count)" },
+    { "krylov",       PSS_KRYLOV,	IF_SET|IF_INTEGER,	"card #537: matrix-free Newton-GMRES shooting for method=shoot (1=on, default 0 = dense finite-difference monodromy)" },
     { "dev",          PNOISE_DEVTBL,	IF_SET|IF_INTEGER,	"card #509: .pnoise (solver=td) per-device noise contribution table (1=on, default off)" }
 };
 

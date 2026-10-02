@@ -3555,6 +3555,11 @@ DCpss(CKTcircuit *ckt,
      * ruling #447 A) and is refused here rather than silently falling back,
      * so a `method=shoot` deck without a driven source gets a clear error
      * instead of a wrong answer. */
+    /* card #537: krylov=1 (card key or NGSPICE_PSS_KRYLOV=1) belongs to the shooting engine only. */
+    if (job->PSSmethod != PSS_METHOD_SHOOT &&
+        (job->PSSkrylov || (getenv("NGSPICE_PSS_KRYLOV") && atoi(getenv("NGSPICE_PSS_KRYLOV")) != 0)))
+        fprintf(stderr, "PSS: krylov=1 only applies to method=shoot; ignored for this analysis.\n");
+
     if (job->PSSmethod == PSS_METHOD_SHOOT) {
         /* card #489 (plan T6.2): a `trigger=<node>` card selects the
          * free-running (autonomous) Poincare-section engine instead of

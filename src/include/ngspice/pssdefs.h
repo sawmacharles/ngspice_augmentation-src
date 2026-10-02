@@ -197,6 +197,14 @@ typedef struct {
      * to introspect XSPICE code models, and does nothing for a genuinely
      * autonomous circuit unless the user asserts driven=1 themselves. */
     int      PSSforceDriven;
+
+    /* card #537: `krylov=1` on the .pss/.pac/.pstb/.pxf/.pnoise card (or the
+     * environment variable NGSPICE_PSS_KRYLOV=1): matrix-free Newton-GMRES
+     * shooting for driven method=shoot -- the monodromy is never assembled,
+     * each Krylov vector costs one (centred) perturbed period run. Default 0
+     * (dense finite-difference monodromy, byte-for-byte the previous
+     * behaviour). See pssshoot.c "card #537". */
+    int      PSSkrylov;
 } PSSan;
 
 enum {
@@ -243,6 +251,7 @@ enum {
     PXF_SOURCES,
     PXF_ADJOINT,
     PNOISE_DEVTBL,
+    PSS_KRYLOV,
 };
 
 #endif

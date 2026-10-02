@@ -1220,6 +1220,10 @@ dot_pss(char *line, void *ckt, INPtables *tab, struct card *current,
             INPgetTok(&line, &dword, 1);
             ptemp.sValue = dword;
             GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+        } else if (strcmp(word, "krylov") == 0) {
+            /* card #537: `krylov=1` -- matrix-free Newton-GMRES shooting (pssdefs.h PSSkrylov) */
+            parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+            GCA(INPapName, (ckt, which, foo, "krylov", parm));
         } else if (strcmp(word, "driven") == 0) {
             /* card #494: `driven=1` -- see pssdefs.h's PSSforceDriven
              * comment. Token-split note: same as method=/trigger= above,
@@ -1380,6 +1384,11 @@ dot_pac(char *line, void *ckt, INPtables *tab, struct card *current,
                 INPgetTok(&line, &dword, 1);
                 ptemp.sValue = dword;
                 GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+            } else if (strcmp(word, "krylov") == 0) {
+                /* card #537: `krylov=1` -- matrix-free Newton-GMRES shooting (pssdefs.h PSSkrylov) */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "krylov", parm));
             } else if (strcmp(word, "driven") == 0) {
                 /* card #494: see dot_pss()'s identical branch. */
                 tfree(word);
@@ -1534,6 +1543,11 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
             INPgetTok(&line, &dword, 1);
             ptemp.sValue = dword;
             GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+        } else if (strcmp(word, "krylov") == 0) {
+            /* card #537: `krylov=1` -- matrix-free Newton-GMRES shooting (pssdefs.h PSSkrylov) */
+            tfree(word);
+            parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+            GCA(INPapName, (ckt, which, foo, "krylov", parm));
         } else if (strcmp(word, "driven") == 0) {
             /* card #494: see dot_pss()'s identical branch. */
             tfree(word);
@@ -1751,6 +1765,11 @@ dot_pnoise(char *line, void *ckt, INPtables *tab, struct card *current,
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
                 GCA(INPapName, (ckt, which, foo, "dev", parm));
+            } else if (strcmp(word, "krylov") == 0) {
+                /* card #537: `krylov=1` -- matrix-free Newton-GMRES shooting (pssdefs.h PSSkrylov) */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "krylov", parm));
             } else if (strcmp(word, "pacpoints") == 0) {
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
@@ -1873,7 +1892,7 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
             if (!*word) { tfree(word); break; }
             if (!maxsb_seen && strcmp(word, "method") != 0 && strcmp(word, "solver") != 0 &&
                 strcmp(word, "sources") != 0 && strcmp(word, "pacpoints") != 0 &&
-                strcmp(word, "adjoint") != 0 &&
+                strcmp(word, "adjoint") != 0 && strcmp(word, "krylov") != 0 &&
                 (isdigit((unsigned char) word[0]) ||
                  ((word[0] == '+' || word[0] == '-') && isdigit((unsigned char) word[1])))) {
                 line = save;
@@ -1893,6 +1912,11 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
                 INPgetTok(&line, &sword, 1);
                 ptemp.sValue = sword;
                 GCA(INPapName, (ckt, which, foo, "solver", &ptemp));
+            } else if (strcmp(word, "krylov") == 0) {
+                /* card #537: `krylov=1` -- matrix-free Newton-GMRES shooting (pssdefs.h PSSkrylov) */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "krylov", parm));
             } else if (strcmp(word, "pacpoints") == 0) {
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
