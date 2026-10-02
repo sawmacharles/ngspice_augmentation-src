@@ -2582,10 +2582,19 @@ pss_sens_get_phi(PSSstateMap *map, double *Phi)
 static int g_pss_krylov = 0;        /* this analysis runs matrix-free */
 static int g_pss_kry_failed = 0;    /* set when the last pss_newton_run failed in the Krylov solve itself */
 
+static int pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
+                                 int node_num, double trigval, int dir,
+                                 double max_period, double *x_T, double *T_measured,
+                                 double *x_prev_out, double *t_prev_out);
+
 typedef struct {
     CKTcircuit *ckt;
     PSSstateMap *map;
     double T;
+    /* card #538: free-running (trigger=) shooting: the map is the Poincare-section return map
+     * (state at the next trigger crossing), the period is its return time, not a fixed T */
+    int trig, node_num, dir;
+    double trigval, max_period;
     int n;
     const double *x0;     /* the point the products are taken at (n_full states) */
     const double *w;      /* weights (ripple-relative scale) */
@@ -2617,6 +2626,25 @@ pss_kry_hstep(double x0j, double ripple_j, double eps)
     return h;
 }
 
+/* one evaluation of the map the products difference: out = P(ic). Driven: one period run from ic (the
+ * recorded/forced grid of the caller); free-running (card #538): the state at the next trigger crossing.
+ * Returns 0, or the failing error (1 for a lost trigger crossing). */
+static int
+pss_kry_eval(PSSkry *c, const double *ic, double *out, const char *label)
+{
+    int err;
+    if (c->trig) {
+        double Tm;
+        g_pss_nruns++;
+        return pss_run_until_trigger(c->ckt, c->map, ic, c->node_num, c->trigval, c->dir, c->max_period,
+                                     out, &Tm, NULL, NULL);
+    }
+    pss_state_set_ic(c->map, ic);
+    err = pss_run_period_ex_safe(c->ckt, c->T, label, 0, 1);
+    if (!err) pss_state_get(c->map, c->ckt, out);
+    return err;
+}
+
 /* Mv = M~ v in weighted variables. Returns 0, or the failing ngspice error. */
 static int
 pss_kry_matvec(PSSkry *c, const double *v, double *Mv)
@@ -2645,15 +2673,11 @@ pss_kry_matvec(PSSkry *c, const double *v, double *Mv)
 
     for (tries = 0; tries < retry_max; tries++) {
         for (k = 0; k < n; k++) c->icbuf[k] = c->x0[k] + sigma * c->w[k] * v[k] / nv;
-        pss_state_set_ic(c->map, c->icbuf);
-        err = pss_run_period_ex_safe(c->ckt, c->T, "PSS shoot (Krylov product +)", 0, 1);
+        err = pss_kry_eval(c, c->icbuf, c->outp, "PSS shoot (Krylov product +)");
         if (!err) {
-            pss_state_get(c->map, c->ckt, c->outp);
             if (!c->onesided) {
                 for (k = 0; k < n; k++) c->icbuf[k] = c->x0[k] - sigma * c->w[k] * v[k] / nv;
-                pss_state_set_ic(c->map, c->icbuf);
-                err = pss_run_period_ex_safe(c->ckt, c->T, "PSS shoot (Krylov product -)", 0, 1);
-                if (!err) pss_state_get(c->map, c->ckt, c->outm);
+                err = pss_kry_eval(c, c->icbuf, c->outm, "PSS shoot (Krylov product -)");
             }
         }
         if (!err) break;
@@ -5659,12 +5683,14 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     double residual = 0.0;
     double t_wall_start, t_wall_end;
 
-    map.n = 0; map.refs = NULL;
+    int fr_kry = 0, fr_kry_fell = 0;   /* card #538: matrix-free Newton-GMRES on the Poincare return map */
+    double *fr_hs = NULL, *fr_kb = NULL, *fr_ky = NULL, *fr_ic = NULL, *fr_op = NULL, *fr_om = NULL;
+    PSSkry fr_ctx;
+    long fr_runs0 = 0;
+    double fr_hmul = getenv("PSS_FREERUN_KRY_HMUL") ? atof(getenv("PSS_FREERUN_KRY_HMUL")) : 1000.0;
 
-    if (job->PSSkrylov || (getenv("NGSPICE_PSS_KRYLOV") && atoi(getenv("NGSPICE_PSS_KRYLOV")) != 0))
-        fprintf(stderr, "PSS-FREERUN: krylov=1 is not supported for free-running (trigger=) shooting "
-                "(the Poincare-section map carries the period as an extra unknown); this run uses "
-                "the dense monodromy (card #537).\n");
+    map.n = 0; map.refs = NULL;
+    memset(&fr_ctx, 0, sizeof fr_ctx);
 
     if (!job->PSStrigNode) {
         fprintf(stderr, "PSS-FREERUN: internal error -- dispatched with no "
@@ -5683,6 +5709,30 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         return E_UNSUPP;
     }
     n = map.n;
+
+    /* card #538: matrix-free free-running shooting. The Newton unknowns are the n states at the trigger
+     * crossing (the Poincare section); the period is not an extra unknown here, it is the return time of the
+     * map P(x) = state at the next trigger crossing, so (M - I) dx = -(P(x0) - x0) with the terminal-projected M
+     * of the dense engine is exactly what GMRES solves, one product = a centred pair of trigger runs.
+     * krylov=1 (card key or NGSPICE_PSS_KRYLOV=1), or automatic from PSS_KRYLOV_AUTO_MIN states (default 64)
+     * unless the card / environment choose; krylov=0 forces the dense monodromy. Not combined with .pac/.pstb
+     * on the orbit (they stay refused by default and use their own runs). */
+    {
+        int want = job->PSSkrylov != 0;
+        if (getenv("NGSPICE_PSS_KRYLOV"))
+            want = atoi(getenv("NGSPICE_PSS_KRYLOV")) != 0;
+        else if (!job->PSSkrylovSet) {
+            int amin = 64;
+            if (getenv("PSS_KRYLOV_AUTO_MIN")) amin = atoi(getenv("PSS_KRYLOV_AUTO_MIN"));
+            if (amin > 0 && n >= amin && !job->PSSdoPAC && !job->PSSdoPSTB && !getenv("PSS_FREERUN_PAC_EXPERIMENTAL")) {
+                want = 1;
+                fprintf(stdout, "PSS-FREERUN: %d states >= %d: matrix-free Newton-GMRES (krylov) chosen automatically "
+                        "(krylov=0 or NGSPICE_PSS_KRYLOV=0 forces the dense monodromy)\n", n, amin);
+                fflush(stdout);
+            }
+        }
+        fr_kry = want;
+    }
 
     Tguess = (job->PSSguessedFreq > 0.0) ? 1.0 / job->PSSguessedFreq : 1e-6;
     /* MAX_PERIOD: 10x the guess -- SIMPLIS's own free-running guidance
@@ -5704,13 +5754,18 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         ckt->CKTreltol = 1e-5;   /* same tightening rationale as the driven engine */
 
     x0 = TMALLOC(double, n); x1 = TMALLOC(double, n);
-    F  = TMALLOC(double, n); M  = TMALLOC(double, (size_t) n * n);
+    F  = TMALLOC(double, n); M  = TMALLOC(double, fr_kry ? (size_t) 1 : (size_t) n * n);
     delta = TMALLOC(double, n);
     xtrial = TMALLOC(double, n); x1trial = TMALLOC(double, n);
     scale = TMALLOC(double, n); ripple = TMALLOC(double, n);
-    A = TMALLOC(double, (size_t) n * n); b = TMALLOC(double, n);
+    A = TMALLOC(double, fr_kry ? (size_t) 1 : (size_t) n * n); b = TMALLOC(double, n);
+    if (fr_kry) {
+        fr_hs = TMALLOC(double, n); fr_kb = TMALLOC(double, n); fr_ky = TMALLOC(double, n);
+        fr_ic = TMALLOC(double, n); fr_op = TMALLOC(double, n); fr_om = TMALLOC(double, n);
+    }
     if (!x0 || !x1 || !F || !M || !delta || !xtrial || !x1trial ||
-        !scale || !ripple || !A || !b) {
+        !scale || !ripple || !A || !b ||
+        (fr_kry && (!fr_hs || !fr_kb || !fr_ky || !fr_ic || !fr_op || !fr_om))) {
         err = E_NOMEM;
         goto fr_cleanup;
     }
@@ -5755,6 +5810,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     eps     = getenv("PSS_FREERUN_FD_EPS") ? atof(getenv("PSS_FREERUN_FD_EPS")) : 1e-6;
 
     t_wall_start = SPfrontEnd->IFseconds();
+    fr_runs0 = g_pss_nruns;
 
     for (iter = 0; iter < maxiter; iter++) {
         double Tmeas;
@@ -5790,6 +5846,44 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
 
         if (residual <= tol) { converged = 1; break; }
 
+        if (fr_kry) {
+            /* card #538: GMRES on (M - I) y = -F in the weighted variables, products by trigger runs */
+            double relres = 0.0, eta = 1e-3;
+            int kdim = 0, gerr, bad = 0;
+            long runs_before = g_pss_nruns;
+            if (getenv("PSS_KRYLOV_ETA")) eta = atof(getenv("PSS_KRYLOV_ETA"));
+            if (eta <= 0.0 || eta >= 1.0) eta = 1e-3;
+            for (k = 0; k < n; k++) {
+                double h = fabs(x0[k]) * eps * fr_hmul;
+                if (h < 1e-9 * fr_hmul) h = 1e-9 * fr_hmul;
+                fr_hs[k] = h;
+                fr_kb[k] = -F[k] / scale[k];
+            }
+            fr_ctx.ckt = ckt; fr_ctx.map = &map; fr_ctx.T = T; fr_ctx.n = n;
+            fr_ctx.trig = 1; fr_ctx.node_num = node_num; fr_ctx.trigval = trigval; fr_ctx.dir = dir;
+            fr_ctx.max_period = max_period;
+            fr_ctx.x0 = x0; fr_ctx.w = scale; fr_ctx.hs = fr_hs; fr_ctx.P0 = x1;
+            fr_ctx.icbuf = fr_ic; fr_ctx.outp = fr_op; fr_ctx.outm = fr_om;
+            fr_ctx.onesided = 0;
+            gerr = pss_kry_gmres(&fr_ctx, fr_kb, fr_ky, eta, 0.01 * tol, 40, &relres, &kdim);
+            for (k = 0; k < n && !gerr; k++) {
+                delta[k] = scale[k] * fr_ky[k];
+                if (!(fabs(delta[k]) < 1e300)) bad = 1;
+            }
+            fprintf(stdout, "PSS-FREERUN: iter=%d krylov: GMRES dim %d relres %.2e, %ld trigger runs in the solve\n",
+                    iter, kdim, relres, g_pss_nruns - runs_before);
+            fflush(stdout);
+            if (gerr || bad || relres > 0.5) {
+                fprintf(stdout, "PSS-FREERUN: krylov solve failed (%s); continuing with the dense monodromy.\n",
+                        gerr ? "a product lost the trigger crossing" : "GMRES stagnated");
+                fflush(stdout);
+                fr_kry = 0; fr_kry_fell = 1;
+                tfree(M); tfree(A);
+                M = TMALLOC(double, (size_t) n * n); A = TMALLOC(double, (size_t) n * n);
+                if (!M || !A) { err = E_NOMEM; goto fr_cleanup; }
+            }
+        }
+        if (!fr_kry) {
         /* central-FD monodromy -- see this file's card #489 header
          * comment for why this is already the terminal-projected M. */
         for (j = 0; j < n; j++) {
@@ -5830,6 +5924,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                     "cannot take a Newton step; reporting FAILED.\n", iter);
             goto fr_fail;
         }
+        }   /* card #538: end of the dense monodromy solve */
 
         {
             double damp = 1.0;
@@ -5868,7 +5963,54 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
      * 1; identify it as the smallest-modulus eigenvalue and report the
      * other n-1 as the genuine multipliers. */
     eig = TMALLOC(PSScomplex, n);
-    if (eig && pss_eigenvalues(M, n, eig) == 0) {
+    if (fr_kry && eig) {
+        /* card #538: no monodromy exists -- Arnoldi estimate of the leading Floquet multipliers of the return
+         * map at the converged state (the trivial, projected-flow multiplier is ~0 and never the radius) */
+        int m_req = 40, m_eff = 0, exact = 0, aerr, kk;
+        double rad = -1.0, radp = -1.0, specrad;
+        int ok = 1;
+        long r0 = g_pss_nruns;
+        if (getenv("PSS_KRYLOV_ARNOLDI")) m_req = atoi(getenv("PSS_KRYLOV_ARNOLDI"));
+        if (m_req < 2) m_req = 2;
+        for (kk = 0; kk < n; kk++) {
+            double h = fabs(x0[kk]) * eps * fr_hmul;
+            fr_hs[kk] = (h < 1e-9 * fr_hmul) ? 1e-9 * fr_hmul : h;
+        }
+        fr_ctx.ckt = ckt; fr_ctx.map = &map; fr_ctx.T = T; fr_ctx.n = n;
+        fr_ctx.trig = 1; fr_ctx.node_num = node_num; fr_ctx.trigval = trigval; fr_ctx.dir = dir;
+        fr_ctx.max_period = max_period;
+        fr_ctx.x0 = x0; fr_ctx.w = scale; fr_ctx.hs = fr_hs; fr_ctx.P0 = x1;
+        fr_ctx.icbuf = fr_ic; fr_ctx.outp = fr_op; fr_ctx.outm = fr_om; fr_ctx.onesided = 0;
+        aerr = pss_kry_arnoldi(&fr_ctx, m_req, eig, &m_eff, &rad, &radp, &exact);
+        if (aerr) {
+            ok = 0;
+            fprintf(stdout, "PSS-FREERUN: stability NOT computed (Arnoldi estimate failed, error %d).\n", aerr);
+        } else {
+            char cmp[64];
+            if (!exact) {
+                double diff = (radp >= 0.0) ? fabs(rad - radp) : 1e30;
+                if (!(diff <= 1e-2 * (rad > 1e-3 ? rad : 1e-3)) || (rad - 1.0) * (radp - 1.0) <= 0.0)
+                    ok = 0;
+            }
+            if (radp >= 0.0) snprintf(cmp, sizeof cmp, " (%.6f at dimension %d)", radp, m_eff - 4);
+            else cmp[0] = '\0';
+            fprintf(stdout, "PSS-FREERUN: Arnoldi estimate of the Floquet multipliers: dimension %d of %d%s, "
+                    "%ld trigger runs; spectral radius %.6f%s%s\n", m_eff, n, exact ? " (whole spectrum)" : "",
+                    g_pss_nruns - r0, rad, cmp, ok ? "" : " -- NOT converged / ambiguous around 1: stability not computed");
+        }
+        specrad = ok ? rad : -1.0;
+        t_wall_end = SPfrontEnd->IFseconds();
+        fprintf(stdout, "\nPSS-FREERUN: CONVERGED iter=%d residual=%.6e period=%.9g fsw=%.6g spectral_radius=%.6f %s "
+                "wall_time=%.3fs\n", iter, residual, T, 1.0 / T, specrad,
+                (n <= 1) ? "UNKNOWN(n=1, no non-trivial multiplier)" :
+                !ok ? "UNKNOWN(not-computed)" : (specrad < 1.0 ? "stable[arnoldi]" : "UNSTABLE[arnoldi]"),
+                t_wall_end - t_wall_start);
+        if (ok)
+            fprintf(stdout, "PSS-FREERUN: FLOQUET dominant multiplier modulus %.6g (Arnoldi estimate; the trivial "
+                    "projected-flow multiplier, ~0, is not the radius)\n", rad);
+        fprintf(stdout, "PSS-FREERUN: period runs: %ld trigger runs, mode=%s\n", g_pss_nruns - fr_runs0,
+                fr_kry_fell ? "krylov-fell-back-to-dense" : "krylov");
+    } else if (eig && pss_eigenvalues(M, n, eig) == 0) {
         int trivial_idx = 0, kk;
         double trivial_mag = 1e300, specrad = -1.0;
         for (kk = 0; kk < n; kk++) {
@@ -6458,6 +6600,12 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     if (A) tfree(A);
     if (b) tfree(b);
     if (eig) tfree(eig);
+    if (fr_hs) tfree(fr_hs);
+    if (fr_kb) tfree(fr_kb);
+    if (fr_ky) tfree(fr_ky);
+    if (fr_ic) tfree(fr_ic);
+    if (fr_op) tfree(fr_op);
+    if (fr_om) tfree(fr_om);
     if (map.refs) tfree(map.refs);
     return err;
 
