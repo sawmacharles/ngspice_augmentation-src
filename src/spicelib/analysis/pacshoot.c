@@ -1923,6 +1923,37 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
     return has;
 }
 
+/* BSIM3/BSIM4 non-quasi-static models carry an internal charge-relaxation state (qcheq) that is a CKTstate
+ * history of its own, not a node charge: the node-charge recursion does not contain it, so a deck that enables it
+ * is refused (measured on a BSIM4 common-source deck with trnqsmod=1: affine-in-ag0 check passes but the result
+ * is 3e-5 off the .ac value, larger NQS time constants would give more). */
+static const char *
+pac_find_nqs_device(CKTcircuit *ckt)
+{
+    int i, k;
+    static char buf[96];
+    for (i = 0; i < DEVmaxnum; i++) {
+        SPICEdev *d = DEVices[i];
+        GENmodel *m;
+        if (!d || !ckt->CKThead[i] || !d->DEVmodAsk || !d->DEVpublic.modelParms || !d->DEVpublic.numModelParms)
+            continue;
+        for (k = 0; k < *d->DEVpublic.numModelParms; k++) {
+            const char *kw = d->DEVpublic.modelParms[k].keyword;
+            if (!kw || (strcasecmp(kw, "trnqsmod") && strcasecmp(kw, "acnqsmod") && strcasecmp(kw, "nqsmod")))
+                continue;
+            for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+                IFvalue v;
+                memset(&v, 0, sizeof v);
+                if (d->DEVmodAsk(ckt, m, d->DEVpublic.modelParms[k].id, &v) == OK && v.iValue != 0) {
+                    snprintf(buf, sizeof buf, "%s (%s=%d)", d->DEVpublic.name ? d->DEVpublic.name : "?", kw, v.iValue);
+                    return buf;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Model-charge detection (one prepass period, cheap): a circuit whose only non-native devices carry no charge
  * (e.g. a diode with cj=0, tt=0 next to ideal switches) keeps the legacy native recursion -- bit-identical to
  * before and still able to use saltation. Each suspicious device TYPE is loaded alone (matrix cleared) at ag0
@@ -2031,6 +2062,16 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         fprintf(stderr, "%s: REFUSED -- device type '%s' carries delay history that is not a charge state; "
                 "td small-signal analysis of it is not implemented (card #542).\n", who, delay);
         return E_UNSUPP;
+    }
+    {
+        const char *nqs = pac_find_nqs_device(ckt);
+        if (nqs && !getenv("PAC_ALLOW_NQS")) {
+            fprintf(stderr, "%s: REFUSED -- %s: the non-quasi-static model carries an internal charge-relaxation state "
+                    "that is not a node charge and is not part of the generic history (card #542). Use the "
+                    "quasi-static model (trnqsmod=0 / nqsmod=0). PAC_ALLOW_NQS=1 overrides (result then only "
+                    "approximate).\n", who, nqs);
+            return E_UNSUPP;
+        }
     }
     if (!has && !getenv("PAC_FORCE_GENERIC"))
         return 0;
