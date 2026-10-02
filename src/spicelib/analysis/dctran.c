@@ -549,6 +549,8 @@ DCtran(CKTcircuit *ckt,
        active. */
     if (PSSrippleRecordActive)
         PSSrippleRecordStep(ckt);
+    if (PSShidActive)
+        PSShidRecordStep(ckt);   /* card #546 */
     /* card #465: time-domain PAC/PSTB per-step complex propagation, same
        call site again. No-op unless a `.pac solver=td` / `.pstb` recording
        pass has it active. */

@@ -339,6 +339,88 @@ pss_ripple_free(void)
 static int g_pss_lag_enabled = 1;
 int PSSshootLagEnabled(void) { return g_pss_lag_enabled && getenv("PSS_NO_EVENT_LOCATE") == NULL; }
 
+/* card #546: hidden-state continuation of the period restart. A period run restarts from the NATIVE C/L states only; every
+ * other node (gate chains, logic, nodes carried by device-model charge) and every device charge history is re-initialised
+ * (zero node vector, device ics derived once at job start), so the run starts with a startup transient the orbit does not have and
+ * the Newton fixed point is that of the RESTARTED map, not of the circuit (R7: +0.36 mV on Vout). Here the full node vector at the
+ * end of the last "latching" run (warm-up transient, Newton baseline) is put back into CKTrhs before the next run and the device
+ * ics are re-derived from it (as pacshoot.c does for the recording runs); the Jacobian runs (perturbations, trials) all start from
+ * the SAME hidden vector, so the finite-difference Jacobian stays consistent within one iteration. Only circuits with
+ * charge-carrying non-native devices (MOS, BJT, JFET, ...) take it; native decks are bit-identical. PSS_NO_HIDDEN=1 disables. */
+int PSShidActive = 0;
+static int g_hid_on = 0;          /* enabled for this analysis */
+static int g_hid_nolatch = 0;     /* the current run must not update the hidden vector */
+static double *g_hid_x = NULL, *g_hid_cur = NULL;
+static int g_hid_n = 0;
+
+void
+PSShidRecordStep(CKTcircuit *ckt)
+{
+    if (g_hid_cur && ckt->CKTtime > 0.0)
+        memcpy(g_hid_cur, ckt->CKTrhs, (size_t) g_hid_n * sizeof(double));
+}
+
+static void
+pss_hid_free(void)
+{
+    if (g_hid_x) tfree(g_hid_x);
+    if (g_hid_cur) tfree(g_hid_cur);
+    g_hid_x = g_hid_cur = NULL;
+    g_hid_n = 0; g_hid_on = 0; PSShidActive = 0; g_hid_nolatch = 0;
+}
+
+static void
+pss_hid_init(CKTcircuit *ckt)
+{
+    static const char *const native[] = { "Resistor", "Capacitor", "Inductor", "Vsource", "Isource", "VCVS", "VCCS",
+        "CCVS", "CCCS", "Switch", "CSwitch", "ASRC", "mutual", "Diode", NULL };
+    int i, k, need = 0;
+    pss_hid_free();
+    if (getenv("PSS_NO_HIDDEN"))
+        return;
+    for (i = 0; i < DEVmaxnum; i++) {
+        int known = 0;
+        if (!DEVices[i] || !ckt->CKThead[i] || !DEVices[i]->DEVpublic.name)
+            continue;
+        for (k = 0; native[k]; k++)
+            if (!strcmp(DEVices[i]->DEVpublic.name, native[k])) { known = 1; break; }
+        if (!known) need = 1;
+    }
+    if (!need)
+        return;
+    g_hid_n = SMPmatSize(ckt->CKTmatrix) + 1;
+    g_hid_cur = TMALLOC(double, g_hid_n);
+    if (!g_hid_cur) { g_hid_n = 0; return; }
+    g_hid_on = 1;
+}
+
+static void
+pss_hid_restore(CKTcircuit *ckt)
+{
+    int di;
+    if (!g_hid_on || !g_hid_x || g_hid_n != SMPmatSize(ckt->CKTmatrix) + 1)
+        return;
+    memcpy(ckt->CKTrhs, g_hid_x, (size_t) g_hid_n * sizeof(double));
+    for (di = 0; di < DEVmaxnum; di++) {
+        const char *dn;
+        if (!DEVices[di] || !DEVices[di]->DEVsetic || !ckt->CKThead[di])
+            continue;
+        dn = DEVices[di]->DEVpublic.name;
+        if (dn && (!strcmp(dn, "Capacitor") || !strcmp(dn, "Inductor")))
+            continue;
+        DEVices[di]->DEVsetic(ckt->CKThead[di], ckt);
+    }
+}
+
+static void
+pss_hid_latch(void)
+{
+    if (!g_hid_on || g_hid_nolatch || !g_hid_cur)
+        return;
+    if (!g_hid_x) g_hid_x = TMALLOC(double, g_hid_n);
+    if (g_hid_x) memcpy(g_hid_x, g_hid_cur, (size_t) g_hid_n * sizeof(double));
+}
+
 static int
 pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
 {
@@ -361,7 +443,11 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
 
     PSSeventLocateActive = (getenv("PSS_NO_EVENT_LOCATE") == NULL) && g_pss_lag_enabled && !PSSsensActive;
     PSSswLagActive = PSSeventLocateActive;
+    pss_hid_restore(ckt);
+    PSShidActive = g_hid_on;
     err = DCtran(ckt, 1);   /* restart = 1: fresh run from t=0 */
+    PSShidActive = 0;
+    if (!err) pss_hid_latch();
     PSSeventLocateActive = 0;
     PSSswLagActive = 0;
 
@@ -905,7 +991,9 @@ pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
         PSSbreakInstallActive = force;
     }
 
+    g_hid_nolatch = !record;
     err = pss_run_period(ckt, T, jobname);
+    g_hid_nolatch = 0;
 
     PSSbreakRecordActive  = 0;
     PSSbreakInstallActive = 0;
@@ -4316,6 +4404,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * own header comment for why (the pss_r4_d55_unstable.cir red-proof
      * regression an ungated version of this fix caused). */
     g_pss_has_switch = pss_ckt_has_switch(ckt);
+    pss_hid_init(ckt);   /* card #546 */
     g_pss_loose_reltol = g_pss_has_switch ? save_reltol : 0.0;
     memset(&floq, 0, sizeof floq);
 
@@ -5339,6 +5428,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     err = OK;
 
  shoot_cleanup:
+    pss_hid_free();   /* card #546 */
     ckt->CKTreltol  = save_reltol;
     ckt->CKTabstol  = save_abstol;
     ckt->CKTvoltTol = save_volttol;

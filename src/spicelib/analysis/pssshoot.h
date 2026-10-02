@@ -103,6 +103,8 @@ void PSSsensRecordStep(CKTcircuit *ckt);    /* called right after CKTaccept(), s
  * comment. ---- */
 
 extern int PSSrippleRecordActive;
+extern int PSShidActive;           /* card #546 */
+void PSShidRecordStep(CKTcircuit *ckt);
 
 void PSSrippleRecordStep(CKTcircuit *ckt);   /* called right after CKTaccept(), same site as the hooks above */
 
