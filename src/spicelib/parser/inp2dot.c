@@ -1361,6 +1361,11 @@ dot_pac(char *line, void *ckt, INPtables *tab, struct card *current,
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
                 GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
+            } else if (strcmp(word, "pacreltol") == 0) {
+                /* card #546: recording-pass reltol of the td analyses */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_REAL, tab);
+                GCA(INPapName, (ckt, which, foo, "pacreltol", parm));
             } else if (strcmp(word, "trigger") == 0) {
                 /* card #489 SECOND pass (plan T6.2, task 5): a `.pac`
                  * card's OWN `.pss` pass may be free-running (trigger=)
@@ -1523,6 +1528,11 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
             tfree(word);
             parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
             GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
+        } else if (strcmp(word, "pacreltol") == 0) {
+            /* card #546: recording-pass reltol of the td analyses */
+            tfree(word);
+            parm = INPgetValue(ckt, &line, IF_REAL, tab);
+            GCA(INPapName, (ckt, which, foo, "pacreltol", parm));
         } else if (strcmp(word, "trigger") == 0) {
             /* card #489 SECOND pass (plan T6.2, task 5): see dot_pac()'s
              * identical branch. */
@@ -1774,6 +1784,11 @@ dot_pnoise(char *line, void *ckt, INPtables *tab, struct card *current,
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
                 GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
+            } else if (strcmp(word, "pacreltol") == 0) {
+                /* card #546: recording-pass reltol of the td analyses */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_REAL, tab);
+                GCA(INPapName, (ckt, which, foo, "pacreltol", parm));
             } else {
                 fprintf(stderr, "Error: unknown trailing token '%s' on .pnoise - ignored\n", word);
                 tfree(word);
@@ -1921,6 +1936,11 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
                 GCA(INPapName, (ckt, which, foo, "pacpoints", parm));
+            } else if (strcmp(word, "pacreltol") == 0) {
+                /* card #546: recording-pass reltol of the td analyses */
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_REAL, tab);
+                GCA(INPapName, (ckt, which, foo, "pacreltol", parm));
             } else if (strcmp(word, "sources") == 0) {
                 /* card #499: sources=all | sources=<Vname|Iname>
                  * (repeatable). INPgetNetTok (not INPgetTok), same

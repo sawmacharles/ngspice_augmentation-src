@@ -165,6 +165,9 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
     case PAC_RECPOINTS:
         job->PACrecordPoints = value->iValue;
         break;
+    case PAC_RECRELTOL:   /* card #546 */
+        job->PACrecordReltol = value->rValue;
+        break;
 
     /* card #489: free-running (autonomous) shooting trigger. */
     case TRIG_NODE:
@@ -231,6 +234,7 @@ static IFparm PSSparms[] = {
     { "solver",       PAC_SOLVER,	IF_SET|IF_STRING,	"PAC solver: fd (default, frequency-domain) or td (card #465, time-domain shooting-based)" },
     { "pstb",         PSTB_DO,		IF_SET|IF_INTEGER,	"run a .pstb periodic loop-gain sweep (card #465)" },
     { "pstb_probe",   PSTB_PROBE,	IF_SET|IF_STRING,	"pstb probe V-source instance name" },
+    { "pacreltol",    PAC_RECRELTOL,	IF_SET|IF_REAL,	"card #546: PAC/PSTB recording-pass reltol (0/unset = the deck's reltol)" },
     { "pacpoints",    PAC_RECPOINTS,	IF_SET|IF_INTEGER,	"card #465: PAC/PSTB recording-pass time points per period (0/unset = deprecated PAC_RECORD_POINTS env var, else PSS's own points=)" },
     { "trigger",      TRIG_NODE,	IF_SET|IF_STRING,	"card #489: free-running shooting Poincare-section trigger node (given = selects PSSshootFreerun)" },
     { "trigval",      TRIG_VAL,	IF_SET|IF_REAL,		"card #489: trigger threshold voltage (default 0.5)" },

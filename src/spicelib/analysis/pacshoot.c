@@ -473,7 +473,15 @@ pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
         }
     }
     PSSeventLocateActive = PSSswLagActive = PSSshootLagEnabled();
-    err = DCtran(ckt, 1);
+    {
+        double save_reltol = ckt->CKTreltol;
+        if (job->PACrecordReltol > 0.0)
+            ckt->CKTreltol = job->PACrecordReltol;
+        else if (getenv("PAC_RECORD_RELTOL") && atof(getenv("PAC_RECORD_RELTOL")) > 0.0)
+            ckt->CKTreltol = atof(getenv("PAC_RECORD_RELTOL"));   /* card #546: env form, tests */
+        err = DCtran(ckt, 1);
+        ckt->CKTreltol = save_reltol;
+    }
     PSSeventLocateActive = PSSswLagActive = 0;
 
     if (localjob.TRANplot)

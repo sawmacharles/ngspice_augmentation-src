@@ -164,6 +164,10 @@ typedef struct {
      * behaviour to before this field existed). See pacshoot.c's
      * pac_run_period() for the resolution order. */
     long int PACrecordPoints;
+    /* card #546: `pacreltol=r` on `.pac`/`.pstb`: RELTOL of the td recording passes only (0 = unset: the deck's reltol, byte-identical to
+     * before). The linearisation of the base trajectory is limited by the step grid its LTE control picks (R7 loop gain: +0.09 dB at reltol 1e-4,
+     * +0.017 dB at 1e-7) while the PSS orbit itself is already converged at the deck's reltol. */
+    double PACrecordReltol;
 
     /* card #489 (plan T6.2): free-running (autonomous) shooting. A
      * `.pss ... trigger=<node> [trigval=<v>] [trigdir=rise|fall]
@@ -245,6 +249,7 @@ enum {
     PSTB_DO,
     PSTB_PROBE,
     PAC_RECPOINTS,
+    PAC_RECRELTOL,
     TRIG_NODE,
     TRIG_VAL,
     TRIG_DIR,
