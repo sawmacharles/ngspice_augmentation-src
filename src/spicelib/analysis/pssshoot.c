@@ -352,6 +352,11 @@ static int g_hid_on = 0;          /* enabled for this analysis */
 static int g_hid_nolatch = 0;     /* the current run must not update the hidden vector */
 static double *g_hid_x = NULL, *g_hid_cur = NULL;
 static int g_hid_n = 0;
+/* card #549: free-running orbits. The hidden vector belongs to the state at the TRIGGER crossing (the Poincare section), so the trigger
+ * probe keeps the full node vector at the two accepted steps that bracket the crossing (g_hid_{prev,lo,hi}, same call site as the native
+ * state snapshots) and interpolates it with the same weight as the native states (g_hid_T); callers latch it explicitly. */
+static double *g_hid_prev = NULL, *g_hid_lo = NULL, *g_hid_hi = NULL, *g_hid_T = NULL;
+static int g_hid_T_ok = 0;
 
 void
 PSShidRecordStep(CKTcircuit *ckt)
@@ -365,8 +370,25 @@ pss_hid_free(void)
 {
     if (g_hid_x) tfree(g_hid_x);
     if (g_hid_cur) tfree(g_hid_cur);
+    if (g_hid_prev) tfree(g_hid_prev);
+    if (g_hid_lo) tfree(g_hid_lo);
+    if (g_hid_hi) tfree(g_hid_hi);
+    if (g_hid_T) tfree(g_hid_T);
+    g_hid_prev = g_hid_lo = g_hid_hi = g_hid_T = NULL;
+    g_hid_T_ok = 0;
     g_hid_x = g_hid_cur = NULL;
     g_hid_n = 0; g_hid_on = 0; PSShidActive = 0; g_hid_nolatch = 0;
+}
+
+/* card #549: does any diode model of device type index i carry charge storage (junction cap, transit time, sidewall cap)? */
+static int
+pss_diode_charged(CKTcircuit *ckt, int i)
+{
+    DIOmodel *dm;
+    for (dm = (DIOmodel *) ckt->CKThead[i]; dm; dm = DIOnextModel(dm))
+        if (dm->DIOjunctionCap != 0.0 || dm->DIOtransitTime != 0.0 || dm->DIOjunctionSWCap != 0.0)
+            return 1;
+    return 0;
 }
 
 static void
@@ -384,6 +406,17 @@ pss_hid_init(CKTcircuit *ckt)
             continue;
         for (k = 0; native[k]; k++)
             if (!strcmp(DEVices[i]->DEVpublic.name, native[k])) { known = 1; break; }
+        /* card #549: a diode with charge (cjo, cjsw or tt) is a charge-carrying device like a MOSFET and takes the continuation
+         * (R3d/R4d with a charged diode: compensator-node orbit error 3.2 % / 0.11 % of ripple on the old restart, 0.03 % / 0.02 %
+         * with it); a diode WITHOUT charge carries no hidden state and keeps the old restart bit for bit (there the hidden-vector
+         * orbit is no better, and the native .pac recording pass, which restarts from native states, then no longer closes the
+         * orbit: R4d line2out +0.24 dB).  PSS_HID_DIODE=1 forces it for every diode deck (experiment), PSS_HID_NODIODE=1 never. */
+        if (known && !strcmp(DEVices[i]->DEVpublic.name, "Diode")) {
+            if (getenv("PSS_HID_DIODE"))
+                known = 0;
+            else if (!getenv("PSS_HID_NODIODE") && pss_diode_charged(ckt, i))
+                known = 0;
+        }
         if (!known) need = 1;
     }
     if (!need)
@@ -419,6 +452,17 @@ pss_hid_latch(void)
         return;
     if (!g_hid_x) g_hid_x = TMALLOC(double, g_hid_n);
     if (g_hid_x) memcpy(g_hid_x, g_hid_cur, (size_t) g_hid_n * sizeof(double));
+}
+
+/* card #549: the hidden vector at the trigger crossing found by the last pss_run_until_trigger() becomes the hidden state of the
+ * section point (the next trigger runs restart from it). No-op without hidden state or when that run did not interpolate one. */
+static void
+pss_hid_latch_T(void)
+{
+    if (!g_hid_on || !g_hid_T_ok || !g_hid_T)
+        return;
+    if (!g_hid_x) g_hid_x = TMALLOC(double, g_hid_n);
+    if (g_hid_x) memcpy(g_hid_x, g_hid_T, (size_t) g_hid_n * sizeof(double));
 }
 
 static int
@@ -5617,6 +5661,13 @@ pss_trig_reset(PSSstateMap *map, int node_num, double val, int dir)
     if (!g_trig_prev_x) g_trig_prev_x = TMALLOC(double, map->n);
     if (!g_trig_x_lo)   g_trig_x_lo   = TMALLOC(double, map->n);
     if (!g_trig_x_hi)   g_trig_x_hi   = TMALLOC(double, map->n);
+    if (g_hid_on && g_hid_n > 0) {   /* card #549 */
+        if (!g_hid_prev) g_hid_prev = TMALLOC(double, g_hid_n);
+        if (!g_hid_lo)   g_hid_lo   = TMALLOC(double, g_hid_n);
+        if (!g_hid_hi)   g_hid_hi   = TMALLOC(double, g_hid_n);
+        if (!g_hid_T)    g_hid_T    = TMALLOC(double, g_hid_n);
+    }
+    g_hid_T_ok = 0;
 }
 
 static void
@@ -5657,6 +5708,10 @@ PSStrigRecordStep(CKTcircuit *ckt)
                 g_trig_x_lo[k] = g_trig_prev_x[k];
                 g_trig_x_hi[k] = pss_state_value(&g_trig_map->refs[k], ckt);
             }
+            if (g_hid_prev && g_hid_lo && g_hid_hi && g_hid_n == SMPmatSize(ckt->CKTmatrix) + 1) {   /* card #549 */
+                memcpy(g_hid_lo, g_hid_prev, (size_t) g_hid_n * sizeof(double));
+                memcpy(g_hid_hi, ckt->CKTrhsOld, (size_t) g_hid_n * sizeof(double));
+            }
             g_trig_found = 1;
             return;   /* freeze: first qualifying crossing only */
         }
@@ -5666,6 +5721,8 @@ PSStrigRecordStep(CKTcircuit *ckt)
     g_trig_prev_v = v;
     for (k = 0; k < g_trig_map->n; k++)
         g_trig_prev_x[k] = pss_state_value(&g_trig_map->refs[k], ckt);
+    if (g_hid_prev && g_hid_n == SMPmatSize(ckt->CKTmatrix) + 1)   /* card #549 */
+        memcpy(g_hid_prev, ckt->CKTrhsOld, (size_t) g_hid_n * sizeof(double));
     g_trig_have_prev = 1;
 }
 
@@ -5736,8 +5793,35 @@ pss_trig_hidden_state(CKTcircuit *ckt)
  * function's own comment and docs/pss-pac.md's free-running section for
  * the derivation). No new run is needed for this: g_trig_prev_x is a
  * sample the SAME probe run already took. */
+static int pss_run_until_trigger_core(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
+                       int node_num, double trigval, int dir,
+                       double max_period, double *x_T, double *T_measured,
+                       double *x_prev_out, double *t_prev_out);
+
+/* card #549: free-running orbits carry the hidden state. Every trigger run restarts from the native states x0 AND the full node
+ * vector of the section point (g_hid_x, restored and device ics re-derived by pss_run_period()); it never latches by itself
+ * (a run's end is not the section); the hidden vector at the interpolated crossing is left in g_hid_T for pss_hid_latch_T().
+ * Only on the interpolating path (pss_trig_hidden_state): the restart-refine path restarts from the bracket's native states and
+ * cannot carry a hidden vector. PSS_NO_HIDDEN=1 / PSS_TRIG_RESTART_REFINE=1 switch it off (old behaviour). */
 static int
 pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
+                       int node_num, double trigval, int dir,
+                       double max_period, double *x_T, double *T_measured,
+                       double *x_prev_out, double *t_prev_out)
+{
+    int err, save_on = g_hid_on, save_nl = g_hid_nolatch;
+    if (g_hid_on && !pss_trig_hidden_state(ckt))
+        g_hid_on = 0;
+    g_hid_nolatch = 1;
+    g_hid_T_ok = 0;
+    err = pss_run_until_trigger_core(ckt, map, x0, node_num, trigval, dir, max_period, x_T, T_measured, x_prev_out, t_prev_out);
+    g_hid_nolatch = save_nl;
+    g_hid_on = save_on;
+    return err;
+}
+
+static int
+pss_run_until_trigger_core(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
                        int node_num, double trigval, int dir,
                        double max_period, double *x_T, double *T_measured,
                        double *x_prev_out, double *t_prev_out)
@@ -5771,6 +5855,11 @@ pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
         for (k = 0; k < map->n; k++)
             x_T[k] = g_trig_x_lo[k] + th * (g_trig_x_hi[k] - g_trig_x_lo[k]);
         *T_measured = g_trig_t_lo + th * (g_trig_t_hi - g_trig_t_lo);
+        if (g_hid_on && g_hid_T && g_hid_lo && g_hid_hi) {   /* card #549 */
+            for (k = 0; k < g_hid_n; k++)
+                g_hid_T[k] = g_hid_lo[k] + th * (g_hid_hi[k] - g_hid_lo[k]);
+            g_hid_T_ok = 1;
+        }
         if (x_prev_out && t_prev_out && g_trig_have_prev) {
             for (k = 0; k < map->n; k++)
                 x_prev_out[k] = g_trig_prev_x[k];
@@ -6034,6 +6123,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         return E_UNSUPP;
     }
     n = map.n;
+    pss_hid_init(ckt);   /* card #549: hidden-state continuation of the trigger runs (transistor-level circuits) */
 
     /* card #538: matrix-free free-running shooting. The Newton unknowns are the n states at the trigger
      * crossing (the Poincare section); the period is not an extra unknown here, it is the return time of the
@@ -6157,6 +6247,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         err = pss_run_until_trigger(ckt, &map, x0, node_num, trigval, dir,
                                      max_period, x1, &Tmeas, NULL, NULL);
         PSSrippleRecordActive = 0;
+        if (!err) pss_hid_latch_T();   /* card #549: the hidden state of the next section point */
         if (err) {
             fprintf(stderr, "PSS-FREERUN: no trigger crossing found within "
                     "MAX_PERIOD=%.6g s (10x the fguess estimate) at Newton "
@@ -6279,6 +6370,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                     }
                 }
                 if ((ok2 && newres < residual * 1.5) || bt == 9) {
+                    if (ok2) pss_hid_latch_T();   /* card #549 */
                     for (k = 0; k < n; k++) x0[k] = xtrial[k];
                     accepted = 1;
                 }
@@ -6495,7 +6587,9 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
      * mechanism as the driven engine's own emission), not another
      * trigger-relocation round trip. */
     pss_state_set_ic(&map, x0);
+    g_hid_nolatch = 1;   /* card #549: the emission run starts from the section's hidden vector and must not overwrite it */
     err = pss_run_period(ckt, T, "Time Domain Periodic Steady State Analysis (free-running)");
+    g_hid_nolatch = 0;
     if (err) {
         fprintf(stderr, "PSS-FREERUN: WARNING -- converged, but the final "
                 "trajectory output run failed (ngspice error %d); the "
@@ -6685,6 +6779,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                         polish_ok = 0;
                         break;
                     }
+                    pss_hid_latch_T();   /* card #549 */
                     for (k = 0; k < n; k++) x0_polished[k] = xnext[k];
                     T_pac = Tnext;
                     tfree(xnext);
@@ -6912,6 +7007,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     err = OK;
 
  fr_cleanup:
+    pss_hid_free();   /* card #549 */
     ckt->CKTreltol  = save_reltol;
     ckt->CKTabstol  = save_abstol;
     ckt->CKTvoltTol = save_volttol;
