@@ -1233,12 +1233,12 @@ pss_xs_periodicity(CKTcircuit *ckt, PSSstateMap *map, double T, const double *x0
                 if (d / sc > drift) { drift = d / sc; worst_v = d; }
             }
         }
-        if (ndig == 0 && drift <= 1e-5)
+        if (ndig == 0 && drift <= 1e-4)
             break;
         if (ndig > 0 && nrun >= 3)   /* a digital limit cycle does not go away by iterating */
             break;
     }
-    nrun++;
+    if (nrun < 12) nrun++;
     if (hx) tfree(hx);
     g_xs_ndig_mismatch = ndig;
     g_xs_vec_diff = drift;
