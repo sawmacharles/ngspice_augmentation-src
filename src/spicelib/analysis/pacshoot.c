@@ -543,6 +543,14 @@ typedef struct { int n, cap; int *ri, *ci; double *v; } PACtrip;
 
 static int g_pac_gen = 0;                        /* generic recursion active for this pass */
 static PACc *g_pac_Qprev = NULL, *g_pac_Qnew = NULL;   /* [(neq+1)*M] */
+/* card #549: method=gear on the generic recursion.  The charge derivative of a BDF/Gear step of order p is
+ * dq/dt|k = ag[0] Q_k + sum_{j=1..p} ag[j] Q_{k-j}, so  J(ag0) y_k = -sum_j ag[j] Q_{k-j}  (+ forcing): no derivative history T,
+ * the charge history itself is kept (Q_{k-1} = g_pac_Qprev, Q_{k-2..k-6} = g_pac_Qh[2..6]).  The order of the step is the highest
+ * nonzero ag[j] of the step just accepted (ckt->CKTorder is not trustworthy at this call site, as for trap).  Order 1 is
+ * backward Euler, ag[1] = -ag[0]: the same formula.  Trap keeps its T recursion bit for bit. */
+#define PAC_GEAR_MAXORD 6
+static int g_pac_gear = 0;
+static PACc *g_pac_Qh[PAC_GEAR_MAXORD + 1];   /* [2..6] allocated when gear */
 static PACtrip g_pac_C = { 0, 0, NULL, NULL, NULL };   /* C_k of the current step */
 static PACtrip g_pac_J1 = { 0, 0, NULL, NULL, NULL }, g_pac_J2 = { 0, 0, NULL, NULL, NULL },
                g_pac_J3 = { 0, 0, NULL, NULL, NULL };
@@ -759,6 +767,8 @@ pac_free(void)
     if (g_pac_Qprev) tfree(g_pac_Qprev);
     if (g_pac_Qnew) tfree(g_pac_Qnew);
     g_pac_Qprev = g_pac_Qnew = NULL;
+    { int jj; for (jj = 2; jj <= PAC_GEAR_MAXORD; jj++) { if (g_pac_Qh[jj]) tfree(g_pac_Qh[jj]); g_pac_Qh[jj] = NULL; } }
+    g_pac_gear = 0;
     g_pac_gen = 0;
     g_pac_Cprev = g_pac_Cnew = NULL;
     g_pac_Tprev = g_pac_Tnew = NULL;
@@ -812,6 +822,14 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
             if (g_pac_Qnew)  memset(g_pac_Qnew, 0, (size_t) (neq + 1) * M * sizeof(PACc));
             if (g_pac_Tprev) memset(g_pac_Tprev, 0, tsz * M * sizeof(PACc));
             if (g_pac_Tnew)  memset(g_pac_Tnew, 0, tsz * M * sizeof(PACc));
+            g_pac_gear = (ckt->CKTintegrateMethod == GEAR);   /* card #549 */
+            if (g_pac_gear) {
+                int jj;
+                for (jj = 2; jj <= PAC_GEAR_MAXORD; jj++) {
+                    g_pac_Qh[jj] = TMALLOC(PACc, (size_t) (neq + 1) * M);
+                    if (g_pac_Qh[jj]) memset(g_pac_Qh[jj], 0, (size_t) (neq + 1) * M * sizeof(PACc));
+                }
+            }
         }
     }
     g_pac_omega = TMALLOC(double, M);
@@ -829,6 +847,11 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
     if (g_pac_gen && (!g_pac_Qprev || !g_pac_Qnew)) {
         pac_free();
         return 1;
+    }
+    if (g_pac_gear) {
+        int jj;
+        for (jj = 2; jj <= PAC_GEAR_MAXORD; jj++)
+            if (!g_pac_Qh[jj]) { pac_free(); return 1; }
     }
     if (!g_pac_Cprev || !g_pac_Cnew || !g_pac_Tprev || !g_pac_Tnew || !g_pac_omega ||
         !g_pac_useforce || !g_pac_rhs_re || !g_pac_rhs_im || !g_pac_scratch ||
@@ -1321,8 +1344,70 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
     if (first && getenv("PAC_GEN_TRACE"))
         fprintf(stderr, "PAC-TD: generic recursion, first step: nnz(C)=%d nnz(J)=%d M=%d ag0=%g\n",
                 g_pac_C.n, g_pac_J1.n, M, ag0);
-    if (first)   /* Q_0 = C_1 y_0 (C_0 := C_1, see the design note), T_0 = 0 (first step is order 1) */
+    if (first) {   /* Q_0 = C_1 y_0 (C_0 := C_1, see the design note), T_0 = 0 (first step is order 1) */
         pac_C_mul(&g_pac_C, g_pac_Cprev, g_pac_Qprev, neq, M);
+        if (g_pac_gear) {
+            int jj;
+            for (jj = 2; jj <= PAC_GEAR_MAXORD; jj++)
+                memcpy(g_pac_Qh[jj], g_pac_Qprev, (size_t) (neq + 1) * M * sizeof(PACc));
+        }
+    }
+    if (g_pac_gear) {
+        int pord = 0, jj;
+        if (n_salt > 0) {
+            fprintf(stderr, "PAC-TD: REFUSED -- an ideal-switch (saltation) event with method=gear: the event's state jump is "
+                    "derived for the trapezoidal derivative history only (card #549); use method=trap (default).\n");
+            return 1;
+        }
+        for (jj = 1; jj <= PAC_GEAR_MAXORD; jj++)
+            if (ckt->CKTag[jj] != 0.0) pord = jj;
+        if (pord < 1) pord = 1;
+        {   /* red-proof hook (tests/test_pac_charge.py check_gear): PAC_GEAR_TEST_ORD1=1 drops every history term beyond Q_{k-1} */
+            static int ord1 = -1;
+            if (ord1 < 0) ord1 = getenv("PAC_GEAR_TEST_ORD1") ? 1 : 0;
+            if (ord1) pord = 1;
+        }
+        for (m = 0; m < M; m++) {
+            memset(g_pac_rhs_re, 0, (size_t) (neq + 1) * sizeof(double));
+            memset(g_pac_rhs_im, 0, (size_t) (neq + 1) * sizeof(double));
+            for (row = 1; row <= neq; row++) {
+                double sr = 0.0, si = 0.0;
+                for (jj = 1; jj <= pord; jj++) {
+                    const PACc *Qj = (jj == 1 ? g_pac_Qprev : g_pac_Qh[jj]) + (size_t) row * M + m;
+                    sr -= ckt->CKTag[jj] * Qj->re;
+                    si -= ckt->CKTag[jj] * Qj->im;
+                }
+                g_pac_rhs_re[row] = sr;
+                g_pac_rhs_im[row] = si;
+            }
+            if (g_pac_useforce[m] && g_pac_br && g_pac_bi) {
+                double w = g_pac_omega[m];
+                double ph = w * t_new;
+                double c = cos(ph), s = sin(ph);
+                for (row = 1; row <= neq; row++) {
+                    double br = g_pac_br[row], bi = g_pac_bi[row];
+                    if (br == 0.0 && bi == 0.0) continue;
+                    g_pac_rhs_re[row] += br * c - bi * s;
+                    g_pac_rhs_im[row] += br * s + bi * c;
+                }
+            }
+            SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
+            SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
+            for (row = 1; row <= neq; row++) {
+                PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
+                pac_set(g_pac_Cnew, row, M, m, v);
+            }
+        }
+        pac_C_mul(&g_pac_C, g_pac_Cnew, g_pac_Qnew, neq, M);
+        {   /* shift the charge history: Q_{k-j} <- Q_{k-j+1}, Q_{k-1} <- Q_k */
+            PACc *oldest = g_pac_Qh[PAC_GEAR_MAXORD];
+            for (jj = PAC_GEAR_MAXORD; jj > 2; jj--) g_pac_Qh[jj] = g_pac_Qh[jj - 1];
+            g_pac_Qh[2] = g_pac_Qprev;
+            g_pac_Qprev = g_pac_Qnew;
+            g_pac_Qnew = oldest;
+        }
+        return 0;
+    }
 
     for (m = 0; m < M; m++) {
         memset(g_pac_rhs_re, 0, (size_t) (neq + 1) * sizeof(double));
@@ -1473,7 +1558,14 @@ PSSpacRecordStep(CKTcircuit *ckt)
      * seed value. */
     is_first_call = (g_pac_tprev == 0.0);
 
-    if (ckt->CKTintegrateMethod != TRAPEZOIDAL || ckt->CKTorder < 1 || ckt->CKTorder > 2) {
+    if (ckt->CKTintegrateMethod == GEAR && g_pac_gear && g_pac_gen && !g_pac_traj_active) {
+        /* card #549: handled by the generic recursion (charge history); the trap-order check below does not apply */
+    } else if (ckt->CKTintegrateMethod == GEAR && g_pac_traj_active) {
+        fprintf(stderr, "PAC-TD: method=gear is not supported by the adjoint/noise recursion (.pnoise, .pxf adjoint=1: the "
+                "transposed sweep replays the trapezoidal derivative history); use method=trap (default). Abandoning this pass.\n");
+        g_pac_failed = 1;
+        return;
+    } else if (ckt->CKTintegrateMethod != TRAPEZOIDAL || ckt->CKTorder < 1 || ckt->CKTorder > 2) {
         fprintf(stderr, "PAC-TD: analytic propagation only implements "
                 "TRAPEZOIDAL orders 1-2 (got method=%d order=%d at t=%g); "
                 "abandoning this pass.\n", ckt->CKTintegrateMethod, ckt->CKTorder, ckt->CKTtime);
@@ -2259,7 +2351,7 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
                     int trig_node_num, const char *who)
 {
     const char *delay = NULL;
-    int has, err, neq, i, ns, npass;
+    int has, err, neq, i, ns, npass, force_gen;
     static int warned_native = 0;
     double tprep0 = SPfrontEnd->IFseconds();
 
@@ -2287,10 +2379,12 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
             return E_UNSUPP;
         }
     }
-    if (!has && !getenv("PAC_FORCE_GENERIC"))
+    /* card #549: method=gear is carried by the generic (charge-history) recursion only, so it is taken for native decks too */
+    force_gen = getenv("PAC_FORCE_GENERIC") != NULL || ckt->CKTintegrateMethod == GEAR;
+    if (!has && !force_gen)
         return 0;
     neq = SMPmatSize(ckt->CKTmatrix);
-    if (!getenv("PAC_FORCE_GENERIC") && !g_pp_has_mutual) {
+    if (!force_gen && !g_pp_has_mutual) {
         /* the only non-native devices may carry no charge at all: look (one cheap period) before leaving the
          * legacy native path, which is bit-identical to before and supports saltation / free-running */
         /* The detection period must leave no trace on the legacy flow that follows (its first recorded period starts
