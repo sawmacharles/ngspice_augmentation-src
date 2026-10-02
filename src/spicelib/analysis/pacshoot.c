@@ -612,7 +612,13 @@ typedef struct {
     int nJ, nC;
     int *Jri, *Jci; double *Jv;
     int *Cri, *Cci; double *Cv;
+    /* card #544 (noise only): the converged CKTstate0 of the forward pass at this step.  DEVnoise of DIOnoise/BJTnoise/MOS3noise/
+     * BSIM4noise reads the operating point (diode and BJT currents, vds/vgs) from CKTstate0, which the backward sweep must
+     * therefore restore to the forward value at x_k (an iterated warm load from the stale end-of-period state does not always
+     * converge through the junction limiting: a few steps then carried currents 10^6 too large). */
+    double *st0; int nst0;
 } PACtrajStep;
+static int g_pac_traj_keep_st0 = 0;
 static double g_pac_traj_bytes = 0.0;
 
 static int g_pac_traj_active = 0;     /* PSSpacRecordStep() appends when set */
@@ -620,6 +626,17 @@ static PACtrajStep *g_pac_traj = NULL;
 static int g_pac_traj_n = 0, g_pac_traj_cap = 0;
 static int g_pac_traj_neq = 0;        /* neq at record time, for x[] sizing */
 static int g_pac_traj_failed = 0;
+
+/* card #544: one line on what the stored trajectory costs (PAC_GEN_TRACE=1 or PAC_TRAJ_REPORT=1). */
+static void
+pac_traj_report(const char *who)
+{
+    if (!getenv("PAC_GEN_TRACE") && !getenv("PAC_TRAJ_REPORT"))
+        return;
+    fprintf(stderr, "%s: stored trajectory %d steps, J_k/C_k %.1f MB + x_k %.1f MB (cap %s MB)\n", who, g_pac_traj_n,
+            g_pac_traj_bytes / 1048576.0, (double) g_pac_traj_n * (double) (g_pac_traj_neq + 1) * 8.0 / 1048576.0,
+            getenv("PAC_TRAJ_MAX_MB") ? getenv("PAC_TRAJ_MAX_MB") : "3000");
+}
 
 static void
 pac_traj_free(void)
@@ -634,6 +651,7 @@ pac_traj_free(void)
             if (g_pac_traj[i].Cri) tfree(g_pac_traj[i].Cri);
             if (g_pac_traj[i].Cci) tfree(g_pac_traj[i].Cci);
             if (g_pac_traj[i].Cv) tfree(g_pac_traj[i].Cv);
+            if (g_pac_traj[i].st0) tfree(g_pac_traj[i].st0);
         }
         tfree(g_pac_traj);
     }
@@ -684,6 +702,16 @@ pac_traj_append(CKTcircuit *ckt, double t, double h, double ag0, double ag1, int
     g_pac_traj[g_pac_traj_n].Jv = NULL;
     g_pac_traj[g_pac_traj_n].Cri = g_pac_traj[g_pac_traj_n].Cci = NULL;
     g_pac_traj[g_pac_traj_n].Cv = NULL;
+    g_pac_traj[g_pac_traj_n].st0 = NULL;
+    g_pac_traj[g_pac_traj_n].nst0 = 0;
+    if (g_pac_traj_keep_st0 && ckt->CKTnumStates > 0) {
+        double *sc = TMALLOC(double, ckt->CKTnumStates);
+        if (!sc) { g_pac_traj_failed = 1; return; }
+        memcpy(sc, ckt->CKTstate0, (size_t) ckt->CKTnumStates * sizeof(double));
+        g_pac_traj[g_pac_traj_n].st0 = sc;
+        g_pac_traj[g_pac_traj_n].nst0 = ckt->CKTnumStates;
+        g_pac_traj_bytes += (double) ckt->CKTnumStates * 8.0;
+    }
     g_pac_traj_n++;
 }
 
@@ -2690,8 +2718,55 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
  * analogue of pac_refactor_at_accepted(), but standalone (no live
  * transient to protect -- caller saves/restores the handful of ckt-global
  * scalars this touches, see pac_engine_run_adjoint()). */
+/* card #544: operating point of every device at the accepted point x_k of a stored step, for the noise evaluation
+ * (DEVnoise reads instance values -- gm, gds, ... -- and CKTstate0: diode/BJT currents, vds/vgs).  The backward sweep never
+ * advances the device state, so this restores the converged forward CKTstate0 (when it was stored) and loads once at x_k with
+ * the integration coefficients ZERO: the capacitive (displacement) currents the transient load adds to the junction current
+ * state (NIintegrate with stale CKTstate1 history gave 10^6-fold currents on the first steps and ~1 % elsewhere) vanish, which is
+ * the DC junction current plain `.noise` uses for the shot/flicker density.  CKTrhs/CKTrhsOld/CKTag/mode are restored. */
 static int
-pac_adj_refactor_at(CKTcircuit *ckt, const PACtrajStep *step)
+pac_noise_warm_load(CKTcircuit *ckt, const PACtrajStep *step)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix), it, err = 0;
+    double *save_rhs = TMALLOC(double, neq + 1), *save_rhsold = TMALLOC(double, neq + 1);
+    double sag0 = ckt->CKTag[0], sag1 = ckt->CKTag[1];
+    long save_mode = ckt->CKTmode;
+    int save_bypass = ckt->CKTbypass, save_noncon = ckt->CKTnoncon;
+    if (getenv("PAC_NOISE_STALE_STATE")) {   /* test only (red proof): the pre-#544 behaviour, device values of whatever load ran last */
+        if (save_rhs) tfree(save_rhs);
+        if (save_rhsold) tfree(save_rhsold);
+        return 0;
+    }
+    if (!save_rhs || !save_rhsold) {
+        if (save_rhs) tfree(save_rhs);
+        if (save_rhsold) tfree(save_rhsold);
+        return 1;
+    }
+    memcpy(save_rhs, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+    memcpy(ckt->CKTrhsOld, step->x, (size_t) (neq + 1) * sizeof(double));
+    if (step->st0 && step->nst0 == ckt->CKTnumStates)
+        memcpy(ckt->CKTstate0, step->st0, (size_t) step->nst0 * sizeof(double));
+    ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODETRAN | MODEINITFLOAT;
+    ckt->CKTbypass = 0;
+    ckt->CKTag[0] = 0.0; ckt->CKTag[1] = 0.0;
+    for (it = 0; it < 80 && !err; it++) {
+        ckt->CKTnoncon = 0;
+        err = CKTload(ckt);
+        if (!ckt->CKTnoncon) break;
+    }
+    ckt->CKTag[0] = sag0; ckt->CKTag[1] = sag1;
+    ckt->CKTmode = save_mode;
+    ckt->CKTbypass = save_bypass;
+    ckt->CKTnoncon = save_noncon;
+    memcpy(ckt->CKTrhs, save_rhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+    tfree(save_rhs); tfree(save_rhsold);
+    return err ? 1 : 0;
+}
+
+static int
+pac_adj_refactor_at(CKTcircuit *ckt, const PACtrajStep *step, int devparams)
 {
     int neq = SMPmatSize(ckt->CKTmatrix);
 
@@ -2700,7 +2775,8 @@ pac_adj_refactor_at(CKTcircuit *ckt, const PACtrajStep *step)
     ckt->CKTdelta = step->h;
     ckt->CKTag[0] = step->ag0;
     ckt->CKTag[1] = step->ag1;
-
+    if (devparams && step->nJ > 0 && pac_noise_warm_load(ckt, step))
+        return 1;
     if (step->nJ > 0) {      /* card #541: the forward pass's own J_k */
         if (SMPsetElements(ckt->CKTmatrix, step->nJ, step->Jri, step->Jci, step->Jv))
             return 1;
@@ -2722,14 +2798,8 @@ pac_adj_refactor_generic(CKTcircuit *ckt, const PACtrajStep *step, int devparams
     ckt->CKTdelta = step->h;
     ckt->CKTag[0] = step->ag0;
     ckt->CKTag[1] = step->ag1;
-    if (devparams) {
-        /* the noise engine's DEVnoise() reads device instance quantities (gm, ...) from the last load:
-         * run one load at x_k (limiting-warmed); the matrix is then replaced by the stored J_k below. */
-        g_pac_gen_bad = 0;
-        g_pac_gen_warm = 1;
-        if (pac_gen_loads(ckt, step->ag0, 0, 0)) { g_pac_gen_warm = 0; return 1; }
-        g_pac_gen_warm = 0;
-    }
+    if (devparams && pac_noise_warm_load(ckt, step))
+        return 1;
     if (pac_trip_fit(&g_pac_C, step->nC)) return 1;
     memcpy(g_pac_C.ri, step->Cri, (size_t) step->nC * sizeof(int));
     memcpy(g_pac_C.ci, step->Cci, (size_t) step->nC * sizeof(int));
@@ -2817,6 +2887,7 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
         g_pac_force_exact_jac = 0;
         PSSpacActive = 0;
         g_pac_traj_active = 0;   /* stop recording -- buffer itself kept */
+        pac_traj_report("PXF-TD");
 
         if (err || g_pac_failed || g_pac_traj_failed) {
             int memrefuse = (!err && !g_pac_failed && g_pac_traj_failed && map->generic);
@@ -2988,7 +3059,7 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
         double h_next = is_last ? g_pac_traj[0].h : g_pac_traj[k + 1].h;
         double ag1eff = (step->order == 2) ? step->ag1 : 0.0;
 
-        if (map->generic ? pac_adj_refactor_generic(ckt, step, 0) : pac_adj_refactor_at(ckt, step)) {
+        if (map->generic ? pac_adj_refactor_generic(ckt, step, 0) : pac_adj_refactor_at(ckt, step, 0)) {
             fprintf(stderr, "PXF-TD-ADJ: refactor failed at t=%.9g (backward step %d)\n",
                     step->t, k);
             err = PAC_ADJOINT_FAIL; goto done;
@@ -3265,18 +3336,25 @@ pac_noise_check_devices(CKTcircuit *ckt)
     extern int DIOnoise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
     extern int MOS1noise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
     extern int BSIM4noise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    /* card #544: BJT, JFET, MOS3 and BSIM3 use the same NevalSrc()/gain idiom; validated against plain .noise
+     * (tests/test_pac_charge.py check_pnoise_dev) before being admitted. */
+    extern int BJTnoise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    extern int JFETnoise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    extern int MOS3noise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
+    extern int BSIM3noise(int, int, GENmodel *, CKTcircuit *, Ndata *, double *);
     int i, bad = 0;
 
     for (i = 0; i < DEVmaxnum; i++) {
         if (!DEVices[i] || !DEVices[i]->DEVnoise || !ckt->CKThead[i])
             continue;
         if (DEVices[i]->DEVnoise == RESnoise || DEVices[i]->DEVnoise == DIOnoise ||
-            DEVices[i]->DEVnoise == MOS1noise || DEVices[i]->DEVnoise == BSIM4noise)
+            DEVices[i]->DEVnoise == MOS1noise || DEVices[i]->DEVnoise == BSIM4noise ||
+            DEVices[i]->DEVnoise == BJTnoise || DEVices[i]->DEVnoise == JFETnoise ||
+            DEVices[i]->DEVnoise == MOS3noise || DEVices[i]->DEVnoise == BSIM3noise)
             continue;
         fprintf(stderr, "PNOISE-TD: REFUSED -- device type '%s' has noise-producing "
                 "instances in this circuit but is outside this engine's v1 scope "
-                "(card #509: resistor thermal, diode shot, MOS1/BSIM4 channel "
-                "thermal+flicker only) -- refusing rather than silently omitting or "
+                "(card #509/#544: resistor, diode, BJT, JFET, MOS1/MOS3/BSIM3/BSIM4 only) -- refusing rather than silently omitting or "
                 "mis-scaling its noise contribution. See docs/pss-pac.md's .pnoise "
                 "section.\n",
                 DEVices[i]->DEVpublic.name ? DEVices[i]->DEVpublic.name : "?");
@@ -3340,6 +3418,7 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
             }
         }
         pac_state_set_ic(map, x0);
+        g_pac_traj_keep_st0 = 1;
         pac_traj_reset(neq);
         if (pac_reset(ckt, map, n, NULL, NULL, omega1, useforce1, ic0_1, 0, T)) {
             tfree(omega1); tfree(useforce1); tfree(ic0_1);
@@ -3352,6 +3431,8 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
         g_pac_force_exact_jac = 0;
         PSSpacActive = 0;
         g_pac_traj_active = 0;
+        g_pac_traj_keep_st0 = 0;
+        pac_traj_report("PNOISE-TD");
 
         if (err || g_pac_failed || g_pac_traj_failed) {
             tfree(omega1); tfree(useforce1); tfree(ic0_1);
@@ -3522,7 +3603,7 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
      * operating point works; step 0 is the cheapest one already at hand. */
     if (want_table) {
         double dummy = 0.0;
-        if (pac_adj_refactor_at(ckt, &g_pac_traj[0])) {
+        if (pac_adj_refactor_at(ckt, &g_pac_traj[0], 1)) {
             fprintf(stderr, "PNOISE-TD: naming-pass refactor failed\n");
             err = PAC_ADJOINT_FAIL; goto done;
         }
@@ -3555,7 +3636,7 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
         double h_next = is_last ? g_pac_traj[0].h : g_pac_traj[k + 1].h;
         double ag1eff = (step->order == 2) ? step->ag1 : 0.0;
 
-        if (map->generic ? pac_adj_refactor_generic(ckt, step, 1) : pac_adj_refactor_at(ckt, step)) {
+        if (map->generic ? pac_adj_refactor_generic(ckt, step, 1) : pac_adj_refactor_at(ckt, step, 1)) {
             fprintf(stderr, "PNOISE-TD: refactor failed at t=%.9g (backward step %d)\n",
                     step->t, k);
             err = PAC_ADJOINT_FAIL; goto done;
@@ -3826,6 +3907,7 @@ pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     err = pac_engine_run_adjoint_noise(ckt, job, &map, x0, T, freqs, nfreq, outrow,
                                         want_table, trig_idx, onoise,
                                         &gen_dens, &gen_names, &ngen);
+    g_pac_traj_keep_st0 = 0;
     t1 = SPfrontEnd->IFseconds();
 
     if (err == PAC_ADJOINT_REFUSED) {
