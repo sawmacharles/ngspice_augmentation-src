@@ -379,6 +379,7 @@ void (*PSSxsPostInitHook)(CKTcircuit *ckt) = NULL;
 static XSsnap *g_xs_snap = NULL;
 static XSsnap *g_xs_prev = NULL;   /* the snapshot a latching run started from (periodicity check) */
 static int g_xs_on = 0;
+static int g_xs_values = 1;   /* PSS_XS_NO_STATE=1: red proof, restart without the carried state */
 static CKTcircuit *g_xs_ckt = NULL;
 static int g_xs_ndig_mismatch = -1;
 static double g_xs_an_diff = -1.0;
@@ -390,7 +391,7 @@ static void
 pss_xs_post_init(CKTcircuit *ckt)
 {
     if (g_xs_on && XSsnapValid(g_xs_snap))
-        XSsnapPut(ckt, g_xs_snap);
+        XSsnapPut(ckt, g_xs_snap, g_xs_values);
 }
 #endif
 
@@ -439,6 +440,7 @@ pss_hid_init(CKTcircuit *ckt)
     g_xs_toff = 0.0;
     if (XSPICEnumInstances(ckt) > 0) {
         g_xs_on = 1;
+        g_xs_values = getenv("PSS_XS_NO_STATE") == NULL;
         g_xs_snap = XSsnapNew();
         g_xs_prev = XSsnapNew();
     }
@@ -522,13 +524,13 @@ pss_hid_latch_T(void)
 typedef struct { const char *name; int cls; } PSSxsClass;
 static const PSSxsClass g_pss_xs_classes[] = {
     { "gain", 1 }, { "summer", 1 }, { "mult", 1 }, { "divide", 1 }, { "limit", 1 }, { "climit", 1 }, { "ilimit", 1 },
-    { "pwl", 1 }, { "multi_input_pwl", 1 }, { "ota", 1 }, { "aswitch", 1 }, { "pswitch", 1 },
-    { "s_xfer", 2 }, { "int", 2 }, { "d_dt", 2 }, { "slew", 2 }, { "hyst", 2 }, { "delay", 2 }, { "oneshot", 2 },
-    { "sine", 2 }, { "square", 2 }, { "triangle", 2 }, { "capacitor", 2 }, { "inductor", 2 },
+    { "pwl", 1 }, { "aswitch", 1 }, { "pswitch", 1 },
+    { "s_xfer", 2 }, { "int", 2 }, { "d_dt", 2 }, { "slew", 2 }, { "hyst", 2 }, { "oneshot", 2 },
+    { "sine", 2 }, { "square", 2 }, { "triangle", 2 }, { "capacitoric", 2 }, { "inductoric", 2 },
     { "adc_bridge", 3 }, { "dac_bridge", 3 }, { "d_and", 3 }, { "d_nand", 3 }, { "d_or", 3 }, { "d_nor", 3 }, { "d_xor", 3 },
     { "d_xnor", 3 }, { "d_inverter", 3 }, { "d_buffer", 3 }, { "d_dff", 3 }, { "d_dlatch", 3 }, { "d_jkff", 3 }, { "d_srff", 3 },
-    { "d_srlatch", 3 }, { "d_tff", 3 }, { "d_fdiv", 3 }, { "d_state", 3 }, { "d_lut", 3 }, { "d_genlut", 3 }, { "d_pulldown", 3 },
-    { "d_pullup", 3 }, { "d_osc", 3 }, { "d_pwm", 3 }, { "d_tristate", 3 }, { "d_open_c", 3 }, { "d_open_e", 3 },
+    { "d_srlatch", 3 }, { "d_tff", 3 }, { "d_fdiv", 3 }, { "d_state", 3 }, { "d_lut", 3 }, { "d_pullup", 3 }, { "d_pulldown", 3 },
+    { "d_osc", 3 }, { "d_pwm", 3 },
     { NULL, 0 }
 };
 
@@ -555,9 +557,10 @@ PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who)
             if (!cls) {
                 fprintf(stderr, "%s: REFUSED -- XSPICE code model '%s' (instance %s) has not been validated for the periodic analyses "
                         "(hidden state / event behaviour unknown); card #551. Validated: analog gain summer mult divide limit climit ilimit "
-                        "pwl multi_input_pwl ota aswitch pswitch (orbit + small signal); s_xfer int d_dt slew hyst delay oneshot sine square "
-                        "triangle capacitor inductor and the digital/hybrid set (adc_bridge dac_bridge d_and..d_xnor d_inverter d_buffer "
-                        "d_dff d_dlatch d_jkff d_srff d_srlatch d_tff d_fdiv d_state d_lut d_genlut d_osc d_pwm ...) for the orbit only.\n",
+                        "pwl aswitch pswitch (orbit + small signal); s_xfer int d_dt slew hyst oneshot sine square triangle capacitoric "
+                        "inductoric and the digital/hybrid set (adc_bridge dac_bridge d_and d_nand d_or d_nor d_xor d_xnor d_inverter "
+                        "d_buffer d_dff d_dlatch d_jkff d_srff d_srlatch d_tff d_fdiv d_state d_lut d_pullup d_pulldown d_osc d_pwm) "
+                        "for the orbit only.\n",
                         who, nm, inst);
                 bad = 1;
             } else if (kind == 1) {
@@ -569,7 +572,7 @@ PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who)
                 fprintf(stderr, "%s: REFUSED -- XSPICE code model '%s' (instance %s) %s; the time-domain small-signal recursion cannot "
                         "linearise it and would return a wrong curve (card #551). Use a converged FRA (tools/fra*.py) or "
                         "tools/pac_perturbed.py; stateless analog code models (gain summer mult divide limit climit ilimit pwl "
-                        "multi_input_pwl ota aswitch pswitch) are supported.\n", who, nm, inst,
+                        "aswitch pswitch) are supported.\n", who, nm, inst,
                         cls == 3 ? "is event-driven / digital (events are discontinuities, quantisers have no small-signal gain)"
                                  : "keeps integration state between time points (cm_analog_integrate / stored previous values)");
                 bad = 1;
@@ -608,7 +611,7 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
     pss_hid_restore(ckt);
 #ifdef XSPICE
     if (g_xs_on) {   /* card #551: XSPICE hidden state of the restart (first run: nothing to put back, model time 0) */
-        if (XSsnapValid(g_xs_snap)) XSsnapPut(ckt, g_xs_snap);
+        if (XSsnapValid(g_xs_snap)) XSsnapPut(ckt, g_xs_snap, g_xs_values);
         else g_xs_toff = 0.0;
         if (getenv("PSS_XS_TRACE"))
             fprintf(stderr, "XS-TRACE run '%s' start: snapshot %s toff=%.9g nolatch=%d\n", jobname, XSsnapValid(g_xs_snap) ? "put" : "none", g_xs_toff, g_hid_nolatch);
@@ -1197,39 +1200,50 @@ static int pss_run_period_ex_safe(CKTcircuit *ckt, double T, const char *jobname
 static int
 pss_xs_periodicity(CKTcircuit *ckt, PSSstateMap *map, double T, const double *x0, double tol)
 {
-    int i, ndig, err;
+    int i, ndig = 0, err, nrun;
     double drift = 0.0, worst_v = 0.0;
     double *hx = NULL;
     (void) tol;
-    if (g_hid_on && g_hid_x && g_hid_n > 0) {
-        hx = TMALLOC(double, g_hid_n);
-        if (hx) memcpy(hx, g_hid_x, (size_t) g_hid_n * sizeof(double));
-    }
-    pss_state_set_ic(map, x0);
-    err = pss_run_period_ex_safe(ckt, T, "PSS shoot (XSPICE hidden-state periodicity check)", 1, 0);
-    if (err) {
-        fprintf(stderr, "PSS-SHOOT: the XSPICE hidden-state periodicity check run failed (err=%d).\n", err);
-        if (hx) tfree(hx);
-        return 1;
-    }
-    ndig = XSsnapDigitalDiff(ckt, g_xs_snap, g_xs_prev);
-    if (hx && g_hid_x && g_hid_n == SMPmatSize(ckt->CKTmatrix) + 1) {
-        double vmax = 0.0;
-        for (i = 1; i < g_hid_n; i++)
-            if (fabs(g_hid_x[i]) > vmax) vmax = fabs(g_hid_x[i]);
-        for (i = 1; i < g_hid_n; i++) {
-            double sc = fmax(fabs(g_hid_x[i]), fabs(hx[i]));
-            double d = fabs(g_hid_x[i] - hx[i]);
-            if (sc < 1e-2 * vmax) sc = 1e-2 * vmax;
-            if (sc < 1e-9) sc = 1e-9;
-            if (d / sc > drift) { drift = d / sc; worst_v = d; }
+    /* The last latching baseline of the Newton iteration may be several iterates old (Broyden steps do not latch), so the hidden vector
+     * is first iterated to its own fixed point: up to 12 latching baselines from the converged native state, each starting from the
+     * hidden state the previous one ended in; the drift of the last two is the periodicity measure. */
+    for (nrun = 0; nrun < 12; nrun++) {
+        pss_state_set_ic(map, x0);
+        if (g_hid_on && g_hid_x && g_hid_n > 0) {
+            if (!hx) hx = TMALLOC(double, g_hid_n);
+            if (hx) memcpy(hx, g_hid_x, (size_t) g_hid_n * sizeof(double));
         }
+        err = pss_run_period_ex_safe(ckt, T, "PSS shoot (XSPICE hidden-state periodicity check)", 1, 0);
+        if (err) {
+            fprintf(stderr, "PSS-SHOOT: the XSPICE hidden-state periodicity check run failed (err=%d).\n", err);
+            if (hx) tfree(hx);
+            return 1;
+        }
+        ndig = XSsnapDigitalDiff(ckt, g_xs_snap, g_xs_prev);
+        drift = 0.0; worst_v = 0.0;
+        if (hx && g_hid_x && g_hid_n == SMPmatSize(ckt->CKTmatrix) + 1) {
+            double vmax = 0.0;
+            for (i = 1; i < g_hid_n; i++)
+                if (fabs(g_hid_x[i]) > vmax) vmax = fabs(g_hid_x[i]);
+            for (i = 1; i < g_hid_n; i++) {
+                double sc = fmax(fabs(g_hid_x[i]), fabs(hx[i]));
+                double d = fabs(g_hid_x[i] - hx[i]);
+                if (sc < 1e-2 * vmax) sc = 1e-2 * vmax;
+                if (sc < 1e-9) sc = 1e-9;
+                if (d / sc > drift) { drift = d / sc; worst_v = d; }
+            }
+        }
+        if (ndig == 0 && drift <= 1e-5)
+            break;
+        if (ndig > 0 && nrun >= 3)   /* a digital limit cycle does not go away by iterating */
+            break;
     }
+    nrun++;
     if (hx) tfree(hx);
     g_xs_ndig_mismatch = ndig;
     g_xs_vec_diff = drift;
-    fprintf(stdout, "PSS-SHOOT: XSPICE hidden state over one period at the converged orbit: digital node mismatches %d, analog node "
-            "drift %.3e (relative, worst %.3e V)\n", ndig, drift, worst_v);
+    fprintf(stdout, "PSS-SHOOT: XSPICE hidden state over one period at the converged orbit (after %d latching baseline(s)): digital node "
+            "mismatches %d, analog node drift %.3e (relative, worst %.3e V)\n", nrun, ndig, drift, worst_v);
     if (ndig > 0) {
         fprintf(stderr, "PSS-SHOOT: FAILED -- the XSPICE digital state is not periodic with the analysis period (%.9g s): %d digital node(s) "
                 "differ between the start and the end of the period. The digital loop is in a limit cycle or a subharmonic of this period "

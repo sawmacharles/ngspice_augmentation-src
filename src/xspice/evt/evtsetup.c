@@ -1002,13 +1002,14 @@ XSsnapTake(CKTcircuit *ckt, XSsnap *s, double L, double base_toff)
 
 /* Put the snapshot back before a restarted run (DCtran restart = 1, CKTtime = 0). */
 void
-XSsnapPut(CKTcircuit *ckt, const XSsnap *s)
+XSsnapPut(CKTcircuit *ckt, const XSsnap *s, int values)
 {
     int i, k;
     if (!s || !s->valid)
         return;
-    g_xs_toff = s->toff;
-    if (s->n_an && ckt->CKTstate0) {
+    /* values == 0 (PSS_XS_NO_STATE=1, red proof only): restart the event framework but carry no state (the pre-#551 restart) */
+    g_xs_toff = values ? s->toff : 0.0;
+    if (values && s->n_an && ckt->CKTstate0) {
         for (k = 0; k < s->n_an; k++) {
             ckt->CKTstate0[s->an_idx[k]] = s->an_val[k];
             if (ckt->CKTstate1)
@@ -1043,8 +1044,10 @@ XSsnapPut(CKTcircuit *ckt, const XSsnap *s)
             nd->tail[i] = &(nd->head[i]);
             nd->last_step[i] = &(nd->head[i]);
             nd->modified[i] = MIF_FALSE;
-            xs_nodeval_put(ckt, i, &s->rhs[i], &nd->rhs[i]);
-            xs_nodeval_put(ckt, i, &s->rhsold[i], &nd->rhsold[i]);
+            if (values) {
+                xs_nodeval_put(ckt, i, &s->rhs[i], &nd->rhs[i]);
+                xs_nodeval_put(ckt, i, &s->rhsold[i], &nd->rhsold[i]);
+            }
         }
         nd->num_modified = 0;
 
@@ -1052,7 +1055,8 @@ XSsnapPut(CKTcircuit *ckt, const XSsnap *s)
             Evt_State_t *st = sd->tail[i] ? *(sd->tail[i]) : NULL;
             if (!st || !st->block || !s->st_blk[i] || s->st_size[i] != sd->total_size[i])
                 continue;
-            memcpy(st->block, s->st_blk[i], (size_t) s->st_size[i]);
+            if (values)
+                memcpy(st->block, s->st_blk[i], (size_t) s->st_size[i]);
             if (sd->head[i] != st) {              /* history still linked: older steps go to the free list, as EVTaccept() does */
                 if (st->prev) {
                     st->prev->next = sd->free[i];
@@ -1069,9 +1073,9 @@ XSsnapPut(CKTcircuit *ckt, const XSsnap *s)
         }
         sd->num_modified = 0;
 
-        for (k = 0; k < s->n_ie; k++)
+        for (k = 0; values && k < s->n_ie; k++)
             EVTqueue_inst(ckt, s->ie_inst[k], 0.0, s->ie_t[k]);
-        for (k = 0; k < s->n_oe; k++) {
+        for (k = 0; values && k < s->n_oe; k++) {
             int out = s->oe_out[k];
             int node = ckt->evt->info.output_table[out]->node_index;
             int udn = ckt->evt->info.node_table[node]->udn_index;

@@ -74,7 +74,7 @@ XSsnap *XSsnapNew(void);
 void    XSsnapFree(CKTcircuit *ckt, XSsnap *s);
 int     XSsnapValid(const XSsnap *s);
 void    XSsnapTake(CKTcircuit *ckt, XSsnap *s, double L, double base_toff);
-void    XSsnapPut(CKTcircuit *ckt, const XSsnap *s);
+void    XSsnapPut(CKTcircuit *ckt, const XSsnap *s, int values);
 int     XSsnapDigitalDiff(CKTcircuit *ckt, const XSsnap *a, const XSsnap *b);
 double  XSsnapAnalogDiff(const XSsnap *a, const XSsnap *b);
 
