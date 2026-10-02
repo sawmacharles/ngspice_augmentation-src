@@ -2811,7 +2811,14 @@ pss_kry_arnoldi(PSSkry *c, int mmax, PSScomplex *ritz, int *m_eff, double *rad,
         mm = dim;
         if (hn < 1e-12) { *exact = 1; stop = 1; }
         if (dim == n) *exact = 1;
-        checkpoint = (dim >= 8 && (dim <= 24 ? dim % 4 == 0 : dim % 8 == 0));
+        {
+            /* card #538: a checkpoint every PSS_KRYLOV_ARN_STEP (default 2, was 4) dimensions from 8 up:
+             * the settle test (radius at m vs m-4) is unchanged, it is just evaluated at 10 instead of 12
+             * (the eigen-solves are free next to a period run), saving 2 products on every deck measured */
+            static int ast = -1;
+            if (ast < 0) { ast = getenv("PSS_KRYLOV_ARN_STEP") ? atoi(getenv("PSS_KRYLOV_ARN_STEP")) : 2; if (ast < 1) ast = 2; }
+            checkpoint = (dim >= 8 && (dim <= 24 ? dim % ast == 0 : dim % 8 == 0));
+        }
         if (*exact || dim == m || checkpoint) {
             for (i = 0; i < dim; i++)
                 for (k = 0; k < dim; k++) Hm[i * dim + k] = H[i * m + k];
@@ -4182,6 +4189,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     int n_slow = 0;
     int *slow_idx = NULL;
     int kry_requested = 0, kry_fellback = 0;   /* card #537 */
+    int kry_explicit = 0, kry_auto_blocked = 0;   /* card #538 */
 
     t_wall_start = SPfrontEnd->IFseconds();
 
@@ -4202,6 +4210,9 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         }
         g_pss_krylov = want;
         kry_requested = want;
+        /* card #538: automatic choice is made below, once the state count is known */
+        kry_explicit = job->PSSkrylovSet || getenv("NGSPICE_PSS_KRYLOV") != NULL;
+        kry_auto_blocked = (getenv("PSS_SHOOT_JACOBIAN") && strcmp(getenv("PSS_SHOOT_JACOBIAN"), "analytic") == 0);
     }
 
     /* Integration resolution within a period: match the sampling the
@@ -4235,6 +4246,24 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         fprintf(stderr, "Error: .pss method=shoot found no capacitor or "
                 "inductor in the circuit -- nothing to shoot on.\n");
         return E_UNSUPP;
+    }
+
+    /* card #538: automatic matrix-free shooting from PSS_KRYLOV_AUTO_MIN (default 64)
+     * capacitor + inductor states up (the run counts of the dense and the matrix-free
+     * engine cross at 25-30 states, the wall time at about 40; see docs/pss-pac.md).
+     * Neither the card key `krylov=` (0 or 1) nor NGSPICE_PSS_KRYLOV (0 or 1) is set
+     * -> automatic; either one set -> that choice wins. PSS_KRYLOV_AUTO_MIN=0 turns
+     * the automatic choice off. Every deck below the threshold is untouched. */
+    if (!kry_explicit && !kry_auto_blocked && !g_pss_krylov) {
+        int amin = 64;
+        if (getenv("PSS_KRYLOV_AUTO_MIN")) amin = atoi(getenv("PSS_KRYLOV_AUTO_MIN"));
+        if (amin > 0 && n >= amin) {
+            g_pss_krylov = 1;
+            kry_requested = 1;
+            fprintf(stdout, "PSS-SHOOT: %d states >= %d: matrix-free Newton-GMRES (krylov) chosen automatically "
+                    "(krylov=0 or NGSPICE_PSS_KRYLOV=0 forces the dense monodromy)\n", n, amin);
+            fflush(stdout);
+        }
     }
 
     /* CKTreltol/abstol/voltTol saved here (single funnel-point restore at
@@ -4719,6 +4748,29 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                  * see seed_available's own comment above and
                  * pss_newton_run()'s header comment for the reuse
                  * mechanics and why a somewhat stale seed is still safe. */
+                /* card #538: matrix-free mode: a Newton attempt costs about 13 period runs (a product is a
+                 * centred pair of runs, ~6 products) and a probe on a warm-up this short fails (residual
+                 * 1.0, step clipped to alpha<1e-2 and abandoned) on every PEX-size deck measured, while a
+                 * warm-up period (probe stages run at a 10x looser step) costs 1/10..1/40 of a period run.
+                 * So the first PSS_KRYLOV_WARMUP (default 130) periods of the staged warm-up run WITHOUT a
+                 * Newton attempt: same transients, same endpoints (the stage-3 x0 of the 20/40/80 schedule
+                 * is untouched, hence the same orbit), 2 failed probes less (-26 of 75 period runs on the
+                 * 1150-state deck). Only from PSS_KRYLOV_WARMUP_MIN (default 64) states up; an explicit
+                 * PSS_SHOOT_WARMUP_PERIODS disables it; never the final stage. */
+                int skip_attempt = 0;
+                if (g_pss_krylov && !last_stage && !getenv("PSS_SHOOT_WARMUP_PERIODS") &&
+                    n >= (getenv("PSS_KRYLOV_WARMUP_MIN") ? atoi(getenv("PSS_KRYLOV_WARMUP_MIN")) : 64)) {
+                    double kw = getenv("PSS_KRYLOV_WARMUP") ? atof(getenv("PSS_KRYLOV_WARMUP")) : 130.0;
+                    if (cumulative < kw * T * (1.0 - 1e-9))
+                        skip_attempt = 1;
+                }
+                if (skip_attempt) {
+                    fprintf(stdout, "PSS-SHOOT: %s no Newton attempt on a warm-up of %.0f periods (matrix-free: "
+                            "attempts start at %.0f periods); extending the warm-up.\n", label,
+                            cumulative / T, getenv("PSS_KRYLOV_WARMUP") ? atof(getenv("PSS_KRYLOV_WARMUP")) : 130.0);
+                    fflush(stdout);
+                    converged_flag = 0; iter = 0; residual = 1.0;
+                } else
                 converged_flag = pss_newton_run(ckt, &map, T, n_slow, slow_idx, x0,
                                                  this_maxiter, tol, eps,
                                                  this_trust, broyden_enabled,

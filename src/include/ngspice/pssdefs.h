@@ -205,6 +205,7 @@ typedef struct {
      * (dense finite-difference monodromy, byte-for-byte the previous
      * behaviour). See pssshoot.c "card #537". */
     int      PSSkrylov;
+    int      PSSkrylovSet;   /* card #538: krylov= given on the card (0 or 1): no automatic choice */
 } PSSan;
 
 enum {

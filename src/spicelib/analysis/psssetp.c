@@ -194,6 +194,7 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
     /* card #537: `krylov=1` -- see pssdefs.h's PSSkrylov comment. */
     case PSS_KRYLOV:
         job->PSSkrylov = value->iValue;
+        job->PSSkrylovSet = 1;   /* card #538: explicit choice, no automatic threshold */
         break;
 
     default:
