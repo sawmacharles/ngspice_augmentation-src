@@ -1448,12 +1448,24 @@ static double g_salt_prev_time = -1.0;      /* card #494 fifth pass: h_dot's tru
 static double g_salt_settle_until = -1.0;   /* card #494 fifth pass: force-order-1 window deadline */
 static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
 static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_ind_jump() */
+/* card #535: terminal voltage of every sw instance at the PREVIOUS accepted
+ * point (index = instance order). The saltation current jump dI = dG*v_switch
+ * needs the switch voltage at the crossing, i.e. the continuous state just
+ * BEFORE the flip. With exact event location (patch 0065) the flip is
+ * applied in the step that FOLLOWS the located crossing, and that step is
+ * deliberately short but not infinitesimal (30 ps after patch 0070), so the
+ * end-of-step CKTrhsOld voltage has already slewed through the switch node's
+ * ron*Csw transient (R6o: 4.8 V instead of 11.5 V at the first event, 7.2 V
+ * instead of -0.007 V at the second). */
+static double *g_salt_vsw_prev = NULL, *g_salt_vsw_cur = NULL;
+static int g_salt_vsw_n = 0, g_salt_vsw_have_prev = 0;
 
 void
 PSSsaltReset(void)
 {
     g_salt_first_step_pending = 1;
     g_salt_prev_time = -1.0;
+    g_salt_vsw_have_prev = 0;
     g_salt_settle_until = -1.0;
     g_salt_events_seen = 0;
     g_salt_ind_warned = 0;   /* card #510 step 1: once per analysis (fresh period/recording run) */
@@ -1936,6 +1948,35 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     dt_actual = (g_salt_prev_time >= 0.0) ? (ckt->CKTtime - g_salt_prev_time) : ckt->CKTdelta;
     g_salt_prev_time = ckt->CKTtime;
 
+    /* card #535: roll the per-switch terminal-voltage snapshot (see above). */
+    {
+        int st_ = CKTtypelook("Switch"), cnt = 0;
+        SWmodel *m_;
+        SWinstance *h_;
+        if (st_ >= 0) {
+            for (m_ = (SWmodel *) ckt->CKThead[st_]; m_; m_ = SWnextModel(m_))
+                for (h_ = SWinstances(m_); h_; h_ = SWnextInstance(h_))
+                    cnt++;
+            if (cnt != g_salt_vsw_n) {
+                g_salt_vsw_prev = TREALLOC(double, g_salt_vsw_prev, cnt > 0 ? cnt : 1);
+                g_salt_vsw_cur  = TREALLOC(double, g_salt_vsw_cur,  cnt > 0 ? cnt : 1);
+                g_salt_vsw_n = cnt;
+                g_salt_vsw_have_prev = 0;
+            }
+            if (g_salt_vsw_have_prev)
+                memcpy(g_salt_vsw_prev, g_salt_vsw_cur, (size_t) cnt * sizeof(double));
+            cnt = 0;
+            for (m_ = (SWmodel *) ckt->CKThead[st_]; m_; m_ = SWnextModel(m_))
+                for (h_ = SWinstances(m_); h_; h_ = SWnextInstance(h_)) {
+                    g_salt_vsw_cur[cnt] = ckt->CKTrhsOld[h_->SWposNode] - ckt->CKTrhsOld[h_->SWnegNode];
+                    if (!g_salt_vsw_have_prev)
+                        g_salt_vsw_prev[cnt] = g_salt_vsw_cur[cnt];
+                    cnt++;
+                }
+            g_salt_vsw_have_prev = 1;
+        }
+    }
+
     /* card #494 third pass: restart filter -- see PSSsaltReset()'s own
      * header comment in pssshoot.h. Consumes the latch unconditionally,
      * even if this particular step has no real sw event, so it only ever
@@ -1960,6 +2001,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     if (swtype < 0)
         return 0;
 
+    int sw_idx = -1;
     for (model = (SWmodel *) ckt->CKThead[swtype]; model && n < max;
          model = SWnextModel(model)) {
         for (here = SWinstances(model); here && n < max;
@@ -1973,6 +2015,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             double tau_ind_pos = 0.0, tau_ind_neg = 0.0;
             const char *why = NULL;
 
+            sw_idx++;
             if (pss_salt_is_on(now) == pss_salt_is_on(prev))
                 continue;   /* hysteresis-band-only or no-change: no real event */
 
@@ -1982,10 +2025,41 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             if (fabs(h_dot) < 1e-30)
                 continue;   /* degenerate: avoid a divide-by-zero downstream */
 
+            /* card #535: a genuine event has the flip threshold between the
+             * control values at the two ends of this step (plain mode: the
+             * crossing is inside the step; exact-location mode: the located
+             * crossing is at its start, to ~1e-16 s). A flip with the control
+             * far from the threshold is not a crossing but a switch whose
+             * restarted state disagrees with its control -- R6o's hi switch
+             * restarts OFF at t=0 with its control 0.545 V past the ON
+             * threshold. The first-step filter (g_salt_first_step_pending)
+             * catches that in plain mode, but with the lagged decision
+             * (patch 0065) the corrective flip lands one step later, got
+             * through the filter and injected a spurious jump at t=0 (6.157
+             * instead of 6.2036 V/V). Positive hysteresis only (the
+             * negative-hysteresis semantics differ). */
+            if (model->SWvHysteresis > 0.0 && !getenv("PSS_SALT_NOCROSSCHK")) {
+                double thr = model->SWvThreshold +
+                             (pss_salt_is_on(now) ? model->SWvHysteresis : -model->SWvHysteresis);
+                double clo = (vctrl_now < vctrl_prev) ? vctrl_now : vctrl_prev;
+                double chi = (vctrl_now < vctrl_prev) ? vctrl_prev : vctrl_now;
+                double slack = 1e-6 * (fabs(thr) + 1e-3) + 0.01 * (chi - clo);
+                if (thr < clo - slack || thr > chi + slack) {
+                    if (getenv("PSS_SALT_TRACE"))
+                        fprintf(stderr, "SALT-TRACE t=%.9g flip of %s ignored: control %.9g -> %.9g does not cross threshold %.9g\n",
+                                ckt->CKTtime, here->SWname, vctrl_prev, vctrl_now, thr);
+                    continue;
+                }
+            }
+
             g_now  = pss_salt_is_on(now)  ? model->SWonConduct : model->SWoffConduct;
             g_prev = pss_salt_is_on(prev) ? model->SWonConduct : model->SWoffConduct;
             dG = g_now - g_prev;
-            v_switch = ckt->CKTrhsOld[here->SWposNode] - ckt->CKTrhsOld[here->SWnegNode];
+            /* card #535: the switch voltage BEFORE the flip (previous accepted point), not the
+             * end-of-event-step value; PSS_SALT_VEND=1 restores the old end-of-step read. */
+            v_switch = (sw_idx >= 0 && sw_idx < g_salt_vsw_n && !getenv("PSS_SALT_VEND"))
+                       ? g_salt_vsw_prev[sw_idx]
+                       : ckt->CKTrhsOld[here->SWposNode] - ckt->CKTrhsOld[here->SWnegNode];
             dI = dG * v_switch;
 
             Cpos = pss_salt_local_cap(ckt, here->SWposNode);
