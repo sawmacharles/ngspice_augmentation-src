@@ -541,6 +541,10 @@ static int g_pp_active = 0, g_pp_neq = 0, g_pp_steps = 0;
 static unsigned char *g_pp_col = NULL;           /* [neq+1] 1 = column of some C_k */
 static double g_pp_cmax = 0.0;
 static void pac_gen_identify_bad(CKTcircuit *ckt, double ag0);
+static int g_pp_susp[64], g_pp_nsusp = 0;       /* non-native device types with a DEVload */
+static int g_pp_has_mutual = 0;                  /* a mutual inductor (K) is present */
+static int g_pp_detect = 0, g_pp_detect_hit = 0; /* model-charge detection prepass state */
+static void pac_detect_step(CKTcircuit *ckt);
 static double *g_pp_xend = NULL;
 
 
@@ -1285,7 +1289,10 @@ PSSpacRecordStep(CKTcircuit *ckt)
     int is_first_call;
 
     if (g_pp_active) {   /* card #542: state-set discovery prepass */
-        pac_prepass_step(ckt);
+        if (g_pp_detect)
+            pac_detect_step(ckt);
+        else
+            pac_prepass_step(ckt);
         return;
     }
     if (g_pac_failed || !g_pac_map)
@@ -1891,6 +1898,7 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
         "Isource", "VCVS", "VCCS", "CCVS", "CCCS", "Switch", "CSwitch", "ASRC", NULL };
     int i, k, has = 0;
     *delay_dev = NULL;
+    g_pp_nsusp = 0; g_pp_has_mutual = 0;
     for (i = 0; i < DEVmaxnum; i++) {
         const char *nm;
         int known = 0;
@@ -1904,10 +1912,78 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
         }
         for (k = 0; nocharge[k]; k++)
             if (!strcmp(nm, nocharge[k])) { known = 1; break; }
-        if (!known)
-            has = 1;
+        if (known)
+            continue;
+        has = 1;
+        if (!strcmp(nm, "mutual"))
+            g_pp_has_mutual = 1;
+        else if (DEVices[i]->DEVload && g_pp_nsusp < 64)
+            g_pp_susp[g_pp_nsusp++] = i;
     }
     return has;
+}
+
+/* Model-charge detection (one prepass period, cheap): a circuit whose only non-native devices carry no charge
+ * (e.g. a diode with cj=0, tt=0 next to ideal switches) keeps the legacy native recursion -- bit-identical to
+ * before and still able to use saltation. Each suspicious device TYPE is loaded alone (matrix cleared) at ag0
+ * and ag0/2; any element that differs is a charge (C = dJ/dag0 != 0). */
+static void
+pac_detect_step(CKTcircuit *ckt)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix), nstates = ckt->CKTnumStates, ti, i, r;
+    double *save_rhs, *save_rhsold, *save_state0 = NULL;
+    long save_mode = ckt->CKTmode;
+    int save_noncon = ckt->CKTnoncon, save_bypass = ckt->CKTbypass;
+    double a1 = ckt->CKTag[0];
+    PACtrip A = { 0, 0, NULL, NULL, NULL }, B = A;
+
+    if (ckt->CKTtime <= 0.0 || g_pp_detect_hit)
+        return;
+    save_rhs = TMALLOC(double, neq + 1);
+    save_rhsold = TMALLOC(double, neq + 1);
+    if (nstates > 0) save_state0 = TMALLOC(double, nstates);
+    if (!save_rhs || !save_rhsold || (nstates > 0 && !save_state0)) {
+        g_pp_detect_hit = 1;   /* cannot tell: take the generic path (safe) */
+        goto out;
+    }
+    memcpy(save_rhs, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(save_rhsold, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+    if (nstates > 0) memcpy(save_state0, ckt->CKTstate0, (size_t) nstates * sizeof(double));
+    memcpy(ckt->CKTrhsOld, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
+    ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODETRAN | MODEINITFLOAT;
+    ckt->CKTbypass = 0;
+    for (ti = 0; ti < g_pp_nsusp && !g_pp_detect_hit; ti++) {
+        int dev = g_pp_susp[ti], k, err = 0;
+        PACtrip *tt[2]; double ag[2];
+        tt[0] = &A; tt[1] = &B; ag[0] = a1; ag[1] = 0.5 * a1;
+        for (k = 0; k < 2 && !err; k++) {
+            int nnz;
+            SMPclear(ckt->CKTmatrix);
+            for (r = 0; r <= neq; r++) ckt->CKTrhs[r] = 0.0;
+            ckt->CKTag[0] = ag[k];
+            err = DEVices[dev]->DEVload(ckt->CKThead[dev], ckt);
+            ckt->CKTag[0] = a1;
+            if (err) break;
+            nnz = SMPnumElements(ckt->CKTmatrix);
+            if (pac_trip_fit(tt[k], nnz)) { err = 1; break; }
+            tt[k]->n = SMPcopyElements(ckt->CKTmatrix, tt[k]->ri, tt[k]->ci, tt[k]->v);
+        }
+        if (err || A.n != B.n) { g_pp_detect_hit = 1; break; }
+        for (i = 0; i < A.n; i++)
+            if (fabs(A.v[i] - B.v[i]) > 1e-14 * (fabs(A.v[i]) + fabs(B.v[i]))) { g_pp_detect_hit = 1; break; }
+    }
+    ckt->CKTmode = save_mode;
+    ckt->CKTbypass = save_bypass;
+    ckt->CKTnoncon = save_noncon;
+    ckt->CKTag[0] = a1;
+    memcpy(ckt->CKTrhs, save_rhs, (size_t) (neq + 1) * sizeof(double));
+    memcpy(ckt->CKTrhsOld, save_rhsold, (size_t) (neq + 1) * sizeof(double));
+    if (nstates > 0) memcpy(ckt->CKTstate0, save_state0, (size_t) nstates * sizeof(double));
+out:
+    if (save_rhs) tfree(save_rhs);
+    if (save_rhsold) tfree(save_rhsold);
+    if (save_state0) tfree(save_state0);
+    pac_trip_free(&A); pac_trip_free(&B);
 }
 
 /* card #542: periodic-continuation start of the recording runs (see g_pac_xinit). */
@@ -1940,6 +2016,7 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     const char *delay = NULL;
     int has, err, neq, i, ns, npass;
     static int warned_native = 0;
+    double tprep0 = SPfrontEnd->IFseconds();
 
     if (getenv("PAC_NATIVE_HISTORY")) {
         if (!warned_native) {
@@ -1957,13 +2034,27 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     }
     if (!has && !getenv("PAC_FORCE_GENERIC"))
         return 0;
+    neq = SMPmatSize(ckt->CKTmatrix);
+    if (!getenv("PAC_FORCE_GENERIC") && !g_pp_has_mutual) {
+        /* the only non-native devices may carry no charge at all: look (one cheap period) before leaving the
+         * legacy native path, which is bit-identical to before and supports saltation / free-running */
+        pac_state_set_ic(map, x0);
+        g_pp_detect = 1; g_pp_detect_hit = 0; g_pp_active = 1; PSSpacActive = 1;
+        err = pac_run_period(ckt, job, T, "TD-shoot model-charge detection (card #542)");
+        PSSpacActive = 0; g_pp_active = 0; g_pp_detect = 0;
+        if (err) {
+            fprintf(stderr, "%s: model-charge detection run failed (err=%d)\n", who, err);
+            return E_INTERN;
+        }
+        if (!g_pp_detect_hit)
+            return 0;   /* no device-model charge anywhere on the orbit: native C/L history is exact */
+    }
     if (trig_node_num >= 0) {
         fprintf(stderr, "%s: REFUSED -- free-running (trigger=) orbits with device-model charge storage are "
                 "not supported: the period-variation projection needs f(T) at every charge state "
                 "(card #542).\n", who);
         return E_UNSUPP;
     }
-    neq = SMPmatSize(ckt->CKTmatrix);
     g_pp_col = TMALLOC(unsigned char, neq + 1);
     if (!g_pp_col) return E_NOMEM;
     if (g_pp_xend) tfree(g_pp_xend);
@@ -2013,8 +2104,9 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     tfree(g_pp_col); g_pp_col = NULL;
     tfree(g_pp_xend); g_pp_xend = NULL;
     fprintf(stderr, "%s: generic charge-based history (card #542): %d native C/L + model-charge states -> "
-            "%d state rows (columns of dq/dx on the orbit, %d steps, affine-in-ag0 check passed, max|C|=%.3g)\n",
-            who, map->n, ns, g_pp_steps, g_pp_cmax);
+            "%d state rows (columns of dq/dx on the orbit, %d steps, affine-in-ag0 check passed, max|C|=%.3g), "
+            "prepass wall_time=%.3fs\n",
+            who, map->n, ns, g_pp_steps, g_pp_cmax, SPfrontEnd->IFseconds() - tprep0);
     return 0;
 }
 
