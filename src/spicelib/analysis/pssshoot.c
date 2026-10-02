@@ -5666,6 +5666,164 @@ pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
 }
 
 
+/* card #540: the Floquet estimate of the free-running engine, and why it is taken under its own solver profile.
+ *
+ * Root cause of the dense engine's wrong radius (24.2 "UNSTABLE" on a stable 24-state PEX-loaded R5, true value
+ * 0.037 from a plain .tran of a perturbed orbit): the Newton monodromy differences the return map at a relative
+ * step of 1e-6, while the return map itself -- an adaptive-step integration to the trigger crossing, at the
+ * engine's reltol 1e-5 -- is only reproducible to ~1e-5 of the state (different perturbed runs take different
+ * step sequences). The difference quotient is then noise / h = ~10 per entry, and the Floquet radius of such a
+ * matrix is whatever the noise makes it (0.02 ... 24 on the same orbit; the matrix-free path read 4.79 on R5 until
+ * its step was scaled x1000). The same noise made the Newton Jacobian poor (31 iterations on R5, 17 on the PEX
+ * R5, no convergence in 45 iterations / 636 s at 48 states).
+ *
+ * Newton only needs a direction, so its step is now 1e-4 (relative) -- 100x above the noise; the STABILITY verdict
+ * needs the value, so it is computed after convergence with the solver profile tightened to reltol 1e-9 (the
+ * scoped tightening of the card #503/#517 polish), one-sided differences at 1e-5 against a tight base run, where
+ * the noise is 1e-9/1e-5 = 1e-4 of an entry and the truncation (O(h)) is below it. Two such estimates are made,
+ * at h and h/2 (step halving): noise-dominated differences scale like 1/h and truncation-dominated like h, so
+ * they disagree exactly when the estimate is not trustworthy, and then the verdict is UNKNOWN(not-computed), never
+ * a wrong stable/UNSTABLE. Dense: eigenvalues of the two monodromies; matrix-free: two Arnoldi processes. */
+typedef struct {
+    int status;           /* 0 trusted, 1 the two estimates disagree / not settled / ambiguous around 1, 2 a pass failed */
+    double ra, rb, rad;   /* radii at h and h/2; the reported one (the larger, conservative) */
+    double radp;          /* matrix-free: radius at dimension m_eff-4 of the first Arnoldi (settle indicator) */
+    int m_eff, exact;
+    long runs;
+    char why[200];
+} PSSfrStab;
+
+static double
+pss_fr_dense_radius(const double *M, int n, PSScomplex *eig)
+{
+    int k, ti = 0;
+    double tm = 1e300, r = -1.0;
+    if (n <= 1 || pss_eigenvalues(M, n, eig) != 0) return -1.0;
+    for (k = 0; k < n; k++) { double a = hypot(eig[k].re, eig[k].im); if (a < tm) { tm = a; ti = k; } }
+    for (k = 0; k < n; k++) {
+        double a;
+        if (k == ti) continue;
+        a = hypot(eig[k].re, eig[k].im);
+        if (a > r) r = a;
+    }
+    return r;
+}
+
+/* trusted if both estimates are present, on the same side of 1, and agree to 10 % (0.02 absolute below 0.2) */
+static int
+pss_fr_agree(double ra, double rb)
+{
+    double mx = ra > rb ? ra : rb, mn = ra > rb ? rb : ra, tol;
+    if (!(mn >= 0.0)) return 0;
+    if ((ra - 1.0) * (rb - 1.0) <= 0.0) return 0;
+    tol = 0.1 * mx;
+    if (tol < 0.02) tol = 0.02;
+    return (mx - mn) <= tol;
+}
+
+static void
+pss_fr_stability(CKTcircuit *ckt, PSSstateMap *map, int n, const double *x0, const double *w,
+                 int node_num, double trigval, int dir, double max_period, int use_kry, int m_req,
+                 double *M, PSScomplex *eig, PSSfrStab *res)
+{
+    double save_reltol = ckt->CKTreltol, save_trtol = ckt->CKTtrtol;
+    double st_reltol = getenv("PSS_FREERUN_STAB_RELTOL") ? atof(getenv("PSS_FREERUN_STAB_RELTOL")) : 1e-8;
+    double st_trtol = getenv("PSS_FREERUN_STAB_TRTOL") ? atof(getenv("PSS_FREERUN_STAB_TRTOL")) : 0.0;
+    double eps0 = getenv("PSS_FREERUN_STAB_EPS") ? atof(getenv("PSS_FREERUN_STAB_EPS")) : 1e-5;
+    double *Pt = TMALLOC(double, n), *hs = TMALLOC(double, n), *ic = TMALLOC(double, n);
+    double *op = TMALLOC(double, n), *om = TMALLOC(double, n), *Mb = NULL;
+    PSScomplex *eb = TMALLOC(PSScomplex, n);
+    PSSkry c;
+    int pass, k, j;
+    double rr[2] = {-1.0, -1.0};
+    long r0 = g_pss_nruns;
+
+    memset(res, 0, sizeof *res);
+    res->ra = res->rb = res->rad = res->radp = -1.0;
+    if (!Pt || !hs || !ic || !op || !om || !eb) { res->status = 2; snprintf(res->why, sizeof res->why, "out of memory"); goto out; }
+    if (eps0 <= 0.0) eps0 = 1e-5;
+    if (st_reltol > 0.0 && st_reltol < ckt->CKTreltol) ckt->CKTreltol = st_reltol;
+    if (st_trtol > 0.0 && st_trtol < ckt->CKTtrtol) ckt->CKTtrtol = st_trtol;
+
+    memset(&c, 0, sizeof c);
+    c.ckt = ckt; c.map = map; c.n = n; c.trig = 1; c.node_num = node_num; c.trigval = trigval; c.dir = dir;
+    c.max_period = max_period; c.x0 = x0; c.w = w; c.hs = hs; c.P0 = Pt; c.icbuf = ic; c.outp = op; c.outm = om;
+    c.onesided = 1;
+    if (pss_kry_eval(&c, x0, Pt, "PSS freerun (stability base)")) {
+        res->status = 2; snprintf(res->why, sizeof res->why, "the base trigger run at x0 failed under the tight profile");
+        goto out;
+    }
+    if (!use_kry) {
+        Mb = TMALLOC(double, (size_t) n * n);
+        if (!Mb) { res->status = 2; snprintf(res->why, sizeof res->why, "out of memory"); goto out; }
+    }
+    for (pass = 0; pass < 2; pass++) {
+        double eps = pass ? 0.5 * eps0 : eps0;
+        for (k = 0; k < n; k++) { hs[k] = fabs(x0[k]) * eps; if (hs[k] < 1e-8) hs[k] = 1e-8; }
+        if (use_kry) {
+            /* the products move ALL states at once, by the largest amount no state's ceiling hs forbids: with ceilings
+             * proportional to |x| the stiffest-to-|x| state (Csw: ripple ~ |x|) fixes the size, and a state whose ripple
+             * is 1e-3 of its value (vout) is moved by 1e-8 of itself, 10 % of the tight noise floor. Ceilings
+             * proportional to the ripple instead (1e-3 of it; |x| 1e-6 and 1e-9 as floors) move every state by the same
+             * fraction of its own swing, and the product noise drops by 100x (card #540). */
+            double cr = (pass ? 0.5 : 1.0) * (getenv("PSS_FREERUN_STAB_RIPPLE") ? atof(getenv("PSS_FREERUN_STAB_RIPPLE")) : 1e-3);
+            for (k = 0; k < n; k++) {
+                double h = cr * w[k], h2 = 1e-6 * fabs(x0[k]);
+                if (h2 > h) h = h2;
+                hs[k] = (h < 1e-9) ? 1e-9 : h;
+            }
+            int m_eff = 0, exact = 0, aerr;
+            double rad = -1.0, radp = -1.0;
+            aerr = pss_kry_arnoldi(&c, m_req, pass ? eb : eig, &m_eff, &rad, &radp, &exact);
+            if (aerr) {
+                res->status = 2; snprintf(res->why, sizeof res->why, "Arnoldi pass %d failed (error %d)", pass, aerr);
+                goto out;
+            }
+            if (!exact) {
+                double diff = (radp >= 0.0) ? fabs(rad - radp) : 1e30;
+                if (!(diff <= 1e-2 * (rad > 1e-3 ? rad : 1e-3)) || (rad - 1.0) * (radp - 1.0) <= 0.0) {
+                    res->status = 1;
+                    snprintf(res->why, sizeof res->why, "Arnoldi estimate not settled at dimension %d (radius %.4g vs %.4g at dimension %d)",
+                             m_eff, rad, radp, m_eff - 4);
+                }
+            }
+            if (!pass) { res->m_eff = m_eff; res->exact = exact; res->radp = radp; }
+            rr[pass] = rad;
+        } else {
+            double *Mp = pass ? Mb : M;
+            for (j = 0; j < n; j++) {
+                for (k = 0; k < n; k++) ic[k] = x0[k];
+                ic[j] += hs[j];
+                if (pss_kry_eval(&c, ic, op, "PSS freerun (stability column)")) {
+                    res->status = 2; snprintf(res->why, sizeof res->why, "a perturbed trigger run (state %d) lost the crossing", j);
+                    goto out;
+                }
+                for (k = 0; k < n; k++) Mp[k * n + j] = (op[k] - Pt[k]) / hs[j];
+            }
+            rr[pass] = pss_fr_dense_radius(Mp, n, pass ? eb : eig);
+            if (pass == 0 && rr[0] < 0.0 && n > 1) { res->status = 2; snprintf(res->why, sizeof res->why, "the eigenvalue solver did not converge"); goto out; }
+        }
+    }
+    res->ra = rr[0]; res->rb = rr[1];
+    res->rad = rr[0] > rr[1] ? rr[0] : rr[1];
+    if (res->status == 0 && !pss_fr_agree(rr[0], rr[1])) {
+        res->status = 1;
+        snprintf(res->why, sizeof res->why, "the estimates at perturbation h and h/2 disagree (radius %.6g vs %.6g)",
+                 rr[0], rr[1]);
+    }
+ out:
+    res->runs = g_pss_nruns - r0;
+    ckt->CKTreltol = save_reltol;
+    ckt->CKTtrtol = save_trtol;
+    if (Pt) tfree(Pt);
+    if (hs) tfree(hs);
+    if (ic) tfree(ic);
+    if (op) tfree(op);
+    if (om) tfree(om);
+    if (eb) tfree(eb);
+    if (Mb) tfree(Mb);
+}
+
 int
 PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
 {
@@ -5675,13 +5833,14 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     double *xtrial = NULL, *x1trial = NULL, *scale = NULL, *ripple = NULL;
     double *A = NULL, *b = NULL;
     PSScomplex *eig = NULL;
-    double T = 0.0, Tguess, max_period, tol, eps;
+    double T = 0.0, Tguess, max_period, tol, eps, eps_d;
     double save_reltol, save_abstol, save_volttol;
     int node_num, dir;
     double trigval;
     int converged = 0, maxiter;
     double residual = 0.0;
     double t_wall_start, t_wall_end;
+    PSSfrStab frst;
 
     int fr_kry = 0, fr_kry_fell = 0;   /* card #538: matrix-free Newton-GMRES on the Poincare return map */
     double *fr_hs = NULL, *fr_kb = NULL, *fr_ky = NULL, *fr_ic = NULL, *fr_op = NULL, *fr_om = NULL;
@@ -5722,9 +5881,15 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         if (getenv("NGSPICE_PSS_KRYLOV"))
             want = atoi(getenv("NGSPICE_PSS_KRYLOV")) != 0;
         else if (!job->PSSkrylovSet) {
-            int amin = 64;
-            if (getenv("PSS_KRYLOV_AUTO_MIN")) amin = atoi(getenv("PSS_KRYLOV_AUTO_MIN"));
-            if (amin > 0 && n >= amin && !job->PSSdoPAC && !job->PSSdoPSTB && !getenv("PSS_FREERUN_PAC_EXPERIMENTAL")) {
+            /* card #540: free-running shooting is matrix-free from the FIRST state (PSS_FREERUN_AUTO_MIN, default 1;
+             * PSS_KRYLOV_AUTO_MIN, default 64, is the driven engine's threshold and does not apply here): on R5 and
+             * the PEX-loaded R5 (4 / 10 / 24 / 48 states) it converges in the same or fewer Newton iterations, is the
+             * same or faster in wall time (equal at 4 states, 6x at 24, 12x at 48), finds the same period, and its
+             * stability estimate is the more accurate (docs/pss-pac.md, card #540). The dense monodromy stays as the
+             * explicit krylov=0 / NGSPICE_PSS_KRYLOV=0 choice and as the engine of .pac/.pstb on the orbit. */
+            int amin = 1;
+            if (getenv("PSS_FREERUN_AUTO_MIN")) amin = atoi(getenv("PSS_FREERUN_AUTO_MIN"));
+            if (amin > 0 && n >= amin) {
                 want = 1;
                 fprintf(stdout, "PSS-FREERUN: %d states >= %d: matrix-free Newton-GMRES (krylov) chosen automatically "
                         "(krylov=0 or NGSPICE_PSS_KRYLOV=0 forces the dense monodromy)\n", n, amin);
@@ -5808,6 +5973,12 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
      * Floquet report -- a LARGER eps trades truncation bias for less FD
      * noise, the opposite direction). */
     eps     = getenv("PSS_FREERUN_FD_EPS") ? atof(getenv("PSS_FREERUN_FD_EPS")) : 1e-6;
+    /* card #540: the dense Newton monodromy steps 1e-4 (relative, floor 1e-7), not 1e-6: at reltol 1e-5 the return map
+     * is reproducible only to ~1e-5, so a 1e-6 step differences noise (see pss_fr_stability()). The matrix-free
+     * products keep eps * PSS_FREERUN_KRY_HMUL = 1e-3 (card #538). An explicit PSS_FREERUN_FD_EPS applies to both.
+     * With .pac/.pstb on the orbit the dense Newton keeps 1e-6 (its cold start, residual 0.7 on the pac_r5 fixtures,
+     * converges in 24-41 iterations at 1e-5 .. 3e-6, wanders into a lost crossing at 1e-4 and 3e-5). */
+    eps_d   = getenv("PSS_FREERUN_FD_EPS") ? eps : ((job->PSSdoPAC || job->PSSdoPSTB) ? 1e-6 : 1e-4);
 
     t_wall_start = SPfrontEnd->IFseconds();
     fr_runs0 = g_pss_nruns;
@@ -5887,8 +6058,8 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         /* central-FD monodromy -- see this file's card #489 header
          * comment for why this is already the terminal-projected M. */
         for (j = 0; j < n; j++) {
-            double h = fabs(x0[j]) * eps; double Tp, Tm;
-            if (h < 1e-9) h = 1e-9;
+            double h = fabs(x0[j]) * eps_d; double Tp, Tm;
+            if (h < 1e-9 * (eps_d / 1e-6)) h = 1e-9 * (eps_d / 1e-6);
 
             for (k = 0; k < n; k++) xtrial[k] = x0[k];
             xtrial[j] += h;
@@ -5965,40 +6136,23 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     eig = TMALLOC(PSScomplex, n);
     if (fr_kry && eig) {
         /* card #538: no monodromy exists -- Arnoldi estimate of the leading Floquet multipliers of the return
-         * map at the converged state (the trivial, projected-flow multiplier is ~0 and never the radius) */
-        int m_req = 40, m_eff = 0, exact = 0, aerr, kk;
-        double rad = -1.0, radp = -1.0, specrad;
-        int ok = 1;
-        long r0 = g_pss_nruns;
+         * map at the converged state (the trivial, projected-flow multiplier is ~0 and never the radius).
+         * card #540: taken under the tight stability profile at two steps, UNKNOWN when they disagree. */
+        int m_req = 40, ok;
+        double specrad;
+        PSSfrStab st;
         if (getenv("PSS_KRYLOV_ARNOLDI")) m_req = atoi(getenv("PSS_KRYLOV_ARNOLDI"));
         if (m_req < 2) m_req = 2;
-        for (kk = 0; kk < n; kk++) {
-            double h = fabs(x0[kk]) * eps * fr_hmul;
-            fr_hs[kk] = (h < 1e-9 * fr_hmul) ? 1e-9 * fr_hmul : h;
-        }
-        fr_ctx.ckt = ckt; fr_ctx.map = &map; fr_ctx.T = T; fr_ctx.n = n;
-        fr_ctx.trig = 1; fr_ctx.node_num = node_num; fr_ctx.trigval = trigval; fr_ctx.dir = dir;
-        fr_ctx.max_period = max_period;
-        fr_ctx.x0 = x0; fr_ctx.w = scale; fr_ctx.hs = fr_hs; fr_ctx.P0 = x1;
-        fr_ctx.icbuf = fr_ic; fr_ctx.outp = fr_op; fr_ctx.outm = fr_om; fr_ctx.onesided = 0;
-        aerr = pss_kry_arnoldi(&fr_ctx, m_req, eig, &m_eff, &rad, &radp, &exact);
-        if (aerr) {
-            ok = 0;
-            fprintf(stdout, "PSS-FREERUN: stability NOT computed (Arnoldi estimate failed, error %d).\n", aerr);
-        } else {
-            char cmp[64];
-            if (!exact) {
-                double diff = (radp >= 0.0) ? fabs(rad - radp) : 1e30;
-                if (!(diff <= 1e-2 * (rad > 1e-3 ? rad : 1e-3)) || (rad - 1.0) * (radp - 1.0) <= 0.0)
-                    ok = 0;
-            }
-            if (radp >= 0.0) snprintf(cmp, sizeof cmp, " (%.6f at dimension %d)", radp, m_eff - 4);
-            else cmp[0] = '\0';
+        pss_fr_stability(ckt, &map, n, x0, scale, node_num, trigval, dir, max_period, 1, m_req, NULL, eig, &st);
+        ok = (st.status == 0);
+        if (st.status == 2)
+            fprintf(stdout, "PSS-FREERUN: stability NOT computed (%s).\n", st.why);
+        else
             fprintf(stdout, "PSS-FREERUN: Arnoldi estimate of the Floquet multipliers: dimension %d of %d%s, "
-                    "%ld trigger runs; spectral radius %.6f%s%s\n", m_eff, n, exact ? " (whole spectrum)" : "",
-                    g_pss_nruns - r0, rad, cmp, ok ? "" : " -- NOT converged / ambiguous around 1: stability not computed");
-        }
-        specrad = ok ? rad : -1.0;
+                    "%ld trigger runs (tight stability profile, two steps); spectral radius %.6f and %.6f%s%s\n",
+                    st.m_eff, n, st.exact ? " (whole spectrum)" : "", st.runs, st.ra, st.rb,
+                    ok ? "" : " -- stability not computed: ", ok ? "" : st.why);
+        specrad = ok ? st.rad : -1.0;
         t_wall_end = SPfrontEnd->IFseconds();
         fprintf(stdout, "\nPSS-FREERUN: CONVERGED iter=%d residual=%.6e period=%.9g fsw=%.6g spectral_radius=%.6f %s "
                 "wall_time=%.3fs\n", iter, residual, T, 1.0 / T, specrad,
@@ -6007,10 +6161,11 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                 t_wall_end - t_wall_start);
         if (ok)
             fprintf(stdout, "PSS-FREERUN: FLOQUET dominant multiplier modulus %.6g (Arnoldi estimate; the trivial "
-                    "projected-flow multiplier, ~0, is not the radius)\n", rad);
+                    "projected-flow multiplier, ~0, is not the radius)\n", st.rad);
         fprintf(stdout, "PSS-FREERUN: period runs: %ld trigger runs, mode=%s\n", g_pss_nruns - fr_runs0,
                 fr_kry_fell ? "krylov-fell-back-to-dense" : "krylov");
-    } else if (eig && pss_eigenvalues(M, n, eig) == 0) {
+    } else if (eig && (pss_fr_stability(ckt, &map, n, x0, scale, node_num, trigval, dir, max_period, 0, 0, M, eig, &frst),
+                       frst.status != 2)) {
         int trivial_idx = 0, kk;
         double trivial_mag = 1e300, specrad = -1.0;
         for (kk = 0; kk < n; kk++) {
@@ -6071,10 +6226,18 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                         trivial_mag, second_mag, second_mag / trivial_mag);
             }
         }
+        /* card #540: the multipliers below are those of the tight-profile monodromy (step h); the verdict is only
+         * given when the estimate at h/2 agrees (pss_fr_agree), else UNKNOWN(not-computed) */
+        specrad = frst.rad;
+        if (n >= 2 && frst.status != 0)
+            fprintf(stdout, "PSS-FREERUN: stability not computed: %s\n", frst.why);
+        t_wall_end = SPfrontEnd->IFseconds();
         fprintf(stdout, "\nPSS-FREERUN: CONVERGED iter=%d residual=%.6e "
                 "period=%.9g fsw=%.6g spectral_radius=%.6f %s "
                 "wall_time=%.3fs\n", iter, residual, T, 1.0 / T,
-                specrad, (n <= 1) ? "UNKNOWN(n=1, no non-trivial multiplier)" :
+                (n >= 2 && frst.status != 0) ? -1.0 : specrad,
+                (n <= 1) ? "UNKNOWN(n=1, no non-trivial multiplier)" :
+                (frst.status != 0) ? "UNKNOWN(not-computed)" :
                 (specrad < 1.0 ? "stable" : "UNSTABLE"),
                 t_wall_end - t_wall_start);
         fprintf(stdout, "PSS-FREERUN: FLOQUET trivial(projected flow "
@@ -6088,11 +6251,11 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
                     "|.|=%.6g\n", kk, eig[kk].re, eig[kk].im, mag);
         }
     } else {
-        fprintf(stderr, "PSS-FREERUN: WARNING -- the eigenvalue solver did "
-                "not converge on the monodromy matrix; Floquet report is "
-                "NOT trustworthy this run.\n");
+        fprintf(stderr, "PSS-FREERUN: WARNING -- the stability estimate could not be computed (%s); Floquet report is "
+                "NOT trustworthy this run.\n", eig ? frst.why : "out of memory");
+        t_wall_end = SPfrontEnd->IFseconds();
         fprintf(stdout, "\nPSS-FREERUN: CONVERGED iter=%d residual=%.6e "
-                "period=%.9g fsw=%.6g spectral_radius=UNKNOWN "
+                "period=%.9g fsw=%.6g spectral_radius=-1.000000 UNKNOWN(not-computed) "
                 "wall_time=%.3fs\n", iter, residual, T, 1.0 / T,
                 t_wall_end - t_wall_start);
     }
@@ -6100,8 +6263,8 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     if (getenv("PSS_FREERUN_DEBUG")) {
         int kk;
         for (kk = 0; kk < n; kk++)
-            fprintf(stderr, "DEBUG x0[%d] (%s) = %.10g\n", kk,
-                    map.refs[kk].isCap ? "cap" : "ind", x0[kk]);
+            fprintf(stderr, "DEBUG x0[%d] (%s) = %.10g %s\n", kk,
+                    map.refs[kk].isCap ? "cap" : "ind", x0[kk], map.refs[kk].name);
     }
 
     /* card #503 THIRD pass: PSS_FREERUN_X0_OVERRIDE (n whitespace-separated
