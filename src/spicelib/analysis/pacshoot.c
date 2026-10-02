@@ -1232,9 +1232,64 @@ pac_gen_refuse_message(const char *who)
             "device's charge history (card #542).\n", who, g_pac_gen_badname);
 }
 
+/* card #544: saltation with model charges.  The event jump is applied at posRow/negRow with the native local capacitance
+ * (or inductance) as denominator, so it is only correct if the loaded charge matrix at that row and column is the one the native
+ * capacitors / inductors alone produce.  Compare the sums of |C| in the row and in the column (diagonal and off-diagonal
+ * separately) with the native expectation; any model charge (MOS gate/junction caps, diode cj, ...) at a switched node, or a
+ * mutual inductance on the branch, shows up as a difference and the analysis is refused. */
+static int
+pac_gen_salt_guard(CKTcircuit *ckt, const PSSsaltEvent *ev, int n_ev)
+{
+    int captype = CKTtypelook("Capacitor"), indtype = CKTtypelook("Inductor");
+    int i, k;
+    for (i = 0; i < n_ev; i++) {
+        int rows[4];
+        /* posRow/negRow are where the jump is applied (capacitor node or inductor branch); the switch's own power nodes carry the
+         * charge the jump would have to move when the jump is routed through an inductor (no capacitor at the switched node): a
+         * model charge there (diode cj at the switch node) makes the node a state the native jump does not describe. */
+        rows[0] = ev[i].posRow; rows[1] = ev[i].negRow; rows[2] = ev[i].posNode; rows[3] = ev[i].negNode;
+        for (k = 0; k < 4; k++) {
+            int r = rows[k], j;
+            double ed = 0.0, eo = 0.0, ad = 0.0, ao = 0.0, ad2 = 0.0, ao2 = 0.0;
+            CAPmodel *cm; CAPinstance *ci;
+            INDmodel *im; INDinstance *ii;
+            if (r <= 0) continue;
+            if (captype >= 0)
+                for (cm = (CAPmodel *) ckt->CKThead[captype]; cm; cm = CAPnextModel(cm))
+                    for (ci = CAPinstances(cm); ci; ci = CAPnextInstance(ci)) {
+                        int p = ci->CAPposNode, q = ci->CAPnegNode;
+                        if (p != r && q != r) continue;
+                        ed += fabs(ci->CAPcapac);
+                        if ((p == r ? q : p) > 0) eo += fabs(ci->CAPcapac);
+                    }
+            if (indtype >= 0)
+                for (im = (INDmodel *) ckt->CKThead[indtype]; im; im = INDnextModel(im))
+                    for (ii = INDinstances(im); ii; ii = INDnextInstance(ii))
+                        if (ii->INDbrEq == r)
+                            ed += fabs(ii->INDinduct);
+            for (j = 0; j < g_pac_C.n; j++) {
+                double v = fabs(g_pac_C.v[j]);
+                if (g_pac_C.ri[j] == r) { if (g_pac_C.ci[j] == r) ad += v; else ao += v; }
+                if (g_pac_C.ci[j] == r && g_pac_C.ri[j] != r) ao2 += v;
+                if (g_pac_C.ci[j] == r && g_pac_C.ri[j] == r) ad2 += v;
+            }
+            if (fabs(ad - ed) > 1e-6 * (ad + ed) + 1e-30 || fabs(ao - eo) > 1e-6 * (ao + eo) + 1e-30 ||
+                fabs(ao2 - eo) > 1e-6 * (ao2 + eo) + 1e-30 || fabs(ad2 - ed) > 1e-6 * (ad2 + ed) + 1e-30) {
+                fprintf(stderr, "PAC-TD: REFUSED -- an ideal-switch (saltation) event (%s) at a row that carries device-model "
+                        "charge or a mutual inductance (loaded |C| row %g/%g, native %g/%g): the state jump of the event is "
+                        "derived for the native capacitor/inductor at the switched node only (card #544).\n",
+                        ev[i].name ? ev[i].name : "sw", ad, ao, ed, eo);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* One accepted step of the generic recursion for all M columns. */
 static int
-pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new)
+pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new,
+                const PSSsaltEvent *salt_ev, int n_salt)
 {
     int neq = g_pac_neq, M = g_pac_M, m, row;
     double a1 = (order == 2) ? ag1 : 0.0;
@@ -1247,6 +1302,8 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
         pac_gen_refuse_message("PAC-TD");
         return 1;
     }
+    if (n_salt > 0 && pac_gen_salt_guard(ckt, salt_ev, n_salt))
+        return 1;
     if (first && getenv("PAC_GEN_TRACE"))
         fprintf(stderr, "PAC-TD: generic recursion, first step: nnz(C)=%d nnz(J)=%d M=%d ag0=%g\n",
                 g_pac_C.n, g_pac_J1.n, M, ag0);
@@ -1278,6 +1335,34 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
         for (row = 1; row <= neq; row++) {
             PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
             pac_set(g_pac_Cnew, row, M, m, v);
+        }
+    }
+    /* card #544: saltation (ideal sw/csw event) with model charges on the orbit.  The state jump of the native recursion
+     * (Fang: delta_x+ = delta_x- - (f+ - f-) dt_e, dt_e = -(grad h . delta_x-)/h_dot, applied as a direct value jump at the
+     * event's capacitor-node / inductor-branch rows) is exactly what the generic recursion needs too, once the charge vector
+     * is formed from the JUMPED solution: Q_k = C_k y_k then carries dq = C_k (jump) and T_k = ag0 (Q_k - Q_{k-1}) - a1 T_{k-1}
+     * the derivative history of it, as in the native branch.  It is only exact where the loaded charge matrix at the event rows
+     * is that of the native capacitors/inductors alone (pac_gen_salt_guard() refuses otherwise), because the jump magnitude
+     * (-dG v_sw / C_local) divides by the native local capacitance. */
+    if (n_salt > 0) {
+        int i_salt;
+        for (m = 0; m < M; m++) {
+            PACc djump[PSS_SALT_MAX_EVENTS][2];
+            for (i_salt = 0; i_salt < n_salt; i_salt++) {
+                const PSSsaltEvent *e = &salt_ev[i_salt];
+                PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m);
+                PACc Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
+                PACc coeff = pc_scale(pc_sub(Sp, Sn), 1.0 / e->h_dot);
+                djump[i_salt][0] = pc_scale(coeff, e->dfdt_pos);
+                djump[i_salt][1] = pc_scale(coeff, e->dfdt_neg);
+            }
+            for (i_salt = 0; i_salt < n_salt; i_salt++) {
+                const PSSsaltEvent *e = &salt_ev[i_salt];
+                if (e->posRow > 0)
+                    pac_set(g_pac_Cnew, e->posRow, M, m, pc_add(pac_get(g_pac_Cnew, e->posRow, M, m), djump[i_salt][0]));
+                if (e->negRow > 0)
+                    pac_set(g_pac_Cnew, e->negRow, M, m, pc_add(pac_get(g_pac_Cnew, e->negRow, M, m), djump[i_salt][1]));
+            }
         }
     }
     pac_C_mul(&g_pac_C, g_pac_Cnew, g_pac_Qnew, neq, M);
@@ -1456,18 +1541,15 @@ PSSpacRecordStep(CKTcircuit *ckt)
         order = 1;
 
     if (g_pac_gen) {
-        /* card #542: generic charge-based recursion. Saltation (ideal-switch events) is built on the
-         * native capacitor/inductor state jump (Fang's formula uses dx across the control-node
-         * states); the model charges at an event would need their own jump (dq continuity through
-         * the switched topology), which is not derived here -> REFUSED, never silently dropped. */
+        /* card #542/#544: generic charge-based recursion; saltation events are applied inside it (guarded). */
         if (n_salt > 0) {
-            fprintf(stderr, "PAC-TD: REFUSED -- an ideal-switch (saltation) event at t=%g in a circuit with "
-                    "device-model charge storage: the state jump at an event is only implemented for native "
-                    "capacitor/inductor states, not for model charges (card #542).\n", t_new);
-            g_pac_failed = 1;
-            return;
+            static int warned_salt = 0;
+            if (!warned_salt && getenv("PAC_GEN_TRACE")) {
+                fprintf(stderr, "PAC-TD: saltation event(s) on the generic path (card #544), first at t=%g\n", t_new);
+                warned_salt = 1;
+            }
         }
-        if (pac_step_generic(ckt, is_first_call, ag0, ag1, order, t_new)) {
+        if (pac_step_generic(ckt, is_first_call, ag0, ag1, order, t_new, salt_ev, n_salt)) {
             g_pac_failed = 1;
             return;
         }
