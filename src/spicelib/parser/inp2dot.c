@@ -1731,6 +1731,12 @@ dot_pnoise(char *line, void *ckt, INPtables *tab, struct card *current,
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
     GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
 
+    /* card #557: trigval/trigdir defaults, only used if trigger= also appears (as dot_pac) */
+    ptemp.rValue = 0.5;
+    GCA(INPapName, (ckt, which, foo, "trigval", &ptemp));
+    ptemp.sValue = "rise";
+    GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+
     /* card #509: trailing tokens, in any order --
      *   cyclo                 (Enhancement-126: bare keyword, existing
      *                          frequency-domain cyclostationary-noise flag)
@@ -1789,6 +1795,29 @@ dot_pnoise(char *line, void *ckt, INPtables *tab, struct card *current,
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_REAL, tab);
                 GCA(INPapName, (ckt, which, foo, "pacreltol", parm));
+            } else if (strcmp(word, "trigger") == 0) {
+                /* card #557: free-running (trigger=) orbit, same tokens as dot_pac's identical branch */
+                char *tnname;
+                CKTnode *tnnode;
+                tfree(word);
+                INPgetNetTok(&line, &tnname, 0);
+                INPtermInsert(ckt, &tnname, tab, &tnnode);
+                ptemp.nValue = tnnode;
+                GCA(INPapName, (ckt, which, foo, "trigger", &ptemp));
+            } else if (strcmp(word, "trigval") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_REAL, tab);
+                GCA(INPapName, (ckt, which, foo, "trigval", parm));
+            } else if (strcmp(word, "trigdir") == 0) {
+                char *dword;
+                tfree(word);
+                INPgetTok(&line, &dword, 1);
+                ptemp.sValue = dword;
+                GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+            } else if (strcmp(word, "driven") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "driven", parm));
             } else {
                 fprintf(stderr, "Error: unknown trailing token '%s' on .pnoise - ignored\n", word);
                 tfree(word);
@@ -1864,6 +1893,12 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
     GCA(INPapName, (ckt, which, foo, "pac_fstart", parm));
     parm = INPgetValue(ckt, &line, IF_REAL, tab);		/* fstop */
     GCA(INPapName, (ckt, which, foo, "pac_fstop", parm));
+
+    /* card #557: trigval/trigdir defaults, only used if trigger= also appears (as dot_pac) */
+    ptemp.rValue = 0.5;
+    GCA(INPapName, (ckt, which, foo, "trigval", &ptemp));
+    ptemp.sValue = "rise";
+    GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
 
     /* card #499: optional trailing tokens, in any order --
      *   maxsideband           (bare integer, existing Enhancement-125 syntax,
@@ -1964,6 +1999,29 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
                 tfree(word);
                 parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
                 GCA(INPapName, (ckt, which, foo, "adjoint", parm));
+            } else if (strcmp(word, "trigger") == 0) {
+                /* card #557: free-running (trigger=) orbit, same tokens as dot_pac's identical branch */
+                char *tnname;
+                CKTnode *tnnode;
+                tfree(word);
+                INPgetNetTok(&line, &tnname, 0);
+                INPtermInsert(ckt, &tnname, tab, &tnnode);
+                ptemp.nValue = tnnode;
+                GCA(INPapName, (ckt, which, foo, "trigger", &ptemp));
+            } else if (strcmp(word, "trigval") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_REAL, tab);
+                GCA(INPapName, (ckt, which, foo, "trigval", parm));
+            } else if (strcmp(word, "trigdir") == 0) {
+                char *dword;
+                tfree(word);
+                INPgetTok(&line, &dword, 1);
+                ptemp.sValue = dword;
+                GCA(INPapName, (ckt, which, foo, "trigdir", &ptemp));
+            } else if (strcmp(word, "driven") == 0) {
+                tfree(word);
+                parm = INPgetValue(ckt, &line, IF_INTEGER, tab);
+                GCA(INPapName, (ckt, which, foo, "driven", parm));
             } else {
                 fprintf(stderr, "Error: unknown trailing token '%s' on .pxf - ignored\n", word);
                 tfree(word);

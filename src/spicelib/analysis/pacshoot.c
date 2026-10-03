@@ -3170,8 +3170,17 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
     double *save_rhsold = NULL;
     int have_ckt_saved = 0;
 
-    if (trig_idx >= 0)
-        return PAC_ADJOINT_REFUSED;   /* free-running: not transposed (see header) */
+    /* card #557: a free-running (trigger=) orbit is transposed like a driven one: the forward operator on it is the fixed-period
+     * LPTV engine on the polished orbit (the period-variation projection is opt-in, PAC_FREERUN_PROJ), so its exact transpose is
+     * this sweep.  Only the opt-in projection (not transposed) keeps the refusal. */
+#ifdef XSPICE
+    if (g_hid_nh > 0) {   /* card #557: the transposed sweep does not carry the hidden states of stateful code models */
+        fprintf(stderr, "PXF-TD-ADJ: stateful XSPICE code model in the circuit: the adjoint sweep does not transpose its hidden states (card #557).\n");
+        return PAC_ADJOINT_REFUSED;
+    }
+#endif
+    if (trig_idx >= 0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ"))
+        return PAC_ADJOINT_REFUSED;
     if (n <= 0 || nfreq <= 0 || nsrc_use <= 0)
         return PAC_ADJOINT_FAIL;
 
@@ -3896,8 +3905,8 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
     memset(&nd, 0, sizeof(nd));
     *gen_dens_out = NULL; *gen_names_out = NULL; *ngen_out = 0;
 
-    if (trig_idx >= 0)
-        return PAC_ADJOINT_REFUSED;
+    if (trig_idx >= 0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ"))
+        return PAC_ADJOINT_REFUSED;   /* card #557: only the opt-in period-variation projection is not transposed */
     if (n <= 0 || nfreq <= 0)
         return PAC_ADJOINT_FAIL;
 
@@ -4509,9 +4518,9 @@ pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
     if (trig_node_num >= 0 && trig_idx < 0) {
-        fprintf(stderr, "PNOISE-TD: REFUSED -- free-running (trigger=) orbit, no "
-                "period-variation-aware adjoint noise engine (same scope cut as "
-                ".pxf adjoint=1) -- see docs/pss-pac.md.\n");
+        fprintf(stderr, "PNOISE-TD: REFUSED -- the trigger= node (free-running orbit) is not one of the circuit's state "
+                "rows (a capacitor / inductor state or a column of the charge matrix); pick a state node as trigger (card #557) -- "
+                "see docs/pss-pac.md.\n");
         pac_map_free(&map);
         return E_UNSUPP;
     }
@@ -4539,7 +4548,7 @@ pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
 
     if (err == PAC_ADJOINT_REFUSED) {
         fprintf(stderr, "PNOISE-TD: REFUSED -- saltation (ideal-switch) events seen "
-                "on this orbit; this engine needs the smooth-switch-only adjoint "
+                "on this orbit (or the opt-in PAC_FREERUN_PROJ projection on a free-running one); this engine needs the smooth-switch-only adjoint "
                 "(card #504's own scope cut) -- no fallback engine exists for "
                 "pnoise (unlike .pxf's adjoint=0). See docs/pss-pac.md.\n");
         pac_map_free(&map); tfree(freqs); tfree(onoise);
@@ -5232,8 +5241,8 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                                                : (nsrc_use > PXF_ADJOINT_AUTO_THRESHOLD);
         int adj_err = PAC_ADJOINT_REFUSED;
 
-        if (trig_idx >= 0)
-            want_adjoint = 0;
+        if (trig_idx >= 0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ"))
+            want_adjoint = 0;   /* card #557: the opt-in projection is not transposed (default free-running forward = fixed-period engine) */
 
         t0 = SPfrontEnd->IFseconds();
         err = OK;

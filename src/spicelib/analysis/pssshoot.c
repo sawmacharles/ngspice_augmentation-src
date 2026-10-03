@@ -7083,7 +7083,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
      * products keep eps * PSS_FREERUN_KRY_HMUL = 1e-3 (card #538). An explicit PSS_FREERUN_FD_EPS applies to both.
      * With .pac/.pstb on the orbit the dense Newton keeps 1e-6 (its cold start, residual 0.7 on the pac_r5 fixtures,
      * converges in 24-41 iterations at 1e-5 .. 3e-6, wanders into a lost crossing at 1e-4 and 3e-5). */
-    eps_d   = getenv("PSS_FREERUN_FD_EPS") ? eps : ((job->PSSdoPAC || job->PSSdoPSTB) ? 1e-6 : 1e-4);
+    eps_d   = getenv("PSS_FREERUN_FD_EPS") ? eps : ((job->PSSdoPAC || job->PSSdoPSTB || job->PSSdoPXF || job->PSSdoPnoise) ? 1e-6 : 1e-4);
 
     t_wall_start = SPfrontEnd->IFseconds();
     fr_runs0 = g_pss_nruns;
@@ -7481,7 +7481,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
      * REFUSED by default (same honest-failure principle as before this
      * pass); PSS_FREERUN_PAC_EXPERIMENTAL=1 opts into the implementation
      * above for further investigation, never for production use. */
-    if (job->PSSdoPAC || job->PSSdoPSTB) {
+    if (job->PSSdoPAC || job->PSSdoPSTB || job->PSSdoPXF || job->PSSdoPnoise) {   /* card #557: .pxf/.pnoise on a free-running orbit */
         double *fT = TMALLOC(double, n);
         double *x_prev = TMALLOC(double, n);
         double t_prev = 0.0, T_meas2 = 0.0;
