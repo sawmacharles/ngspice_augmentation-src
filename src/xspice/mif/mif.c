@@ -50,6 +50,7 @@ int MIFmSize = sizeof(MIFmodel);
 /* NULL pointer in g_mif_info.ckt */
 
 double g_xs_toff = 0.0;   /* card #551, see mif.h */
+double g_xs_ag0_fix = 0.0;   /* card #557, see mif.h */
 
 Mif_Info_t  g_mif_info = {
   { MIF_FALSE, MIF_FALSE, MIF_DC, MIF_ANALOG, 0.0,},

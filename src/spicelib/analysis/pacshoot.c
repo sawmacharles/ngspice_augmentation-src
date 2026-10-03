@@ -160,6 +160,8 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 #ifdef XSPICE
 #include "ngspice/miftypes.h"
 #include "ngspice/mif.h"
+#include "ngspice/mifdefs.h"
+#include "ngspice/mifcmdat.h"
 #endif
 
 #include <math.h>
@@ -411,6 +413,7 @@ pac_find_trig_idx(const PACstateMap *map, int trig_node_num)
 static double *g_pac_xinit = NULL;
 static int g_pac_xinit_n = 0;
 
+static int g_hid_nc, g_hid_nhy;   /* card #557, defined below with the hidden-state machinery */
 static int pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname);
 static int
 pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
@@ -500,13 +503,18 @@ pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
         else if (getenv("PAC_RECORD_RELTOL") && atof(getenv("PAC_RECORD_RELTOL")) > 0.0)
             ckt->CKTreltol = atof(getenv("PAC_RECORD_RELTOL"));   /* card #546: env form, tests */
 #ifdef XSPICE
-        g_xs_toff = 0.0;   /* card #551: the td recording passes only see stateless analog code models (PSSxspicePolicy) */
+        /* card #551/#557: stateless models: no state to carry, model time 0.  With stateful analog models the carried hidden state
+         * of the converged orbit (analog CKTstate values, model time) is put back, as for a restarted shooting run. */
+        if (g_hid_nc > 0 || g_hid_nhy > 0) PSSxsPacBegin(ckt); else g_xs_toff = 0.0;
 #endif
         /* card #553: the recording pass's plot is never read; keep one point per vector (PSS_KEEP_RUN_DATA=1: old behaviour) */
         PSSdiscardRunData = !(getenv("PSS_KEEP_RUN_DATA") && atoi(getenv("PSS_KEEP_RUN_DATA")) != 0);
         err = DCtran(ckt, 1);
         PSSdiscardRunData = 0;
         ckt->CKTreltol = save_reltol;
+#ifdef XSPICE
+        if (g_hid_nc > 0 || g_hid_nhy > 0) PSSxsPacEnd();
+#endif
     }
     PSSeventLocateActive = PSSswLagActive = 0;
 
@@ -594,6 +602,35 @@ static int g_pp_has_mutual = 0;                  /* a mutual inductor (K) is pre
 static int g_pp_detect = 0, g_pp_detect_hit = 0; /* model-charge detection prepass state */
 static void pac_detect_step(CKTcircuit *ckt);
 static double *g_pp_xend = NULL;
+
+/* card #557: HIDDEN-STATE td small-signal recursion for XSPICE analog code models with state (s_xfer, int, d_dt, slew, hyst).
+ * The model's CKTstate slots (cm_analog_alloc'd: integrator outputs, old inputs, ...) are extra Floquet states h.  One accepted
+ * step of the real transient is a map (x_k, h_k) = S(x_{k-1}..., h_{k-1}); linearised at the accepted point it reads
+ *       J'_k y_k + B_k dh_{k-1} = (forcing + capacitive history),      dh_k = P_k y_k + R_k dh_{k-1}
+ * where B = dF/dh1 (F = J x - rhs is the load residual, state1 slot perturbed), P = dh0/dx, R = dh0/dh1 and J' is J with the columns
+ * of the model's input nodes replaced by the finite-difference dF/dx (the models' declared PARTIALs are not always the derivative:
+ * s_xfer's PARTIAL(out,in) is the value of an integrator, not a partial).  Every matrix comes from central differences of
+ * the model through full CKTload() calls, so no per-model code exists.  The slot set is found in the prepass: slots reachable
+ * from the inputs (P or R chain) AND read by a later step (B or R chain) -- constants (coefficients copied state1 -> state0, time
+ * stamps) and write-only slots (in/out copies) are dropped.  cm_analog_integrate uses g_xs_ag0_fix while ag0 is varied for C_k
+ * so the models do not enter the charge matrix. */
+static int g_hid_nc = 0;          /* candidate slots (0: no stateful XSPICE model) */
+static int g_hid_nin = 0;         /* input rows of the stateful instances */
+static int g_hid_nh = 0;          /* ACTIVE hidden states (virtual rows neq+1 .. neq+nh of Cprev/Cnew) */
+static int g_hid_mode = 0;        /* 0 off, 1 prepass pattern, 2 forward (matrices per step) */
+static int g_hid_slewact = 0;
+static int g_hid_stride = 1;      /* prepass: pattern probed every stride-th step (all steps up to ~20000 per period) */
+static char *g_hid_cslew = NULL;  /* candidate slot belongs to a 'slew' model: slew-rate limiting active on the orbit is refused (saltation) */
+static int *g_hid_cslot = NULL, *g_hid_inrow = NULL, *g_hid_act = NULL;   /* candidate state indices; input rows; active -> candidate */
+static double *g_hid_cscale = NULL;
+static unsigned char *g_hid_patP = NULL, *g_hid_patR = NULL, *g_hid_patB = NULL;
+static double *g_hid_Bh = NULL, *g_hid_P = NULL, *g_hid_R = NULL, *g_hid_Jc = NULL;   /* [(neq+1)*nh], [nh*nin], [nh*nh], [(neq+1)*nin] */
+static int g_hid_nrow = 0;        /* neq + nh while the generic recursion runs */
+static int g_hid_flips = 0;       /* discrete (Boolean) model state changes seen on the orbit */
+#ifdef XSPICE
+static int pac_hid_stage(CKTcircuit *ckt, double ag0, const double *xbase, const double *st0);
+static PACtrip g_hid_J = { 0, 0, NULL, NULL, NULL };   /* scratch matrix of the finite-difference loads */
+#endif
 
 
 
@@ -834,8 +871,10 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
     g_pac_demod_active = demod_active;
     g_pac_tprev = 0.0;
 
-    g_pac_Cprev = TMALLOC(PACc, (size_t) (neq + 1) * M);
-    g_pac_Cnew  = TMALLOC(PACc, (size_t) (neq + 1) * M);
+    g_hid_nrow = neq + (map->generic ? g_hid_nh : 0);   /* card #557: virtual rows of the hidden states */
+    g_pac_Cprev = TMALLOC(PACc, (size_t) (g_hid_nrow + 1) * M);
+    g_pac_Cnew  = TMALLOC(PACc, (size_t) (g_hid_nrow + 1) * M);
+    if (g_pac_Cnew) memset(g_pac_Cnew, 0, (size_t) (g_hid_nrow + 1) * M * sizeof(PACc));
     g_pac_gen = map->generic;
     {
         size_t tsz = g_pac_gen ? (size_t) (neq + 1) : (size_t) n;
@@ -886,7 +925,7 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
         return 1;
     }
 
-    memset(g_pac_Cprev, 0, (size_t) (neq + 1) * M * sizeof(PACc));
+    memset(g_pac_Cprev, 0, (size_t) (g_hid_nrow + 1) * M * sizeof(PACc));
     memset(g_pac_Tprev, 0, (size_t) (g_pac_gen ? (neq + 1) : n) * M * sizeof(PACc));
     if (demod_active) {
         memset(g_pac_demod, 0, (size_t) neq * M * sizeof(PACc));
@@ -1087,7 +1126,13 @@ pac_jload(CKTcircuit *ckt, double a, PACtrip *t)
     int err, nnz;
 
     ckt->CKTag[0] = a;
+#ifdef XSPICE
+    g_xs_ag0_fix = sag0;   /* card #557: code-model integrals keep the true ag0 while the device charges are separated */
+#endif
     err = CKTload(ckt);
+#ifdef XSPICE
+    g_xs_ag0_fix = 0.0;
+#endif
     ckt->CKTag[0] = sag0;
     if (err)
         return 1;
@@ -1159,6 +1204,295 @@ pac_gen_identify_bad(CKTcircuit *ckt, double ag0)
         snprintf(g_pac_gen_badname, sizeof g_pac_gen_badname, "(not isolated to one device type)");
 }
 
+/* ---------------------------------------------------------------------------------------------------------------------------
+ * card #557: hidden-state machinery (see the comment at g_hid_nc).  XSPICE only. */
+#ifdef XSPICE
+static int g_hid_nhy = 0;                 /* slots of hyst models (Boolean state; flips are events) */
+static int *g_hid_hyslot = NULL;
+
+static void
+pac_hid_free(void)
+{
+    if (g_hid_cslot) tfree(g_hid_cslot);
+    if (g_hid_inrow) tfree(g_hid_inrow);
+    if (g_hid_act) tfree(g_hid_act);
+    if (g_hid_cscale) tfree(g_hid_cscale);
+    if (g_hid_cslew) tfree(g_hid_cslew);
+    g_hid_cslew = NULL;
+    if (g_hid_patP) tfree(g_hid_patP);
+    if (g_hid_patR) tfree(g_hid_patR);
+    if (g_hid_patB) tfree(g_hid_patB);
+    if (g_hid_Bh) tfree(g_hid_Bh);
+    if (g_hid_P) tfree(g_hid_P);
+    if (g_hid_R) tfree(g_hid_R);
+    if (g_hid_Jc) tfree(g_hid_Jc);
+    if (g_hid_hyslot) tfree(g_hid_hyslot);
+    g_hid_cslot = g_hid_inrow = g_hid_act = g_hid_hyslot = NULL;
+    g_hid_cscale = g_hid_Bh = g_hid_P = g_hid_R = g_hid_Jc = NULL;
+    g_hid_patP = g_hid_patR = g_hid_patB = NULL;
+    g_hid_nc = g_hid_nin = g_hid_nh = g_hid_mode = g_hid_nrow = g_hid_flips = g_hid_nhy = 0;
+}
+
+static void
+pac_hid_add_unique(int **list, int *n, int v)
+{
+    int i;
+    for (i = 0; i < *n; i++)
+        if ((*list)[i] == v) return;
+    *list = TREALLOC(int, *list, *n + 1);
+    (*list)[(*n)++] = v;
+}
+
+/* Candidate slots and input rows of every instance of a td-supported stateful analog code model.  Returns the number of candidate
+ * slots (also g_hid_nc). */
+static int
+pac_hid_collect(CKTcircuit *ckt)
+{
+    int i, k, d, ci, j;
+    pac_hid_free();
+    if (getenv("PAC_HID_OFF"))
+        return 0;
+    for (i = 0; i < DEVmaxnum; i++) {
+        GENmodel *m;
+        const char *nm;
+        int is_hyst;
+        if (!DEVices[i] || !DEVices[i]->DEVpublic.cm_func || !ckt->CKThead[i] || !DEVices[i]->DEVpublic.name)
+            continue;
+        nm = DEVices[i]->DEVpublic.name;
+        if (!PSSxsTdStateful(nm))
+            continue;
+        is_hyst = !strcmp(nm, "hyst");
+        for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+            GENinstance *g;
+            for (g = m->GENinstances; g; g = g->GENnextInstance) {
+                MIFinstance *here = (MIFinstance *) g;
+                if (!here->analog) continue;
+                for (k = 0; k < here->num_state; k++)
+                    for (d = 0; d < here->state[k].doubles; d++) {
+                        int idx = here->state[k].index + d;
+                        if (is_hyst) pac_hid_add_unique(&g_hid_hyslot, &g_hid_nhy, idx);
+                        else {
+                            int n0 = g_hid_nc;
+                            pac_hid_add_unique(&g_hid_cslot, &g_hid_nc, idx);
+                            if (g_hid_nc > n0) {
+                                g_hid_cslew = TREALLOC(char, g_hid_cslew, g_hid_nc);
+                                g_hid_cslew[g_hid_nc - 1] = !strcmp(nm, "slew");
+                            }
+                        }
+                    }
+                if (is_hyst) continue;   /* a discrete-state static nonlinearity: J exact, no hidden states */
+                for (ci = 0; ci < here->num_conn; ci++) {
+                    if (here->conn[ci]->is_null || !here->conn[ci]->is_input) continue;
+                    for (j = 0; j < here->conn[ci]->size; j++) {
+                        Mif_Port_Data_t *fast = here->conn[ci]->port[j];
+                        if (fast->is_null) continue;
+                        switch (fast->type) {
+                        case MIF_VOLTAGE: case MIF_DIFF_VOLTAGE: case MIF_CONDUCTANCE: case MIF_DIFF_CONDUCTANCE:
+                            if (fast->smp_data.pos_node > 0) pac_hid_add_unique(&g_hid_inrow, &g_hid_nin, fast->smp_data.pos_node);
+                            if (fast->smp_data.neg_node > 0) pac_hid_add_unique(&g_hid_inrow, &g_hid_nin, fast->smp_data.neg_node);
+                            break;
+                        case MIF_CURRENT: case MIF_DIFF_CURRENT: case MIF_VSOURCE_CURRENT: case MIF_RESISTANCE: case MIF_DIFF_RESISTANCE:
+                            if (fast->smp_data.ibranch > 0) pac_hid_add_unique(&g_hid_inrow, &g_hid_nin, fast->smp_data.ibranch);
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (g_hid_nc > 0) {
+        g_hid_cscale = TMALLOC(double, g_hid_nc);
+        g_hid_patP = TMALLOC(unsigned char, g_hid_nc);
+        g_hid_patB = TMALLOC(unsigned char, g_hid_nc);
+        g_hid_patR = TMALLOC(unsigned char, (size_t) g_hid_nc * g_hid_nc);
+        memset(g_hid_cscale, 0, (size_t) g_hid_nc * sizeof(double));
+    }
+    return g_hid_nc;
+}
+
+/* One full load at (x, current states); F = J x - rhs over rows 1..neq, h0 = state0 of the candidate (or active) slots. */
+static int
+pac_hid_eval(CKTcircuit *ckt, double ag0, const double *x, double *F, double *h0, const int *slots, int ns)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix), i, r;
+    memcpy(ckt->CKTrhsOld, x, (size_t) (neq + 1) * sizeof(double));
+    ckt->CKTnoncon = 0;
+    if (pac_jload(ckt, ag0, &g_hid_J))
+        return 1;
+    for (r = 1; r <= neq; r++)
+        F[r] = -ckt->CKTrhs[r];
+    for (i = 0; i < g_hid_J.n; i++) {
+        int rr = g_hid_J.ri[i], cc = g_hid_J.ci[i];
+        if (rr > 0 && cc > 0) F[rr] += g_hid_J.v[i] * x[cc];
+    }
+    for (i = 0; i < ns; i++)
+        h0[i] = ckt->CKTstate0[slots[i]];
+    return 0;
+}
+
+/* Smallest relative response, over the entries that responded at all, of a central-difference pair: the step is enlarged until the
+ * response is resolved (>= 1e-7 of its own entry) or three times.  Entries that did not respond (bit-identical) are no dependence. */
+static double
+pac_hid_resp(const double *Fp, const double *Fm, int n0, int n1)
+{
+    int r; double q = 0.0;
+    for (r = n0; r <= n1; r++) {
+        double d = fabs(Fp[r] - Fm[r]);
+        if (d == 0.0) continue;
+        d /= (fabs(Fp[r]) + fabs(Fm[r]) + 1e-300);
+        if (d > q) q = d;
+    }
+    return q;
+}
+
+/* One central-difference probe: kind 0 = node row `idx` of x, kind 1 = CKTstate1[idx].  On return Fp/Fm/hp/hm hold the last pair and
+ * *delta the step used. */
+static int
+pac_hid_probe(CKTcircuit *ckt, double ag0, double *x, int kind, int idx, double del0, const int *slots, int ns,
+              double *Fp, double *Fm, double *hp, double *hm, double *delta)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix), tries, err = 0;
+    double base = (kind == 0) ? x[idx] : ckt->CKTstate1[idx];
+    double del = del0;
+    for (tries = 0; tries < 4; tries++) {
+        double qF, qH;
+        if (kind == 0) x[idx] = base + del; else ckt->CKTstate1[idx] = base + del;
+        err = pac_hid_eval(ckt, ag0, x, Fp, hp, slots, ns);
+        if (!err) {
+            if (kind == 0) x[idx] = base - del; else ckt->CKTstate1[idx] = base - del;
+            err = pac_hid_eval(ckt, ag0, x, Fm, hm, slots, ns);
+        }
+        if (kind == 0) x[idx] = base; else ckt->CKTstate1[idx] = base;
+        if (err) return 1;
+        qF = pac_hid_resp(Fp, Fm, 1, neq);
+        qH = pac_hid_resp(hp - 1, hm - 1, 1, ns);
+        if (tries == 3 || ((qF == 0.0 || qF >= 1e-7) && (qH == 0.0 || qH >= 1e-7)))
+            break;
+        { double q = (qF > 0.0 && qF < 1e-7) ? qF : 1e300; if (qH > 0.0 && qH < 1e-7 && qH < q) q = qH;
+          del *= fmin(1e3, 1e-6 / q); }
+    }
+    *delta = del;
+    return 0;
+}
+
+/* Central differences of the model.  mode 1 (prepass): pattern of dependences over all candidate slots.  mode 2: P, R, B and the
+ * input columns of J for the ACTIVE slots.  Called from pac_gen_loads between its J2 and J1 loads; xbase = x_k, st0 = CKTstate0 of
+ * the accepted step.  Returns 1 on a hard failure. */
+static int
+pac_hid_stage(CKTcircuit *ckt, double ag0, const double *xbase, const double *st0)
+{
+    int neq = SMPmatSize(ckt->CKTmatrix), nstates = ckt->CKTnumStates, ns, i, a, r, err = 0;
+    const int *slots;
+    double *Fp = NULL, *Fm = NULL, *hp = NULL, *hm = NULL, *x = NULL, *save_s0 = NULL, *save_s1 = NULL;
+    int act = (g_hid_mode == 2);
+    int nact = act ? g_hid_nh : g_hid_nc;
+    int *aslot = NULL;
+    double S = 0.0;
+
+    if (g_hid_nc <= 0 || nstates <= 0)
+        return 0;
+    ns = nact;
+    aslot = TMALLOC(int, ns > 0 ? ns : 1);
+    for (a = 0; a < ns; a++)
+        aslot[a] = act ? g_hid_cslot[g_hid_act[a]] : g_hid_cslot[a];
+    slots = aslot;
+    Fp = TMALLOC(double, neq + 1); Fm = TMALLOC(double, neq + 1);
+    hp = TMALLOC(double, ns > 0 ? ns + 1 : 2); hm = TMALLOC(double, ns > 0 ? ns + 1 : 2);
+    x = TMALLOC(double, neq + 1);
+    save_s0 = TMALLOC(double, nstates); save_s1 = TMALLOC(double, nstates);
+    if (!Fp || !Fm || !hp || !hm || !x || !save_s0 || !save_s1) { err = 1; goto out; }
+    memcpy(x, xbase, (size_t) (neq + 1) * sizeof(double));
+    memcpy(save_s0, ckt->CKTstate0, (size_t) nstates * sizeof(double));
+    memcpy(save_s1, ckt->CKTstate1, (size_t) nstates * sizeof(double));
+
+    if (!act)
+        for (a = 0; a < ns; a++) {
+            double v = fabs(st0[slots[a]]);
+            if (v > g_hid_cscale[a]) g_hid_cscale[a] = v;
+        }
+    for (a = 0; a < g_hid_nc; a++)
+        if (g_hid_cscale[a] > S) S = g_hid_cscale[a];
+    /* inputs */
+    for (i = 0; i < g_hid_nin && !err; i++) {
+        int row = g_hid_inrow[i];
+        double del = 0.0;
+        err = pac_hid_probe(ckt, ag0, x, 0, row, 1e-6 * fmax(fabs(xbase[row]), 1e-3), slots, ns, Fp, Fm, hp, hm, &del);
+        if (err) break;
+        if (act) {
+            for (r = 1; r <= neq; r++) g_hid_Jc[(size_t) r * g_hid_nin + i] = (Fp[r] - Fm[r]) / (2.0 * del);
+            for (a = 0; a < ns; a++) g_hid_P[(size_t) a * g_hid_nin + i] = (hp[a] - hm[a]) / (2.0 * del);
+        } else {
+            for (a = 0; a < ns; a++)
+                if (hp[a] != hm[a]) g_hid_patP[a] = 1;
+        }
+    }
+    /* state slots */
+    for (a = 0; a < ns && !err; a++) {
+        int sl = slots[a], b;
+        double h1 = save_s1[sl], del = 0.0;
+        err = pac_hid_probe(ckt, ag0, x, 1, sl, 1e-6 * fmax(fmax(S, fabs(h1)), 1e-9), slots, ns, Fp, Fm, hp, hm, &del);
+        if (err) break;
+        if (act) {
+            for (r = 1; r <= neq; r++) g_hid_Bh[(size_t) r * ns + a] = (Fp[r] - Fm[r]) / (2.0 * del);
+            for (b = 0; b < ns; b++) g_hid_R[(size_t) b * ns + a] = (hp[b] - hm[b]) / (2.0 * del);
+        } else {
+            for (r = 1; r <= neq; r++)
+                if (Fp[r] != Fm[r]) { g_hid_patB[a] = 1; break; }
+            for (b = 0; b < ns; b++)
+                if (hp[b] != hm[b]) g_hid_patR[(size_t) b * ns + a] = 1;
+        }
+    }
+    memcpy(ckt->CKTstate0, save_s0, (size_t) nstates * sizeof(double));
+    memcpy(ckt->CKTstate1, save_s1, (size_t) nstates * sizeof(double));
+out:
+    if (Fp) tfree(Fp); if (Fm) tfree(Fm); if (hp) tfree(hp); if (hm) tfree(hm); if (x) tfree(x);
+    if (save_s0) tfree(save_s0); if (save_s1) tfree(save_s1); if (aslot) tfree(aslot);
+    return err ? 1 : 0;
+}
+
+/* End of the prepass: reachable-from-inputs AND needed-by-a-later-step slots become the active set. */
+static void
+pac_hid_finalize(void)
+{
+    int nc = g_hid_nc, j, l, changed, na = 0;
+    unsigned char *reach = NULL, *need = NULL;
+    if (nc <= 0)
+        return;
+    reach = TMALLOC(unsigned char, nc); need = TMALLOC(unsigned char, nc);
+    for (j = 0; j < nc; j++) { reach[j] = g_hid_patP[j]; need[j] = g_hid_patB[j]; }
+    do {
+        changed = 0;
+        for (j = 0; j < nc; j++)
+            for (l = 0; l < nc; l++) {
+                if (j == l || !g_hid_patR[(size_t) j * nc + l]) continue;
+                if (reach[l] && !reach[j]) { reach[j] = 1; changed = 1; }   /* j (new) depends on l */
+                if (need[j] && !need[l]) { need[l] = 1; changed = 1; }       /* l feeds a needed slot */
+            }
+    } while (changed);
+    g_hid_act = TMALLOC(int, nc);
+    for (j = 0; j < nc; j++)
+        if (reach[j] && need[j]) g_hid_act[na++] = j;
+    g_hid_nh = na;
+    g_hid_mode = 0;
+    g_hid_slewact = 0;
+    for (j = 0; j < na; j++)
+        if (g_hid_cslew && g_hid_cslew[g_hid_act[j]]) g_hid_slewact = 1;
+    if (getenv("PAC_HID_TRACE")) {
+        int q;
+        for (j = 0; j < nc; j++) {
+            fprintf(stderr, "PAC-HID: cand %d state %d scale %.4g patP=%d patB=%d reach=%d need=%d R:", j, g_hid_cslot[j], g_hid_cscale[j], g_hid_patP[j], g_hid_patB[j], reach[j], need[j]);
+            for (q = 0; q < nc; q++) fprintf(stderr, "%d", g_hid_patR[(size_t) j * nc + q]);
+            fprintf(stderr, "\n");
+        }
+    }
+    tfree(reach); tfree(need);
+    if (getenv("PAC_HID_TRACE"))
+        fprintf(stderr, "PAC-TD: hidden-state set: %d candidate slots -> %d active, %d input rows\n", nc, na, g_hid_nin);
+}
+#endif   /* XSPICE */
+
 /* Load J(ag0) and C = dq/dx at the TRUE accepted point x_k = CKTrhs.  Leaves ckt->CKTmatrix holding
  * the factored J_k (if do_factor) -- exactly pac_refactor_at_accepted()'s contract -- and the
  * charge matrix in g_pac_C.  Everything the loads touch (CKTrhs, CKTrhsOld, CKTstate0, noncon,
@@ -1173,6 +1507,7 @@ pac_gen_loads(CKTcircuit *ckt, double a1, int check, int do_factor)
     int save_noncon = ckt->CKTnoncon, save_bypass = ckt->CKTbypass;
     PACtrip *C = &g_pac_C;
     double d12 = 0.5 * a1;
+    int save_order = ckt->CKTorder;
 
     save_rhs = TMALLOC(double, neq + 1);
     save_rhsold = TMALLOC(double, neq + 1);
@@ -1192,6 +1527,12 @@ pac_gen_loads(CKTcircuit *ckt, double a1, int check, int do_factor)
     memcpy(ckt->CKTrhsOld, ckt->CKTrhs, (size_t) (neq + 1) * sizeof(double));
     ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODETRAN | MODEINITFLOAT;
     ckt->CKTbypass = 0;
+#ifdef XSPICE
+    /* card #557: cm_analog_integrate() switches on ckt->CKTorder, which is already the NEXT step's at this call site (see
+     * PSSpacRecordStep); use the order of the step just accepted, recovered from ag as there. */
+    if (g_hid_nc > 0 && ckt->CKTintegrateMethod == TRAPEZOIDAL)
+        ckt->CKTorder = (fabs(ckt->CKTag[1] + ckt->CKTag[0]) < 1e-6 * fabs(ckt->CKTag[0])) ? 1 : 2;
+#endif
 
     ckt->CKTnoncon = 0;
     if (g_pac_gen_warm) {
@@ -1225,6 +1566,13 @@ pac_gen_loads(CKTcircuit *ckt, double a1, int check, int do_factor)
     }
     if (!err && check)
         err = pac_jload(ckt, 2.0 * a1, &g_pac_J3);
+#ifdef XSPICE
+    if (!err && g_hid_nc > 0 && g_hid_mode) {      /* card #557: finite differences of the stateful code models */
+        err = pac_hid_stage(ckt, a1, save_rhs, save_state0);
+        memcpy(ckt->CKTrhsOld, save_rhs, (size_t) (neq + 1) * sizeof(double));
+        ckt->CKTnoncon = 0;
+    }
+#endif
     if (!err)
         err = pac_jload(ckt, a1, &g_pac_J1);       /* last: the matrix now holds J_k */
     if (!err) {
@@ -1252,11 +1600,50 @@ pac_gen_loads(CKTcircuit *ckt, double a1, int check, int do_factor)
         g_pac_gen_bad = 1;
         pac_gen_identify_bad(ckt, a1);
     }
+#ifdef XSPICE
+    if (!err && do_factor && g_hid_mode == 2 && g_hid_nh > 0) {
+        /* card #557: the model's input columns of J_k are the finite-difference dF/dx (declared PARTIALs are not always the derivative) */
+        int k, c, nin = g_hid_nin;
+        unsigned char *seen = TMALLOC(unsigned char, (size_t) (neq + 1) * nin);
+        int *cmap = TMALLOC(int, neq + 1);
+        if (!seen || !cmap) err = 1;
+        else {
+            memset(seen, 0, (size_t) (neq + 1) * nin);
+            for (c = 0; c <= neq; c++) cmap[c] = -1;
+            for (k = 0; k < nin; k++) cmap[g_hid_inrow[k]] = k;
+            for (i = 0; i < g_pac_J1.n; i++) {
+                int r = g_pac_J1.ri[i], cc = g_pac_J1.ci[i];
+                if (r > 0 && cc > 0 && cmap[cc] >= 0) {
+                    g_pac_J1.v[i] = g_hid_Jc[(size_t) r * nin + cmap[cc]];
+                    seen[(size_t) r * nin + cmap[cc]] = 1;
+                }
+            }
+            for (k = 0; k < nin && !err; k++) {
+                double mx = 0.0;
+                int r;
+                for (r = 1; r <= neq; r++) { double v = fabs(g_hid_Jc[(size_t) r * nin + k]); if (v > mx) mx = v; }
+                for (r = 1; r <= neq; r++)
+                    if (!seen[(size_t) r * nin + k] && fabs(g_hid_Jc[(size_t) r * nin + k]) > 1e-9 * mx) {
+                        fprintf(stderr, "PAC-TD: stateful code model: the finite-difference Jacobian column of node row %d has an entry at row %d "
+                                "outside the loaded matrix structure (%.3g); abandoning (card #557).\n", g_hid_inrow[k], r, g_hid_Jc[(size_t) r * nin + k]);
+                        err = 1;
+                    }
+            }
+            if (getenv("PAC_HID_NO_JCOL")) {   /* red proof: keep the declared PARTIALs (wrong for s_xfer) */
+                SMPcopyElements(ckt->CKTmatrix, g_pac_J1.ri, g_pac_J1.ci, g_pac_J1.v);
+            }
+            else if (!err && SMPsetElements(ckt->CKTmatrix, g_pac_J1.n, g_pac_J1.ri, g_pac_J1.ci, g_pac_J1.v)) err = 1;
+        }
+        if (seen) tfree(seen);
+        if (cmap) tfree(cmap);
+    }
+#endif
     if (!err && do_factor && !g_pac_gen_bad) {
         /* the last pac_jload() was the J1 load, but pac_gen_identify_bad() (bad path only) clobbers */
         err = SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin) ? 1 : 0;
     }
 
+    ckt->CKTorder = save_order;
     ckt->CKTmode = save_mode;
     ckt->CKTbypass = save_bypass;
     ckt->CKTnoncon = save_noncon;
@@ -1387,6 +1774,8 @@ pac_mq_on(void)
     return on;
 }
 
+static int pac_hid_active(void);   /* card #557/#558: defined with the hidden-state code */
+
 static void
 pac_mq_put(int m)
 {
@@ -1439,6 +1828,61 @@ pac_mq_flush(CKTcircuit *ckt, int M)
         }
 }
 
+#ifdef XSPICE
+/* card #557: hidden-state terms of one step for column m: rhs -= B dh_{k-1} (before the solve), dh_k = P y_k + R dh_{k-1} (after). */
+static int
+pac_hid_active(void)
+{
+    return g_hid_nh > 0 && g_hid_mode == 2;
+}
+
+static void
+pac_hid_rhs(int m, int M)
+{
+    int neq = g_pac_neq, a, row, nh = g_hid_nh;
+    if (nh <= 0 || g_hid_mode != 2 || getenv("PAC_HID_RED")) return;   /* PAC_HID_RED=1: red proof, the hidden states do not act on the nodes */
+    for (a = 0; a < nh; a++) {
+        PACc hv = g_pac_Cprev[(size_t) (neq + 1 + a) * M + m];
+        if (hv.re == 0.0 && hv.im == 0.0) continue;
+        for (row = 1; row <= neq; row++) {
+            double b = g_hid_Bh[(size_t) row * nh + a];
+            if (b == 0.0) continue;
+            g_pac_rhs_re[row] -= b * hv.re;
+            g_pac_rhs_im[row] -= b * hv.im;
+        }
+    }
+}
+
+static void
+pac_hid_update(int m, int M)
+{
+    int neq = g_pac_neq, a, b, i, nh = g_hid_nh, nin = g_hid_nin;
+    if (nh <= 0 || g_hid_mode != 2) return;
+    for (a = 0; a < nh; a++) {
+        PACc v = { 0.0, 0.0 };
+        for (i = 0; i < nin; i++) {
+            double p = g_hid_P[(size_t) a * nin + i];
+            PACc y;
+            if (p == 0.0) continue;
+            y = g_pac_Cnew[(size_t) g_hid_inrow[i] * M + m];
+            v.re += p * y.re; v.im += p * y.im;
+        }
+        for (b = 0; b < nh; b++) {
+            double r = g_hid_R[(size_t) a * nh + b];
+            PACc y;
+            if (r == 0.0) continue;
+            y = g_pac_Cprev[(size_t) (neq + 1 + b) * M + m];
+            v.re += r * y.re; v.im += r * y.im;
+        }
+        g_pac_Cnew[(size_t) (neq + 1 + a) * M + m] = v;
+    }
+}
+#else
+static int pac_hid_active(void) { return 0; }
+static void pac_hid_rhs(int m, int M) { (void) m; (void) M; }
+static void pac_hid_update(int m, int M) { (void) m; (void) M; }
+#endif
+
 /* One accepted step of the generic recursion for all M columns. */
 static int
 pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new,
@@ -1447,6 +1891,16 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
     int neq = g_pac_neq, M = g_pac_M, m, row;
     double a1 = (order == 2) ? ag1 : 0.0;
 
+#ifdef XSPICE
+    if (g_hid_nh > 0) {
+        g_hid_mode = 2;
+        if (n_salt > 0) {
+            fprintf(stderr, "PAC-TD: REFUSED -- an ideal-switch (saltation) event with a stateful XSPICE code model in the circuit: the "
+                    "event jump of the hidden states is not derived (card #557).\n");
+            return 1;
+        }
+    }
+#endif
     if (pac_gen_loads(ckt, ag0, g_pac_gen_check, 1)) {
         fprintf(stderr, "PAC-TD: generic charge extraction/refactor failed at t=%g; abandoning this pass.\n", t_new);
         return 1;
@@ -1507,8 +1961,9 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                     g_pac_rhs_im[row] += br * s + bi * c;
                 }
             }
-            if (pac_mq_on())
-                pac_mq_put(m);   /* card #558: solved for all columns after the loop */
+            pac_hid_rhs(m, M);
+            if (pac_mq_on() && !pac_hid_active())
+                pac_mq_put(m);   /* card #558: solved for all columns after the loop (not with #557 hidden states: they update per column after the solve) */
             else {
                 pac_solve_cplx(ckt);
                 for (row = 1; row <= neq; row++) {
@@ -1516,8 +1971,9 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                     pac_set(g_pac_Cnew, row, M, m, v);
                 }
             }
+            pac_hid_update(m, M);
         }
-        if (pac_mq_on())
+        if (pac_mq_on() && !pac_hid_active())
             pac_mq_flush(ckt, M);
         pac_C_mul(&g_pac_C, g_pac_Cnew, g_pac_Qnew, neq, M);
         {   /* shift the charge history: Q_{k-j} <- Q_{k-j+1}, Q_{k-1} <- Q_k */
@@ -1550,8 +2006,9 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                 g_pac_rhs_im[row] += br * s + bi * c;
             }
         }
-        if (pac_mq_on())
-            pac_mq_put(m);   /* card #558: solved for all columns after the loop */
+        pac_hid_rhs(m, M);
+        if (pac_mq_on() && !pac_hid_active())
+            pac_mq_put(m);   /* card #558: solved for all columns after the loop (not with #557 hidden states: they update per column after the solve) */
         else {
             pac_solve_cplx(ckt);
             for (row = 1; row <= neq; row++) {
@@ -1559,8 +2016,9 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                 pac_set(g_pac_Cnew, row, M, m, v);
             }
         }
+        pac_hid_update(m, M);
     }
-    if (pac_mq_on())
+    if (pac_mq_on() && !pac_hid_active())
         pac_mq_flush(ckt, M);
     /* card #544: saltation (ideal sw/csw event) with model charges on the orbit.  The state jump of the native recursion
      * (Fang: delta_x+ = delta_x- - (f+ - f-) dt_e, dt_e = -(grad h . delta_x-)/h_dot, applied as a direct value jump at the
@@ -1642,11 +2100,28 @@ pac_prepass_step(CKTcircuit *ckt)
     int i;
     if (ckt->CKTtime <= 0.0 || g_pac_gen_bad || !g_pp_col)
         return;
+#ifdef XSPICE
+    if (g_hid_nhy > 0 && ckt->CKTstate0 && ckt->CKTstate1) {   /* hyst: a flip of the Boolean state is an event the recursion does not carry */
+        int hi;
+        for (hi = 0; hi < g_hid_nhy; hi++)
+            if (*(int *) &ckt->CKTstate0[g_hid_hyslot[hi]] != *(int *) &ckt->CKTstate1[g_hid_hyslot[hi]]) { g_hid_flips++; break; }
+    }
+    if (g_hid_nc > 0)
+        g_hid_mode = ((g_pp_steps % g_hid_stride) == 0) ? 1 : 0;
+#endif
     if (pac_gen_loads(ckt, ckt->CKTag[0], 1, 0)) {
         g_pac_gen_bad = -1;   /* hard failure */
         return;
     }
     g_pp_steps++;
+#ifdef XSPICE
+    if (g_hid_nc > 0 && getenv("PAC_HID_TRACE") && (g_pp_steps <= 2 || ckt->CKTtime >= 0.999999 * ckt->CKTfinalTime)) {
+        int hi;
+        fprintf(stderr, "PAC-HID: prepass step %d t=%.9g slots:", g_pp_steps, ckt->CKTtime);
+        for (hi = 0; hi < g_hid_nc && hi < 12; hi++) fprintf(stderr, " %.6g", ckt->CKTstate0[g_hid_cslot[hi]]);
+        fprintf(stderr, "\n");
+    }
+#endif
     if (g_pp_xend)
         memcpy(g_pp_xend, ckt->CKTrhs, (size_t) (g_pp_neq + 1) * sizeof(double));
     for (i = 0; i < g_pac_C.n; i++) {
@@ -1829,7 +2304,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
 
-        if (pac_mq_on())
+        if (pac_mq_on() && !pac_hid_active())
             pac_mq_put(m);   /* card #558: solved for all columns after the loop */
         else {
             pac_solve_cplx(ckt);
@@ -1839,7 +2314,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
     }
-    if (pac_mq_on())
+    if (pac_mq_on() && !pac_hid_active())
         pac_mq_flush(ckt, M);
 
     /* card #494 THIRD pass (rewrite -- see pssshoot.c's PSSsaltFindEvents()
@@ -2499,8 +2974,19 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     static int warned_native = 0;
     double tprep0 = SPfrontEnd->IFseconds();
 
-    if (PSSxspicePolicy(ckt, 2, who))   /* card #551: only stateless analog XSPICE code models have a td small-signal model */
+    /* card #551/#557: stateless analog XSPICE models have a td small-signal model (J exact); s_xfer/int/d_dt/slew/hyst through the hidden-state
+     * recursion (.pac/.pstb/.pxf), all other stateful or digital models are refused; .pnoise (kind 3) refuses the stateful ones too. */
+    if (PSSxspicePolicy(ckt, !strcmp(who, "PNOISE-TD") ? 3 : 2, who))
         return E_UNSUPP;
+#ifdef XSPICE
+    pac_hid_collect(ckt);
+    if ((g_hid_nc > 0 || g_hid_nhy > 0) && ckt->CKTintegrateMethod == GEAR) {
+        fprintf(stderr, "%s: REFUSED -- a stateful XSPICE code model (s_xfer int d_dt slew hyst) with method=gear: the hidden-state recursion "
+                "is derived for the trapezoidal / backward-Euler integral of cm_analog_integrate only (card #557); use method=trap.\n", who);
+        pac_hid_free();
+        return E_UNSUPP;
+    }
+#endif
 
     if (getenv("PAC_NATIVE_HISTORY")) {
         if (!warned_native) {
@@ -2508,6 +2994,9 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
                     "(device-model charges ignored: wrong on MOS/BJT/diode circuits, card #539 red proof)\n", who);
             warned_native = 1;
         }
+#ifdef XSPICE
+        pac_hid_free();
+#endif
         return 0;
     }
     has = pac_circuit_has_model_charges(ckt, &delay);
@@ -2528,6 +3017,9 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     }
     /* card #549: method=gear is carried by the generic (charge-history) recursion only, so it is taken for native decks too */
     force_gen = getenv("PAC_FORCE_GENERIC") != NULL || ckt->CKTintegrateMethod == GEAR;
+#ifdef XSPICE
+    if (g_hid_nc > 0 || g_hid_nhy > 0) force_gen = 1;   /* card #557 */
+#endif
     if (!has && !force_gen)
         return 0;
     neq = SMPmatSize(ckt->CKTmatrix);
@@ -2567,6 +3059,14 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         memset(g_pp_xend, 0, (size_t) (neq + 1) * sizeof(double));
         g_pp_steps = 0; g_pp_cmax = 0.0;
         g_pac_gen_bad = 0; g_pac_gen_badname[0] = '\0';
+#ifdef XSPICE
+        g_hid_flips = 0;
+        if (g_hid_nc > 0) {
+            memset(g_hid_patP, 0, (size_t) g_hid_nc);
+            memset(g_hid_patB, 0, (size_t) g_hid_nc);
+            memset(g_hid_patR, 0, (size_t) g_hid_nc * g_hid_nc);
+        }
+#endif
         pac_state_set_ic(map, x0);
         g_pp_active = 1;
         PSSpacActive = 1;
@@ -2576,7 +3076,13 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         if (g_pac_gen_bad > 0 || err || g_pac_gen_bad < 0 || g_pp_steps < 1)
             break;
         pac_init_from_prepass(ckt);
+#ifdef XSPICE
+        g_hid_stride = (g_pp_steps > 20000) ? (g_pp_steps + 19999) / 20000 : 1;
+#endif
     }
+#ifdef XSPICE
+    g_hid_stride = 1;
+#endif
     if (g_pac_gen_bad > 0) {
         pac_gen_refuse_message(who);
         tfree(g_pp_col); g_pp_col = NULL;
@@ -2593,10 +3099,40 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     }
     ns = 0;
     for (i = 1; i <= neq; i++) if (g_pp_col[i]) ns++;
-    map->srows = TMALLOC(int, ns > 0 ? ns : 1);
+#ifdef XSPICE
+    if (g_hid_nc > 0) pac_hid_finalize();
+    if (g_hid_slewact && !getenv("PAC_HID_ALLOW_SLEW")) {   /* PAC_HID_ALLOW_SLEW=1: experiment (the error of the missing saltation) */
+        fprintf(stderr, "%s: REFUSED -- slew-rate limiting of a 'slew' code model is active on the orbit: the change between the slewing and the "
+                "tracking regime is an event whose small-signal map (saltation) is not derived (card #557); a slew model that never slews is "
+                "accepted (its small-signal gain is the tracking one).\n", who);
+        tfree(g_pp_col); g_pp_col = NULL; tfree(g_pp_xend); g_pp_xend = NULL;
+        pac_init_free(); pac_hid_free();
+        return E_UNSUPP;
+    }
+    if (g_hid_flips > 0 && !getenv("PAC_HID_ALLOW_FLIP")) {   /* PAC_HID_ALLOW_FLIP=1: experiment */
+        fprintf(stderr, "%s: REFUSED -- the Boolean state of a 'hyst' code model changes on the orbit (%d steps with a state flip): the flip is an "
+                "event whose small-signal map (saltation) is not derived (card #557); a hyst model that stays on one branch is accepted.\n",
+                who, g_hid_flips);
+        tfree(g_pp_col); g_pp_col = NULL; tfree(g_pp_xend); g_pp_xend = NULL;
+        pac_init_free(); pac_hid_free();
+        return E_UNSUPP;
+    }
+#endif
+    map->srows = TMALLOC(int, ns + g_hid_nh + 1);
     if (!map->srows) { tfree(g_pp_col); g_pp_col = NULL; return E_NOMEM; }
     ns = 0;
     for (i = 1; i <= neq; i++) if (g_pp_col[i]) map->srows[ns++] = i;
+#ifdef XSPICE
+    if (g_hid_nh > 0) {
+        int a;
+        g_hid_Bh = TMALLOC(double, (size_t) (neq + 1) * g_hid_nh);
+        g_hid_P = TMALLOC(double, (size_t) g_hid_nh * g_hid_nin);
+        g_hid_R = TMALLOC(double, (size_t) g_hid_nh * g_hid_nh);
+        g_hid_Jc = TMALLOC(double, (size_t) (neq + 1) * g_hid_nin);
+        if (!g_hid_Bh || !g_hid_P || !g_hid_R || !g_hid_Jc) { tfree(g_pp_col); g_pp_col = NULL; return E_NOMEM; }
+        for (a = 0; a < g_hid_nh; a++) map->srows[ns++] = neq + 1 + a;   /* virtual rows of the hidden states */
+    }
+#endif
     map->ns = ns;
     map->generic = 1;
     tfree(g_pp_col); g_pp_col = NULL;
@@ -2604,7 +3140,10 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     fprintf(stderr, "%s: generic charge-based history (card #542): %d native C/L + model-charge states -> "
             "%d state rows (columns of dq/dx on the orbit, %d steps, affine-in-ag0 check passed, max|C|=%.3g), "
             "prepass wall_time=%.3fs\n",
-            who, map->n, ns, g_pp_steps, g_pp_cmax, SPfrontEnd->IFseconds() - tprep0);
+            who, map->n, ns - g_hid_nh, g_pp_steps, g_pp_cmax, SPfrontEnd->IFseconds() - tprep0);
+    if (g_hid_nh > 0)
+        fprintf(stderr, "%s: stateful XSPICE code models (card #557): %d hidden states (of %d state slots), %d input rows; "
+                "finite-difference linearisation of the models, state carried between recording runs\n", who, g_hid_nh, g_hid_nc, g_hid_nin);
     return 0;
 }
 
@@ -5383,6 +5922,9 @@ pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         if (e) err = e;
     }
     pac_init_free();   /* card #542 */
+#ifdef XSPICE
+    pac_hid_free();    /* card #557 */
+#endif
     return err;
 }
 

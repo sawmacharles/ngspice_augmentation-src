@@ -106,6 +106,9 @@ void PSSsensRecordStep(CKTcircuit *ckt);    /* called right after CKTaccept(), s
 
 extern int PSSrippleRecordActive;
 extern int PSShidActive;           /* card #546 */
+extern int PSSxsTdStateful(const char *nm);   /* card #557 */
+extern int PSSxsPacBegin(CKTcircuit *ckt);   /* card #557: put the carried XSPICE state back before a td recording run */
+extern void PSSxsPacEnd(void);
 extern int PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who);   /* card #551: XSPICE model whitelist (0 ok, E_UNSUPP refused) */
 void PSShidRecordStep(CKTcircuit *ckt);
 

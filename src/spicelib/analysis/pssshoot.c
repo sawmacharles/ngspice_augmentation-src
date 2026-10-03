@@ -545,7 +545,22 @@ static const PSSxsClass g_pss_xs_classes[] = {
     { NULL, 0 }
 };
 
-/* kind 0: .pss method=shoot driven, 1: .pss free-running (trigger=), 2: td small-signal (.pac/.pstb/.pxf/.pnoise solver=td).
+/* card #557: the analog models with state whose td small-signal model is the hidden-state recursion of pacshoot.c (pac_hid_*): the model's
+ * CKTstate slots are extra Floquet states, the per-step map is found by finite differences of the model itself.  Kind 3 (.pnoise, whose
+ * adjoint sweep does not transpose that recursion) still refuses them. */
+int
+PSSxsTdStateful(const char *nm)
+{
+    static const char *const ok[] = { "s_xfer", "int", "d_dt", "slew", "hyst", NULL };
+    int i;
+    if (getenv("PAC_HID_OFF"))
+        return 0;
+    for (i = 0; ok[i]; i++)
+        if (!strcmp(nm, ok[i])) return 1;
+    return 0;
+}
+
+/* kind 0: .pss method=shoot driven, 1: .pss free-running (trigger=), 2: td small-signal (.pac/.pstb/.pxf solver=td), 3: td .pnoise.
  * Returns 0 or E_UNSUPP after printing why. PSS_XSPICE_ANY=1 lifts the check (experiments only). */
 int
 PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who)
@@ -579,7 +594,9 @@ PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who)
                         "(event queue, model state) at the interpolated trigger crossing is not defined; use a driven analysis (fixed "
                         "period, driven=1) -- card #551.\n", who, nm, inst);
                 bad = 1;
-            } else if (kind == 2 && cls != 1) {
+            } else if (kind == 2 && cls == 2 && PSSxsTdStateful(nm)) {
+                /* card #557: handled by pacshoot.c's hidden-state recursion */
+            } else if ((kind == 2 || kind == 3) && cls != 1) {
                 fprintf(stderr, "%s: REFUSED -- XSPICE code model '%s' (instance %s) %s; the time-domain small-signal recursion cannot "
                         "linearise it and would return a wrong curve (card #551). Use a converged FRA (tools/fra*.py) or "
                         "tools/pac_perturbed.py; stateless analog code models (gain summer mult divide limit climit ilimit pwl "
@@ -593,8 +610,33 @@ PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who)
     }
     return bad ? E_UNSUPP : 0;
 }
+/* card #557: a td recording run (pacshoot.c) starts like a restarted shooting run: the carried analog XSPICE state (hidden integrator
+ * states, model time) of the converged orbit is put back before DCtran and again after its t=0 pass.  Returns 1 if a snapshot was put. */
+int
+PSSxsPacBegin(CKTcircuit *ckt)
+{
+    if (g_xs_on && XSsnapValid(g_xs_snap)) {
+        XSsnapPut(ckt, g_xs_snap, g_xs_values);
+        PSSxsPostInitHook = pss_xs_post_init;
+        if (getenv("PAC_HID_TRACE")) fprintf(stderr, "PAC-HID: carried XSPICE state put back (toff=%.9g)\n", g_xs_toff);
+        return 1;
+    }
+    if (getenv("PAC_HID_TRACE")) fprintf(stderr, "PAC-HID: NO carried XSPICE snapshot (g_xs_on=%d)\n", g_xs_on);
+    g_xs_toff = 0.0;
+    return 0;
+}
+
+void
+PSSxsPacEnd(void)
+{
+    PSSxsPostInitHook = NULL;
+}
+
 #else
+int PSSxsTdStateful(const char *nm) { (void) nm; return 0; }
 int PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who) { (void) ckt; (void) kind; (void) who; return 0; }
+int PSSxsPacBegin(CKTcircuit *ckt) { (void) ckt; return 0; }
+void PSSxsPacEnd(void) { }
 #endif
 
 /* card #553: PSS_MEM_TRACE=1 prints resident size and malloc in-use bytes after every period run (diagnostic only) */

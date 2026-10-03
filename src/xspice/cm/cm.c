@@ -550,6 +550,7 @@ static void cm_static_integrate(int    byte_index,
 
     double  ceq;
     double  geq;
+    double  ag0_eff;
 
     char    *char_ptr;
 
@@ -558,6 +559,7 @@ static void cm_static_integrate(int    byte_index,
 
     /* Get the address of the ckt struct from g_mif_info */
     ckt  = g_mif_info.ckt;
+    ag0_eff = (g_xs_ag0_fix != 0.0) ? g_xs_ag0_fix : ckt->CKTag[0];   /* card #557: td small-signal C extraction varies CKTag[0] */
 
     /* Get integral values from current and previous timesteps */
     for(i = 0; i <= ckt->CKTorder; i++) {
@@ -584,7 +586,7 @@ static void cm_static_integrate(int    byte_index,
             /* WARNING - This code needs to be redone.  */
             /* The correct code should rely on one previous value */
             /* of cur as done in NIintegrate() */
-            cur = -0.5 * ckt->CKTag[0] * intgr[1];
+            cur = -0.5 * ag0_eff * intgr[1];
             break;
         }
 
@@ -620,7 +622,7 @@ static void cm_static_integrate(int    byte_index,
     }
 
     ceq = cur;
-    geq = ckt->CKTag[0];
+    geq = ag0_eff;   /* card #557 */
 
     /* WARNING: Take this out when the case 2: above is fixed */
     if((ckt->CKTintegrateMethod == TRAPEZOIDAL) &&
