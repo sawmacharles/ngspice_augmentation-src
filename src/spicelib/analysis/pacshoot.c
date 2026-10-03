@@ -5780,8 +5780,12 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                                                : (nsrc_use > PXF_ADJOINT_AUTO_THRESHOLD);
         int adj_err = PAC_ADJOINT_REFUSED;
 
-        if (trig_idx >= 0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ"))
+        if (trig_idx >= 0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ")) {
+            if (want_adjoint)
+                fprintf(stderr, "PXF-TD: adjoint engine REFUSED (the opt-in free-running period-variation projection, PAC_FREERUN_PROJ, is not "
+                        "transposed) -- using the per-source engine.\n");
             want_adjoint = 0;   /* card #557: the opt-in projection is not transposed (default free-running forward = fixed-period engine) */
+        }
 
         t0 = SPfrontEnd->IFseconds();
         err = OK;
