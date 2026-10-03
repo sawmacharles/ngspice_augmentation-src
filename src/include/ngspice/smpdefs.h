@@ -72,6 +72,9 @@ void SMPcaSolve(SMPmatrix *Matrix, double RHS[], double iRHS[],
 		double Spare[], double iSpare[]);
 void SMPcSolve( SMPmatrix *, double [], double [], double [], double []);
 void SMPsolve( SMPmatrix *, double [], double []);
+/* card #558, round 17: nrhs real right-hand sides at once (column m at RHS + m*ld, node index 1..n as in SMPsolve), one
+ * klu_solve call with nrhs columns under KLU, a loop of SMPsolve otherwise. */
+void SMPsolveMulti( SMPmatrix *, double *, int ld, int nrhs);
 /* card #504: REAL transposed solve (A^T x = b, A the currently-factored
  * REAL matrix) -- the real-matrix analogue of SMPcaSolve (which is the
  * COMPLEX adjoint/transposed solve already used by docs/sens.md's card

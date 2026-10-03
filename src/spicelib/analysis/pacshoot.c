@@ -1369,6 +1369,76 @@ pac_solve_cplx(CKTcircuit *ckt)
     SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
 }
 
+
+/* card #558, round 17: the M columns of one step are independent solves against the same factored matrix.  They can be
+ * collected (pac_mq_put) and solved with one multi-right-hand-side call (SMPsolveMulti: one klu_solve with M columns
+ * under KLU, so L and U are read once per block of columns, not once per column).  The curves are byte-identical to the
+ * column-by-column solves (tests/test_accel17.py), but the wall time is not measurably different on R7p .pstb (8
+ * alternations on one machine: -3 %, inside the +-20 % run-to-run outliers of the machine): OPT-IN, PAC_MULTIRHS=1.
+ * The imaginary parts that are identically zero are skipped exactly as in pac_solve_cplx. */
+static double *g_pac_mq_re = NULL, *g_pac_mq_im = NULL, *g_pac_mq_tmp = NULL;
+static size_t g_pac_mq_cap = 0;
+
+static int
+pac_mq_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PAC_MULTIRHS") != NULL && atoi(getenv("PAC_MULTIRHS")) != 0;
+    return on;
+}
+
+static void
+pac_mq_put(int m)
+{
+    int ld = g_pac_neq + 1;
+    size_t need = (size_t) ld * g_pac_M;
+    if (g_pac_mq_cap < need) {
+        g_pac_mq_re = TREALLOC(double, g_pac_mq_re, need);
+        g_pac_mq_im = TREALLOC(double, g_pac_mq_im, need);
+        g_pac_mq_tmp = TREALLOC(double, g_pac_mq_tmp, need);
+        g_pac_mq_cap = need;
+    }
+    memcpy(g_pac_mq_re + (size_t) m * ld, g_pac_rhs_re, (size_t) ld * sizeof(double));
+    memcpy(g_pac_mq_im + (size_t) m * ld, g_pac_rhs_im, (size_t) ld * sizeof(double));
+}
+
+static void
+pac_mq_flush(CKTcircuit *ckt, int M)
+{
+    static int skip = -1;
+    int ld = g_pac_neq + 1, neq = g_pac_neq, m, row, nz = 0;
+    if (skip < 0) skip = getenv("PAC_NO_ZERO_IM_SKIP") == NULL;
+    SMPsolveMulti(ckt->CKTmatrix, g_pac_mq_re, ld, M);
+    if (skip) {
+        for (m = 0; m < M; m++) {
+            const double *c = g_pac_mq_im + (size_t) m * ld;
+            for (row = 0; row <= neq; row++)
+                if (c[row] != 0.0) break;
+            if (row > neq) continue;
+            memcpy(g_pac_mq_tmp + (size_t) nz * ld, c, (size_t) ld * sizeof(double));
+            nz++;
+        }
+        if (nz) {
+            SMPsolveMulti(ckt->CKTmatrix, g_pac_mq_tmp, ld, nz);
+            nz = 0;
+            for (m = 0; m < M; m++) {
+                double *c = g_pac_mq_im + (size_t) m * ld;
+                for (row = 0; row <= neq; row++)
+                    if (c[row] != 0.0) break;
+                if (row > neq) continue;
+                memcpy(c, g_pac_mq_tmp + (size_t) nz * ld, (size_t) ld * sizeof(double));
+                nz++;
+            }
+        }
+    } else
+        SMPsolveMulti(ckt->CKTmatrix, g_pac_mq_im, ld, M);
+    for (m = 0; m < M; m++)
+        for (row = 1; row <= neq; row++) {
+            PACc v; v.re = g_pac_mq_re[(size_t) m * ld + row]; v.im = g_pac_mq_im[(size_t) m * ld + row];
+            pac_set(g_pac_Cnew, row, M, m, v);
+        }
+}
+
 /* One accepted step of the generic recursion for all M columns. */
 static int
 pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new,
@@ -1437,12 +1507,18 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                     g_pac_rhs_im[row] += br * s + bi * c;
                 }
             }
-            pac_solve_cplx(ckt);
-            for (row = 1; row <= neq; row++) {
-                PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
-                pac_set(g_pac_Cnew, row, M, m, v);
+            if (pac_mq_on())
+                pac_mq_put(m);   /* card #558: solved for all columns after the loop */
+            else {
+                pac_solve_cplx(ckt);
+                for (row = 1; row <= neq; row++) {
+                    PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
+                    pac_set(g_pac_Cnew, row, M, m, v);
+                }
             }
         }
+        if (pac_mq_on())
+            pac_mq_flush(ckt, M);
         pac_C_mul(&g_pac_C, g_pac_Cnew, g_pac_Qnew, neq, M);
         {   /* shift the charge history: Q_{k-j} <- Q_{k-j+1}, Q_{k-1} <- Q_k */
             PACc *oldest = g_pac_Qh[PAC_GEAR_MAXORD];
@@ -1474,12 +1550,18 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                 g_pac_rhs_im[row] += br * s + bi * c;
             }
         }
-        pac_solve_cplx(ckt);
-        for (row = 1; row <= neq; row++) {
-            PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
-            pac_set(g_pac_Cnew, row, M, m, v);
+        if (pac_mq_on())
+            pac_mq_put(m);   /* card #558: solved for all columns after the loop */
+        else {
+            pac_solve_cplx(ckt);
+            for (row = 1; row <= neq; row++) {
+                PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
+                pac_set(g_pac_Cnew, row, M, m, v);
+            }
         }
     }
+    if (pac_mq_on())
+        pac_mq_flush(ckt, M);
     /* card #544: saltation (ideal sw/csw event) with model charges on the orbit.  The state jump of the native recursion
      * (Fang: delta_x+ = delta_x- - (f+ - f-) dt_e, dt_e = -(grad h . delta_x-)/h_dot, applied as a direct value jump at the
      * event's capacitor-node / inductor-branch rows) is exactly what the generic recursion needs too, once the charge vector
@@ -1747,12 +1829,18 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
 
-        pac_solve_cplx(ckt);
-        for (row = 1; row <= neq; row++) {
-            PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
-            pac_set(g_pac_Cnew, row, M, m, v);
+        if (pac_mq_on())
+            pac_mq_put(m);   /* card #558: solved for all columns after the loop */
+        else {
+            pac_solve_cplx(ckt);
+            for (row = 1; row <= neq; row++) {
+                PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
+                pac_set(g_pac_Cnew, row, M, m, v);
+            }
         }
     }
+    if (pac_mq_on())
+        pac_mq_flush(ckt, M);
 
     /* card #494 THIRD pass (rewrite -- see pssshoot.c's PSSsaltFindEvents()
      * derivation comment): apply the saltation correction as a DIRECT VALUE

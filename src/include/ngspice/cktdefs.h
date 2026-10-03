@@ -343,6 +343,10 @@ struct CKTcircuit {
     unsigned int CKTautoklu:1;
     unsigned int CKTkluExplicit:1;
     double CKTautokluThreshold;
+    /* card #558, round 17: set by CKTdoJob when the task holds a shooting .pss
+     * (method=shoot, with its .pac/.pstb/.pnoise/.pxf continuations); CKTsetup then
+     * picks KLU above a node-count rule unless the solver was chosen explicitly. */
+    unsigned int CKTperiodicShoot:1;
 #endif
 };
 

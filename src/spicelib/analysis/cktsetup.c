@@ -10,6 +10,7 @@ Author: 1985 Thomas L. Quarles
      */
 
 #include "ngspice/ngspice.h"
+#define PSS_AUTOKLU_MIN_DEFAULT 128
 #include "ngspice/smpdefs.h"
 #include "ngspice/cktdefs.h"
 #include "ngspice/devdefs.h"
@@ -109,6 +110,27 @@ CKTsetup(CKTcircuit *ckt)
                 "Note: .options autoklu switching to KLU (%d nodes >= "
                 "autoklu_threshold=%g)\n", CKTautokluNodes, CKTautokluThresh);
             ckt->CKTkluMODE = 1;
+        }
+    }
+
+    /* card #558, round 17: periodic (shooting) analyses pick KLU on their
+     * own above a node-count rule (research/transient-acceleration.md sec. 22).
+     * Same constraints as autoklu: before NIinit/DEVsetup, never over an
+     * explicit '.options klu'/'.options sparse'.  Off: NGSPICE_PSS_AUTOKLU=0;
+     * threshold: NGSPICE_PSS_AUTOKLU_MIN (nodes, default PSS_AUTOKLU_MIN_DEFAULT). */
+    if (ckt->CKTperiodicShoot && !ckt->CKTkluExplicit && !ckt->CKTkluMODE
+            && ckt->CKTlastNode) {
+        const char *e = getenv("NGSPICE_PSS_AUTOKLU");
+        if (!(e && e[0] == '0')) {
+            const char *m = getenv("NGSPICE_PSS_AUTOKLU_MIN");
+            double thr = (m && m[0]) ? atof(m) : (double) PSS_AUTOKLU_MIN_DEFAULT;
+            int nn = ckt->CKTlastNode->number;
+            if (thr > 0 && (double) nn >= thr) {
+                fprintf(stdout,
+                    "Note: periodic analysis switching to KLU (%d nodes >= %g; "
+                    ".options sparse or NGSPICE_PSS_AUTOKLU=0 keeps SPARSE)\n", nn, thr);
+                ckt->CKTkluMODE = 1;
+            }
         }
     }
 #endif

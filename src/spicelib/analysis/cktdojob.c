@@ -12,6 +12,9 @@ Modified: 2000 AlansFixes
 #include "ngspice/fteext.h"
 
 #include "analysis.h"
+#ifdef KLU
+#include "ngspice/pssdefs.h"
+#endif
 
 #ifdef XSPICE
 /* gtri - add - wbk - 11/26/90 - add include for MIF and EVT global data */
@@ -117,6 +120,16 @@ CKTdoJob(CKTcircuit* ckt, int reset, TSKtask* task)
     ckt->CKTautoklu = task->TSKautoklu;
     ckt->CKTkluExplicit = task->TSKkluExplicit;
     ckt->CKTautokluThreshold = task->TSKautokluThreshold;
+    /* card #558: does this task run a shooting PSS (or a continuation of it)? */
+    ckt->CKTperiodicShoot = 0;
+    {
+        JOB *pj;
+        for (pj = task->jobs; pj; pj = pj->JOBnextJob)
+            if (pj->JOBtype >= 0 && pj->JOBtype < spice_num_analysis() &&
+                    !strcmp(analInfo[pj->JOBtype]->if_analysis.name, "PSS") &&
+                    ((PSSan *) pj)->PSSmethod == PSS_METHOD_SHOOT)
+                ckt->CKTperiodicShoot = 1;
+    }
 #endif
 
     ckt->CKTlteReltol = task->TSKlteReltol;

@@ -106,6 +106,12 @@ What this does NOT do (see the card #458 report for the full list):
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#ifdef USE_OMP
+#include <omp.h>
+#endif
 
 #include "pssshoot.h"
 #include "pacshoot.h"   /* card #465: time-domain PAC/PSTB, hooked in after convergence below */
@@ -1604,6 +1610,227 @@ pss_fd_perturb_side(CKTcircuit *ckt, PSSstateMap *map, double T,
     return err;
 }
 
+
+
+/* ------------------------------------------------------------------ */
+/* card #558, round 17: fork()-based parallel monodromy columns.
+ *
+ * The finite-difference columns of the dense monodromy (the fast-state
+ * detection sweep, the Newton Jacobian, the Floquet re-evaluation) are
+ * independent period runs: each starts from x0 + h e_j and replays the
+ * grid the baseline run recorded (force=1, record=0 -- such a run latches
+ * no hidden state).  ngspice is not thread-safe per circuit, so the
+ * columns run in forked children instead: every child owns a copy-on-write
+ * copy of the whole process (circuit, device states, recorded grid, XSPICE
+ * state), runs the same column code the sequential loop runs (one child per
+ * column, at most K at a time) and writes its result vector into a shared
+ * anonymous mapping.  The parent never reads a child's memory
+ * otherwise; any abnormal child exit makes the whole phase fall back to
+ * the sequential loop (nothing of the children's work is used).
+ *
+ * Children run their period runs with ONE OpenMP thread (libgomp's thread
+ * pool does not survive fork(); a team of one never touches it), so the
+ * worker count is chosen by PSS_FORK_COLS=<n> (unset or 0: the sequential chained loop, the default).
+ * Identity: the result is bit-identical for every worker count K >= 1 (a
+ * column starts from the process as it was on entry, never from what an
+ * earlier column left behind).  Against the chained sequential loop, where
+ * column j starts from the node vector and device states the previous run
+ * ended with, it is byte-identical on every deck measured without algebraic
+ * memory (R3, R3d, R7 BSIM4, the dense PEX decks) and differs at the
+ * Newton-tolerance level where the circuit has an algebraic latch loop
+ * (R4/R4d) or a free-running trigger orbit (R5): the start vector of the
+ * first Newton solve of those runs is the previous run's end.  Hence
+ * opt-in (research/transient-acceleration.md sec. 22). */
+typedef int (*pss_pcol_fn)(void *ctx, int j, double *out);
+static int g_pss_in_worker = 0;
+
+static int
+pss_par_nworkers(int ncol)
+{
+    const char *e = getenv("PSS_FORK_COLS");
+    int k;
+    if (g_pss_in_worker || ncol < 1)
+        return 0;
+    if (e && e[0])
+        k = atoi(e);   /* 1 = isolated columns run one after the other (the identity control) */
+    else
+        k = 0;   /* opt-in: columns started from an isolated process differ from the chained sequential loop at the
+                  * Newton-tolerance level (the chain carries the previous run's node vector and device states) */
+    if (k > ncol) k = ncol;
+    if (k > 64) k = 64;
+    return k >= 1 ? k : 0;
+}
+
+/* Runs fn(ctx, j, res + j*w) for j = 0..ncol-1, each column in its OWN forked child (a fresh copy of the process as it is
+ * on entry, so a column never sees what an earlier column left behind: the result does not depend on the worker count
+ * or on the scheduling), at most K children at a time; errs[j] = fn's return.
+ * Returns 1 when res/errs are complete, 0 when nothing was run (caller does the sequential loop). */
+static int
+pss_par_cols(int ncol, int w, pss_pcol_fn fn, void *ctx, double *res, int *errs, const char *label)
+{
+    int K = pss_par_nworkers(ncol), next = 0, head = 0, tail = 0, ok = 1;
+    size_t off_nr, off_err, off_res, total;
+    char *shm;
+    pid_t *q;
+    double t0 = 0.0;
+
+    if (K < 1)
+        return 0;
+    off_nr = 64;
+    off_err = off_nr + ((size_t) ncol * sizeof(long) + 63) / 64 * 64;
+    off_res = off_err + ((size_t) ncol * sizeof(int) + 63) / 64 * 64;
+    total = off_res + (size_t) ncol * w * sizeof(double);
+    shm = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shm == MAP_FAILED)
+        return 0;
+    q = TMALLOC(pid_t, ncol);
+    if (!q) { munmap(shm, total); return 0; }
+    memset(shm, 0, off_res);
+    if (getenv("PSS_FORK_TRACE"))
+        fprintf(stderr, "PSS-FORK %s: %d columns, %d workers\n", label, ncol, K);
+    if (getenv("PSS_RUN_STATS")) t0 = PSSrunStatsNow();
+    fflush(NULL);
+    while ((next < ncol || tail > head) && ok) {
+        while (next < ncol && tail - head < K) {
+            pid_t pd = fork();
+            if (pd < 0) { ok = 0; break; }
+            if (pd == 0) {
+                long r0 = g_pss_nruns;
+                int e, j = next;
+#ifdef USE_OMP
+                omp_set_num_threads(1);
+#endif
+                g_pss_in_worker = 1;
+                if (getenv("PSS_FORK_TEST_FAIL")) _exit(3);   /* red-proof hook: a dying worker must fall back to the sequential loop */
+                e = fn(ctx, j, (double *) (shm + off_res) + (size_t) j * w);
+                ((int *) (shm + off_err))[j] = e;
+                ((long *) (shm + off_nr))[j] = (g_pss_nruns - r0) * 2 + 1;   /* the odd marker means "finished" */
+                fflush(NULL);
+                _exit(0);
+            }
+            q[tail++] = pd;
+            next++;
+        }
+        if (tail > head) {
+            int st = 0;
+            if (waitpid(q[head], &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) ok = 0;
+            head++;
+        }
+    }
+    while (head < tail) {   /* a fork failed or a worker died: reap the rest */
+        int st;
+        waitpid(q[head++], &st, 0);
+    }
+    if (ok) {
+        long nr = 0;
+        int j;
+        for (j = 0; j < ncol; j++) {
+            long v = ((long *) (shm + off_nr))[j];
+            if (!(v & 1)) { ok = 0; break; }
+            nr += v >> 1;
+        }
+        if (ok) {
+            memcpy(res, shm + off_res, (size_t) ncol * w * sizeof(double));
+            memcpy(errs, shm + off_err, (size_t) ncol * sizeof(int));
+            g_pss_nruns += nr;
+        }
+    }
+    if (ok) {
+        if (getenv("PSS_RUN_STATS")) {
+            char nm[96];
+            snprintf(nm, sizeof nm, "PSS parallel columns (%s)", label);
+            PSSrunStatsAdd(nm, PSSrunStatsNow() - t0);
+        }
+    } else
+        fprintf(stderr, "PSS-SHOOT: a forked column worker failed (%s); recomputing the columns sequentially (card #558).\n", label);
+    munmap(shm, total);
+    tfree(q);
+    return ok;
+}
+
+/* The finite-difference step of Newton column j (shared by the sequential loop and the workers). */
+static double
+pss_newton_fd_h(double x0j, double ripple_jf, double eps)
+{
+    double h = fabs(x0j) * eps;
+    if (h < 1e-6) h = 1e-6;
+    /* card #505: a state whose magnitude is below its own ripple (a comparator-reset latch node, the foot of a dead-time RC
+     * swing) has period-map noise (~1e-5..3e-5, exponential in the comparator on-time) far above the 1e-6 floor step, so
+     * its FD column is noise/h ~ 5-30 (garbage diagonal -> bogus Floquet multipliers). Difference it with 1% of its
+     * ripple instead. Every state with |x| >= ripple keeps the old step exactly. PSS_SHOOT_NO_BIGH disables. */
+    if (ripple_jf > 0.0 && fabs(x0j) < ripple_jf &&
+        0.01 * ripple_jf > h && getenv("PSS_SHOOT_NO_BIGH") == NULL)
+        h = 0.01 * ripple_jf;
+    return h;
+}
+
+/* ---- the three column phases ---- */
+typedef struct {   /* Newton Jacobian */
+    CKTcircuit *ckt; PSSstateMap *map; double T; const double *x_full; int n_full;
+    const double *x0; const int *slow_idx; const double *ripple_full; double eps; int n;
+} PSSpcolNewton;
+
+/* out: [0]=err_plus [1]=err_minus [2]=h_plus [3]=h_minus [4..4+n)=plus (slow rows) [4+n..4+2n)=minus (slow rows) */
+static int
+pss_pcol_newton(void *vc, int j, double *out)
+{
+    PSSpcolNewton *c = vc;
+    int jf = c->slow_idx[j], k, ep, em = 0;
+    double h = pss_newton_fd_h(c->x0[j], c->ripple_full[jf], c->eps), hp = h, hm = h;
+    double *ob = TMALLOC(double, c->n_full);
+    if (!ob) return E_NOMEM;
+    ep = pss_fd_perturb_side(c->ckt, c->map, c->T, c->x_full, c->n_full, jf, c->x0[j], 1.0, h,
+                              "PSS shoot (monodromy perturbation +)", ob, &hp);
+    if (!ep) {
+        for (k = 0; k < c->n; k++) out[4 + k] = ob[c->slow_idx[k]];
+        em = pss_fd_perturb_side(c->ckt, c->map, c->T, c->x_full, c->n_full, jf, c->x0[j], -1.0, h,
+                                  "PSS shoot (monodromy perturbation -)", ob, &hm);
+        if (!em)
+            for (k = 0; k < c->n; k++) out[4 + c->n + k] = ob[c->slow_idx[k]];
+    }
+    out[0] = ep; out[1] = em; out[2] = hp; out[3] = hm;
+    tfree(ob);
+    return 0;
+}
+
+typedef struct {   /* fast-state detection sweep and its large-step recheck; Floquet re-evaluation (slow_idx != NULL) */
+    CKTcircuit *ckt; PSSstateMap *map; double T; const double *x_full; int n_full;
+    int n;                 /* rows returned per side */
+    const int *slow_idx;   /* NULL: all rows, columns j; else column slow_idx[j], rows slow_idx[k] (Floquet) */
+    double eps;            /* detection / Floquet step factor */
+    const int *cols; const double *hs;   /* recheck: column index and step per job */
+    const char *lab_p, *lab_m;
+} PSSpcolSweep;
+
+/* out: [0..n)=plus [n..2n)=minus [2n]=failing side (0 plus, 1 minus) [2n+1]=h */
+static int
+pss_pcol_sweep(void *vc, int j, double *out)
+{
+    PSSpcolSweep *c = vc;
+    int jf = c->slow_idx ? c->slow_idx[j] : (c->cols ? c->cols[j] : j), k, i, err;
+    double h, *ic = TMALLOC(double, c->n_full), *ob = TMALLOC(double, c->n_full);
+    if (!ic || !ob) return E_NOMEM;
+    if (c->hs) h = c->hs[j];
+    else { h = fabs(c->x_full[jf]) * c->eps; if (h < 1e-6) h = 1e-6; }
+    out[2 * c->n + 1] = h;
+    for (i = 0; i < c->n_full; i++) ic[i] = c->x_full[i];
+    ic[jf] = c->x_full[jf] + h;
+    pss_state_set_ic(c->map, ic);
+    err = pss_run_period_ex_safe(c->ckt, c->T, c->lab_p, 0, 1);
+    if (err) { out[2 * c->n] = 0; goto done; }
+    pss_state_get(c->map, c->ckt, ob);
+    for (k = 0; k < c->n; k++) out[k] = ob[c->slow_idx ? c->slow_idx[k] : k];
+    for (i = 0; i < c->n_full; i++) ic[i] = c->x_full[i];
+    ic[jf] = c->x_full[jf] - h;
+    pss_state_set_ic(c->map, ic);
+    err = pss_run_period_ex_safe(c->ckt, c->T, c->lab_m, 0, 1);
+    if (err) { out[2 * c->n] = 1; goto done; }
+    pss_state_get(c->map, c->ckt, ob);
+    for (k = 0; k < c->n; k++) out[c->n + k] = ob[c->slow_idx ? c->slow_idx[k] : k];
+ done:
+    tfree(ic); tfree(ob);
+    return err;
+}
 
 /* ------------------------------------------------------------------ */
 /* Small dense linear solve (Gauss elimination, partial pivoting) --
@@ -3593,6 +3820,8 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
            *M = NULL, *s = NULL, *y = NULL, *Ms = NULL;
     double *icbuf = NULL, *outbuf = NULL, *ripple_full = NULL, *Phi_full = NULL;
     double *plus_raw = NULL;   /* card #498: see the FD perturbation loop below */
+    double *fdres = NULL;      /* card #558: forked FD columns, see below */
+    int *fderr = NULL, fdpar = 0;
     int *is_slow = NULL;
     int baseline_loose = 0;
     int have_baseline = 0;   /* do x0/x1/F already hold a valid, just-run point? */
@@ -3936,23 +4165,24 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
              * other slow state not currently being perturbed) is held at
              * its current x_full value via icbuf, exactly like the
              * un-reduced code held every other state at x0[k]. */
+            /* card #558: the 2n period runs of this sweep as forked workers; the column loop below consumes the
+             * results (same h, same retry code in the worker) and keeps every rescue path live in this process. */
+            fdpar = 0;
+            {
+                PSSpcolNewton nc;
+                nc.ckt = ckt; nc.map = map; nc.T = T; nc.x_full = x_full; nc.n_full = n_full; nc.x0 = x0;
+                nc.slow_idx = slow_idx; nc.ripple_full = ripple_full; nc.eps = eps; nc.n = n;
+                if (!fdres) fdres = TMALLOC(double, (size_t) n * (4 + 2 * n));
+                if (!fderr) fderr = TMALLOC(int, n);
+                if (fdres && fderr && pss_par_nworkers(n) > 0)
+                    fdpar = pss_par_cols(n, 4 + 2 * n, pss_pcol_newton, &nc, fdres, fderr, "newton");
+            }
             for (j = 0; j < n; j++) {
                 int jf = slow_idx[j];
-                double h = fabs(x0[j]) * eps;
+                double h = 0.0;
                 double h_plus, h_minus;
                 int err_plus, err_minus;
-                if (h < 1e-6) h = 1e-6;
-                /* card #505: a state whose magnitude is below its own ripple
-                 * (a comparator-reset latch node, the foot of a dead-time RC
-                 * swing) has period-map noise (~1e-5..3e-5, exponential in
-                 * the comparator on-time) far above the 1e-6 floor step, so
-                 * its FD column is noise/h ~ 5-30 (garbage diagonal ->
-                 * bogus Floquet multipliers). Difference it with 1% of its
-                 * ripple instead. Every state with |x| >= ripple keeps the
-                 * old step exactly. PSS_SHOOT_NO_BIGH disables. */
-                if (ripple_full[jf] > 0.0 && fabs(x0[j]) < ripple_full[jf] &&
-                    0.01 * ripple_full[jf] > h && getenv("PSS_SHOOT_NO_BIGH") == NULL)
-                    h = 0.01 * ripple_full[jf];
+                h = pss_newton_fd_h(x0[j], ripple_full[jf], eps);
                 h_plus = h_minus = h;
 
                 /* card #498: each side gets its OWN shrink-retry (see
@@ -3965,20 +4195,32 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                  * column (the previous iteration's own valid estimate,
                  * m_has_prior below) partially overwritten. */
                 for (k = 0; k < n; k++) plus_raw[k] = 0.0;
-                err_plus = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
-                                                x0[j], 1.0, h,
-                                                "PSS shoot (monodromy perturbation +)",
-                                                outbuf, &h_plus);
-                if (!err_plus)
-                    for (k = 0; k < n; k++) plus_raw[k] = outbuf[slow_idx[k]];
-
-                if (!err_plus) {
-                    err_minus = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
-                                                     x0[j], -1.0, h,
-                                                     "PSS shoot (monodromy perturbation -)",
-                                                     outbuf, &h_minus);
+                if (fdpar) {   /* card #558: this column's two sides come from the forked workers */
+                    const double *o = fdres + (size_t) j * (4 + 2 * n);
+                    err_plus = (int) o[0]; err_minus = (int) o[1];
+                    h_plus = o[2]; h_minus = o[3];
+                    if (fderr[j]) { err_plus = fderr[j]; err_minus = 0; h_plus = h_minus = h; }
+                    if (!err_plus) {
+                        for (k = 0; k < n; k++) plus_raw[k] = o[4 + k];
+                        if (!err_minus)
+                            for (k = 0; k < n; k++) outbuf[slow_idx[k]] = o[4 + n + k];
+                    }
                 } else {
-                    err_minus = 0;   /* -h not even attempted; err_plus alone triggers fallback below */
+                  err_plus = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
+                                                  x0[j], 1.0, h,
+                                                  "PSS shoot (monodromy perturbation +)",
+                                                  outbuf, &h_plus);
+                  if (!err_plus)
+                      for (k = 0; k < n; k++) plus_raw[k] = outbuf[slow_idx[k]];
+
+                  if (!err_plus) {
+                      err_minus = pss_fd_perturb_side(ckt, map, T, x_full, n_full, jf,
+                                                       x0[j], -1.0, h,
+                                                       "PSS shoot (monodromy perturbation -)",
+                                                       outbuf, &h_minus);
+                  } else {
+                      err_minus = 0;   /* -h not even attempted; err_plus alone triggers fallback below */
+                  }
                 }
 
                 /* card #505: ONE-SIDED difference rung. A single failing side
@@ -4428,6 +4670,8 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     }
 
  newton_done:
+    if (fdres) tfree(fdres);
+    if (fderr) tfree(fderr);
     *iter_out = iter;
     *residual_out = residual;
     if (Phi_out && M && !kry)
@@ -4569,6 +4813,43 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
         goto cleanup_no_reduce;
     }
 
+    {   /* card #558: the 2n columns as forked workers (PSS_FORK_COLS; the loop below is the default and the fallback) */
+        PSSpcolSweep pc;
+        int jj, side, par;
+        int *perr = TMALLOC(int, n);
+        double *pres = TMALLOC(double, (size_t) n * (2 * n + 2));
+        memset(&pc, 0, sizeof pc);
+        pc.ckt = ckt; pc.map = map; pc.T = T; pc.x_full = x_full; pc.n_full = n; pc.n = n; pc.eps = eps;
+        pc.lab_p = "PSS shoot (fast-state detection perturbation +)"; pc.lab_m = "PSS shoot (fast-state detection perturbation -)";
+        par = (perr && pres) ? pss_par_cols(n, 2 * n + 2, pss_pcol_sweep, &pc, pres, perr, "detection") : 0;
+        if (par) {
+            for (jj = 0; jj < n; jj++) {
+                const double *o = pres + (size_t) jj * (2 * n + 2);
+                if (perr[jj]) {
+                    side = (int) o[2 * n];
+                    fprintf(stderr, "PSS-SHOOT: fast-state detection perturbation "
+                            "run for state %s (%ch) did not complete (ngspice error "
+                            "%d); skipping reduction, all %d states remain Newton "
+                            "unknowns.\n", map->refs[jj].name, side ? '-' : '+', perr[jj], n);
+                    tfree(perr); tfree(pres);
+                    goto cleanup_no_reduce;
+                }
+                for (k = 0; k < n; k++) Phi[k * n + jj] = o[k];
+                for (k = 0; k < n; k++)
+                    Phi[k * n + jj] = (Phi[k * n + jj] - o[n + k]) / (2.0 * o[2 * n + 1]);
+            }
+            {   /* leave the device IC fields where the sequential loop leaves them (last column, -h) */
+                double h = fabs(x_full[n - 1]) * eps;
+                if (h < 1e-6) h = 1e-6;
+                for (i = 0; i < n; i++) icbuf[i] = x_full[i];
+                icbuf[n - 1] = x_full[n - 1] - h;
+                pss_state_set_ic(map, icbuf);
+            }
+        }
+        if (perr) tfree(perr);
+        if (pres) tfree(pres);
+        if (par) goto det_sweep_done;
+    }
     for (j = 0; j < n; j++) {
         double h = fabs(x_full[j]) * eps;
         if (h < 1e-6) h = 1e-6;
@@ -4603,6 +4884,7 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
             Phi[k * n + j] = (Phi[k * n + j] - outbuf[k]) / (2.0 * h);
     }
 
+ det_sweep_done:
     for (j = 0; j < n; j++) {
         double cn = 0.0;
         for (i = 0; i < n; i++) {
@@ -4634,6 +4916,29 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
         if (ripple_d && phi_small_save) {
             memcpy(phi_small_save, Phi, (size_t) n * n * sizeof(double));
             pss_ripple_get(map, ripple_d);
+            /* card #558: the eligible columns as forked workers; the loop below consumes their results in the same order */
+            int *rjob = TMALLOC(int, n), *rcols = TMALLOC(int, n), *rerr = TMALLOC(int, n), nrj = 0, rpar = 0;
+            double *rhs = TMALLOC(double, n), *rres = NULL;
+            if (rjob && rcols && rerr && rhs) {
+                for (j = 0; j < n; j++) {
+                    double h_small = fabs(x_full[j]) * eps;
+                    rjob[j] = -1;
+                    if (h_small < 1e-6) h_small = 1e-6;
+                    if (colnorm[j] < threshold || 0.05 * ripple_d[j] < 5.0 * h_small)
+                        continue;
+                    rjob[j] = nrj; rcols[nrj] = j; rhs[nrj] = 0.05 * ripple_d[j]; nrj++;
+                }
+                if (nrj >= 2) {
+                    PSSpcolSweep pc;
+                    memset(&pc, 0, sizeof pc);
+                    pc.ckt = ckt; pc.map = map; pc.T = T; pc.x_full = x_full; pc.n_full = n; pc.n = n; pc.eps = eps;
+                    pc.cols = rcols; pc.hs = rhs;
+                    pc.lab_p = "PSS shoot (fast-state large-step recheck +)"; pc.lab_m = "PSS shoot (fast-state large-step recheck -)";
+                    rres = TMALLOC(double, (size_t) nrj * (2 * n + 2));
+                    if (rres)
+                        rpar = pss_par_cols(nrj, 2 * n + 2, pss_pcol_sweep, &pc, rres, rerr, "recheck");
+                }
+            }
             for (j = 0; j < n; j++) {
                 double h_small = fabs(x_full[j]) * eps, h2, cn2 = 0.0;
                 int ok = 1;
@@ -4641,6 +4946,16 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
                 h2 = 0.05 * ripple_d[j];
                 if (colnorm[j] < threshold || h2 < 5.0 * h_small)
                     continue;
+                if (rpar) {
+                    const double *o = rres + (size_t) rjob[j] * (2 * n + 2);
+                    if (rerr[rjob[j]]) ok = 0;
+                    else
+                        for (k = 0; k < n; k++) {
+                            double v = fabs((o[k] - o[n + k]) / (2.0 * h2));
+                            if (v > cn2) cn2 = v;
+                        }
+                    goto rck_have;
+                }
                 for (i = 0; i < n; i++) icbuf[i] = x_full[i];
                 icbuf[j] = x_full[j] + h2;
                 pss_state_set_ic(map, icbuf);
@@ -4661,6 +4976,7 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
                         }
                     }
                 }
+              rck_have:
                 /* restore the small-step column into Phi (the seed Jacobian
                  * must stay exactly what it was): recomputed below from the
                  * saved copy */
@@ -4673,6 +4989,11 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
                 }
                 for (k = 0; k < n; k++) Phi[k * n + j] = phi_small_save[k * n + j];
             }
+            if (rjob) tfree(rjob);
+            if (rcols) tfree(rcols);
+            if (rerr) tfree(rerr);
+            if (rhs) tfree(rhs);
+            if (rres) tfree(rres);
         }
         if (ripple_d) tfree(ripple_d);
         if (phi_small_save) tfree(phi_small_save);
@@ -5793,6 +6114,33 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         if (getenv("PSS_FLOQUET_BASELINE") && floquet_ok && pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet baseline)", 0, 1))
             floquet_ok = 0;
 
+        {   /* card #558: the Floquet columns as forked workers (PSS_FORK_COLS; the loop below is the default and the fallback) */
+            int fpar = 0, *ferr = NULL;
+            double *fres = NULL;
+            if (floquet_ok && pss_par_nworkers(n_slow) > 0) {
+                PSSpcolSweep pc;
+                memset(&pc, 0, sizeof pc);
+                pc.ckt = ckt; pc.map = &map; pc.T = T; pc.x_full = x0; pc.n_full = n_full_fl; pc.n = n_slow;
+                pc.slow_idx = slow_idx; pc.eps = eps_floquet;
+                pc.lab_p = "PSS shoot (Floquet perturbation +)"; pc.lab_m = "PSS shoot (Floquet perturbation -)";
+                ferr = TMALLOC(int, n_slow);
+                fres = TMALLOC(double, (size_t) n_slow * (2 * n_slow + 2));
+                if (ferr && fres)
+                    fpar = pss_par_cols(n_slow, 2 * n_slow + 2, pss_pcol_sweep, &pc, fres, ferr, "floquet");
+            }
+            if (fpar) {
+                for (j = 0; j < n_slow; j++) {
+                    const double *o = fres + (size_t) j * (2 * n_slow + 2);
+                    if (ferr[j]) { floquet_ok = 0; break; }
+                    for (k = 0; k < n_slow; k++) Phi2[k * n_slow + j] = o[k];
+                    for (k = 0; k < n_slow; k++)
+                        Phi2[k * n_slow + j] = (Phi2[k * n_slow + j] - o[n_slow + k]) / (2.0 * o[2 * n_slow + 1]);
+                }
+            }
+            if (ferr) tfree(ferr);
+            if (fres) tfree(fres);
+            if (fpar) goto floquet_cols_done;
+        }
         for (j = 0; floquet_ok && j < n_slow; j++) {
             int jf = slow_idx[j];
             double h = fabs(x0[jf]) * eps_floquet;
@@ -5820,6 +6168,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n_slow; k++)
                 Phi2[k * n_slow + j] = (Phi2[k * n_slow + j] - outbuf_fl[slow_idx[k]]) / (2.0 * h);
         }
+        floquet_cols_done: ;
         }
 
         {
@@ -6433,6 +6782,41 @@ pss_run_until_trigger_core(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
  * at h and h/2 (step halving): noise-dominated differences scale like 1/h and truncation-dominated like h, so
  * they disagree exactly when the estimate is not trustworthy, and then the verdict is UNKNOWN(not-computed), never
  * a wrong stable/UNSTABLE. Dense: eigenvalues of the two monodromies; matrix-free: two Arnoldi processes. */
+/* card #558: trigger-run columns (free-running dense monodromy: +h and -h from x0, or one-sided stability columns) as forked workers.
+ * out: [0..n)=plus [n..2n)=minus (two-sided) [2n]=failing side [2n+1]=h */
+typedef struct {
+    CKTcircuit *ckt; PSSstateMap *map; int n; const double *x0; const double *hs; double eps_d; int two_sided;
+    int node_num; double trigval; int dir; double max_period;
+} PSSpcolTrig;
+
+static int
+pss_pcol_trig(void *vc, int j, double *out)
+{
+    PSSpcolTrig *c = vc;
+    int k, n = c->n, err;
+    double h, Tm, *xt = TMALLOC(double, n);
+    if (!xt) return E_NOMEM;
+    if (c->two_sided) {
+        h = fabs(c->x0[j]) * c->eps_d;
+        if (h < 1e-9 * (c->eps_d / 1e-6)) h = 1e-9 * (c->eps_d / 1e-6);
+    } else
+        h = c->hs[j];
+    out[2 * n + 1] = h;
+    for (k = 0; k < n; k++) xt[k] = c->x0[k];
+    xt[j] += h;
+    err = pss_run_until_trigger(c->ckt, c->map, xt, c->node_num, c->trigval, c->dir, c->max_period, out, &Tm, NULL, NULL);
+    if (err) { out[2 * n] = 0; goto done; }
+    if (c->two_sided) {
+        for (k = 0; k < n; k++) xt[k] = c->x0[k];
+        xt[j] -= h;
+        err = pss_run_until_trigger(c->ckt, c->map, xt, c->node_num, c->trigval, c->dir, c->max_period, out + n, &Tm, NULL, NULL);
+        if (err) out[2 * n] = 1;
+    }
+ done:
+    tfree(xt);
+    return err;
+}
+
 typedef struct {
     int status;           /* 0 trusted, 1 the two estimates disagree / not settled / ambiguous around 1, 2 a pass failed */
     double ra, rb, rad;   /* radii at h and h/2; the reported one (the larger, conservative) */
@@ -6540,6 +6924,31 @@ pss_fr_stability(CKTcircuit *ckt, PSSstateMap *map, int n, const double *x0, con
             rr[pass] = rad;
         } else {
             double *Mp = pass ? Mb : M;
+            if (pss_par_nworkers(n) > 0) {   /* card #558: the n one-sided columns as forked workers */
+                PSSpcolTrig tc;
+                int *terr = TMALLOC(int, n), tpar = 0;
+                double *tres = TMALLOC(double, (size_t) n * (2 * n + 2));
+                if (terr && tres) {
+                    memset(&tc, 0, sizeof tc);
+                    tc.ckt = ckt; tc.map = map; tc.n = n; tc.x0 = x0; tc.hs = hs; tc.two_sided = 0;
+                    tc.node_num = node_num; tc.trigval = trigval; tc.dir = dir; tc.max_period = max_period;
+                    tpar = pss_par_cols(n, 2 * n + 2, pss_pcol_trig, &tc, tres, terr, "freerun stability");
+                }
+                if (tpar) {
+                    for (j = 0; j < n; j++) {
+                        const double *o = tres + (size_t) j * (2 * n + 2);
+                        if (terr[j]) {
+                            res->status = 2; snprintf(res->why, sizeof res->why, "a perturbed trigger run (state %d) lost the crossing", j);
+                            tfree(terr); tfree(tres);
+                            goto out;
+                        }
+                        for (k = 0; k < n; k++) Mp[k * n + j] = (o[k] - Pt[k]) / hs[j];
+                    }
+                }
+                if (terr) tfree(terr);
+                if (tres) tfree(tres);
+                if (tpar) goto stab_cols_done;
+            }
             for (j = 0; j < n; j++) {
                 for (k = 0; k < n; k++) ic[k] = x0[k];
                 ic[j] += hs[j];
@@ -6549,6 +6958,7 @@ pss_fr_stability(CKTcircuit *ckt, PSSstateMap *map, int n, const double *x0, con
                 }
                 for (k = 0; k < n; k++) Mp[k * n + j] = (op[k] - Pt[k]) / hs[j];
             }
+          stab_cols_done:
             rr[pass] = pss_fr_dense_radius(Mp, n, pass ? eb : eig);
             if (pass == 0 && rr[0] < 0.0 && n > 1) { res->status = 2; snprintf(res->why, sizeof res->why, "the eigenvalue solver did not converge"); goto out; }
         }
@@ -6810,6 +7220,34 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         if (!fr_kry) {
         /* central-FD monodromy -- see this file's card #489 header
          * comment for why this is already the terminal-projected M. */
+        {   /* card #558: the 2n trigger runs as forked workers (PSS_FORK_COLS; the loop below is the default and the fallback) */
+            PSSpcolTrig tc;
+            int *terr = TMALLOC(int, n), tpar = 0;
+            double *tres = TMALLOC(double, (size_t) n * (2 * n + 2));
+            if (terr && tres && pss_par_nworkers(n) > 0) {
+                memset(&tc, 0, sizeof tc);
+                tc.ckt = ckt; tc.map = &map; tc.n = n; tc.x0 = x0; tc.eps_d = eps_d; tc.two_sided = 1;
+                tc.node_num = node_num; tc.trigval = trigval; tc.dir = dir; tc.max_period = max_period;
+                tpar = pss_par_cols(n, 2 * n + 2, pss_pcol_trig, &tc, tres, terr, "freerun monodromy");
+            }
+            if (tpar) {
+                for (j = 0; j < n; j++) {
+                    const double *o = tres + (size_t) j * (2 * n + 2);
+                    if (terr[j]) {
+                        fprintf(stderr, "PSS-FREERUN: monodromy perturbation (%ch, "
+                                "state %d) lost the trigger crossing at iter=%d; "
+                                "treating this attempt as non-convergent.\n", o[2 * n] > 0.5 ? '-' : '+', j, iter);
+                        tfree(terr); tfree(tres);
+                        goto fr_fail;
+                    }
+                    for (k = 0; k < n; k++) M[k * n + j] = o[k];
+                    for (k = 0; k < n; k++) M[k * n + j] = (M[k * n + j] - o[n + k]) / (2.0 * o[2 * n + 1]);
+                }
+            }
+            if (terr) tfree(terr);
+            if (tres) tfree(tres);
+            if (tpar) goto fr_fd_done;
+        }
         for (j = 0; j < n; j++) {
             double h = fabs(x0[j]) * eps_d; double Tp, Tm;
             if (h < 1e-9 * (eps_d / 1e-6)) h = 1e-9 * (eps_d / 1e-6);
@@ -6839,7 +7277,7 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n; k++)
                 M[k * n + j] = (M[k * n + j] - x1trial[k]) / (2.0 * h);
         }
-
+        fr_fd_done:
         for (k = 0; k < n * n; k++) A[k] = M[k];
         for (k = 0; k < n; k++) A[k * n + k] -= 1.0;
         for (k = 0; k < n; k++) b[k] = -F[k];

@@ -1096,6 +1096,51 @@ SMPsolve (SMPmatrix *Matrix, double RHS[], double Spare[])
     }
 }
 
+/* card #558, round 17: nrhs real right-hand sides in ONE klu_solve (column m at RHS + m*ld, node numbers 1..n as in
+ * SMPsolve).  Same permutation / scatter as SMPsolve; KLU solves the columns in blocks, reading L and U once per block. */
+void
+SMPsolveMulti (SMPmatrix *Matrix, double *RHS, int ld, int nrhs)
+{
+    static double *Y = NULL ;
+    static size_t Ycap = 0 ;
+    unsigned int i, N ;
+    int m ;
+
+    if (!Matrix->CKTkluMODE)
+    {
+        for (m = 0 ; m < nrhs ; m++)
+            spSolve (Matrix->SPmatrix, RHS + (size_t) m * ld, RHS + (size_t) m * ld, NULL, NULL) ;
+        return ;
+    }
+    if (CircuitIsDigital() && Matrix->SMPkluMatrix->KLUmatrixN == 0)
+        return ;
+    N = Matrix->SMPkluMatrix->KLUmatrixN ;
+    if (Ycap < (size_t) N * nrhs)
+    {
+        free (Y) ;
+        Ycap = (size_t) N * nrhs ;
+        Y = (double *) malloc (Ycap * sizeof (double)) ;
+        if (!Y) { Ycap = 0 ; for (m = 0 ; m < nrhs ; m++) SMPsolve (Matrix, RHS + (size_t) m * ld, NULL) ; return ; }
+    }
+    for (m = 0 ; m < nrhs ; m++)
+        for (i = 0 ; i < N ; i++)
+            Y [(size_t) m * N + i] = (Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1] != 0) ?
+                RHS [(size_t) m * ld + Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1]] : 0.0 ;
+
+    klu_solve (Matrix->SMPkluMatrix->KLUmatrixSymbolic, Matrix->SMPkluMatrix->KLUmatrixNumeric, (int) N, nrhs, Y,
+               Matrix->SMPkluMatrix->KLUmatrixCommon) ;
+
+    for (m = 0 ; m < nrhs ; m++)
+    {
+        double *R = RHS + (size_t) m * ld ;
+        for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixNrhs ; i++)
+            R [i] = 0 ;
+        for (i = 0 ; i < N ; i++)
+            if (Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1] != 0)
+                R [Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1]] = Y [(size_t) m * N + i] ;
+    }
+}
+
 /*
  * SMPtSolve() -- card #504: REAL transposed solve (A.'x = b), the real-
  * matrix analogue of SMPcaSolve() above (which is the COMPLEX adjoint/

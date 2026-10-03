@@ -252,6 +252,15 @@ SMPsolve(SMPmatrix *Matrix, double RHS[], double Spare[])
     spSolve( Matrix->SPmatrix, RHS, RHS, NULL, NULL );
 }
 
+/* card #558: nrhs right-hand sides, column m at RHS + m*ld */
+void
+SMPsolveMulti(SMPmatrix *Matrix, double *RHS, int ld, int nrhs)
+{
+    int m;
+    for (m = 0; m < nrhs; m++)
+        spSolve( Matrix->SPmatrix, RHS + (size_t) m * ld, RHS + (size_t) m * ld, NULL, NULL );
+}
+
 /*
  * SMPtSolve() -- card #504: REAL transposed solve, A^T x = b. Passing
  * NULL for iRHS/iSolution is safe here: spSolveTransposed's first act is
