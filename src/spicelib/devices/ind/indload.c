@@ -14,6 +14,8 @@ Author: 1985 Thomas L. Quarles
 #include "ngspice/sperror.h"
 #include "ngspice/suffix.h"
 
+static int ktype_c = -2, itype_c = -2;   /* card #555 */
+
 int
 INDload(GENmodel *inModel, CKTcircuit *ckt)
 {
@@ -49,7 +51,11 @@ INDload(GENmodel *inModel, CKTcircuit *ckt)
             }
         }
     }
-    ktype = CKTtypelook("mutual");
+    {   /* card #555: the device-type table is fixed for the life of the process; CKTtypelook() is a strcmp scan over ~70
+         * entries and was 2 x per load (R9: 50 M calls, 2.5 % of a .pss) */
+        if (ktype_c == -2) { ktype_c = CKTtypelook("mutual"); itype_c = CKTtypelook("Inductor"); }
+        ktype = ktype_c;
+    }
     mutmodel = (MUTmodel *)(ckt->CKThead[ktype]);
     /*  loop through all the mutual inductor models */
     for( ; mutmodel != NULL; mutmodel = MUTnextModel(mutmodel)) {
@@ -81,7 +87,7 @@ INDload(GENmodel *inModel, CKTcircuit *ckt)
             *(muthere->MUTbr2br1Ptr) -= muthere->MUTfactor*ckt->CKTag[0];
         }
     }
-    itype = CKTtypelook("Inductor");
+    itype = itype_c;
     model = (INDmodel *)(ckt->CKThead[itype]);
     /*  loop through all the inductor models */
     for( ; model != NULL; model = INDnextModel(model)) {

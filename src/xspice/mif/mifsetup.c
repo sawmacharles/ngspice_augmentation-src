@@ -92,6 +92,8 @@ MIFsetup(
     int           *states)    /* The states vector */
 {
     MIFmodel    *model;
+    extern int g_mif_noisy_cache;   /* card #555 */
+    g_mif_noisy_cache = -1;
     MIFinstance *here;
 
     int         mod_type;

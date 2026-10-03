@@ -91,6 +91,24 @@ used to fill the matrix for the next solution attempt.
 */
 
 
+/* card #555: `set noisyxspice` is looked up only when a code model left a message, but a model that leaves one on every call
+ * (R9's digital DPWM, 125 M calls) paid a front-end variable-list walk (cp_getvar -> cp_usrvars, 4 allocations per variable)
+ * each time.  The answer is cached for the life of a circuit setup (MIFsetup resets it).  NGSPICE_MIF_NOISYCACHE=0 restores
+ * the lookup on every call. */
+int g_mif_noisy_cache = -1;
+int
+MIFnoisyxspice(void)
+{
+    static int use_cache = -1;
+    if (use_cache < 0)
+        use_cache = !(getenv("NGSPICE_MIF_NOISYCACHE") && atoi(getenv("NGSPICE_MIF_NOISYCACHE")) == 0);
+    if (!use_cache)
+        return cp_getvar("noisyxspice", CP_BOOL, NULL, 0) ? 1 : 0;
+    if (g_mif_noisy_cache < 0)
+        g_mif_noisy_cache = cp_getvar("noisyxspice", CP_BOOL, NULL, 0) ? 1 : 0;
+    return g_mif_noisy_cache;
+}
+
 int
 MIFload(
     GENmodel      *inModel,  /* The head of the model list */
@@ -467,7 +485,7 @@ MIFload(
                     MIFauto_partial(here, DEVices[mod_type]->DEVpublic.cm_func, &cm_data);
 
             if (g_mif_info.errmsg && g_mif_info.errmsg[0] &&
-                cp_getvar("noisyxspice", CP_BOOL, NULL, 0)) {
+                MIFnoisyxspice()) {
                 fprintf(stderr, "XSPICE instance %s: %s",
                         g_mif_info.instance->MIFname, g_mif_info.errmsg);
                 g_mif_info.errmsg = NULL;

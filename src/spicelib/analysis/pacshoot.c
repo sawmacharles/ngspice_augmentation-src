@@ -411,8 +411,23 @@ pac_find_trig_idx(const PACstateMap *map, int trig_node_num)
 static double *g_pac_xinit = NULL;
 static int g_pac_xinit_n = 0;
 
+static int pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname);
 static int
 pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
+{
+    static int on = -1;
+    double t0;
+    int err;
+    if (on < 0) on = getenv("PSS_RUN_STATS") != NULL;
+    if (!on) return pac_run_period_inner(ckt, job, T, jobname);
+    t0 = PSSrunStatsNow();
+    err = pac_run_period_inner(ckt, job, T, jobname);
+    PSSrunStatsAdd(jobname, PSSrunStatsNow() - t0);
+    return err;
+}
+
+static int
+pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
 {
     JOB *saveJob = ckt->CKTcurJob;
     TRANan localjob;
@@ -1334,6 +1349,26 @@ pac_gen_salt_guard(CKTcircuit *ckt, const PSSsaltEvent *ev, int n_ev)
     return 0;
 }
 
+/* card #555: the matrix is real, so a complex right-hand side is solved as two real solves (re, im).  The homogeneous
+ * (monodromy) columns of recording pass 1 -- n of the n + nfreq columns, 413..1500 on R7p -- have an exactly zero
+ * imaginary part for the whole period (real unit-vector start, no forcing, real C_k): the second solve of a zero vector
+ * returns zeros and costs as much as the first.  It is skipped when the imaginary right-hand side is identically zero
+ * (same values; the sign of a zero may differ).  PAC_NO_ZERO_IM_SKIP=1 restores both solves. */
+static void
+pac_solve_cplx(CKTcircuit *ckt)
+{
+    static int skip = -1;
+    int row, neq = g_pac_neq;
+    if (skip < 0) skip = getenv("PAC_NO_ZERO_IM_SKIP") == NULL;
+    SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
+    if (skip) {
+        for (row = 0; row <= neq; row++)
+            if (g_pac_rhs_im[row] != 0.0) break;
+        if (row > neq) return;
+    }
+    SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
+}
+
 /* One accepted step of the generic recursion for all M columns. */
 static int
 pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new,
@@ -1402,8 +1437,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                     g_pac_rhs_im[row] += br * s + bi * c;
                 }
             }
-            SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
-            SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
+            pac_solve_cplx(ckt);
             for (row = 1; row <= neq; row++) {
                 PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
                 pac_set(g_pac_Cnew, row, M, m, v);
@@ -1440,8 +1474,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                 g_pac_rhs_im[row] += br * s + bi * c;
             }
         }
-        SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
-        SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
+        pac_solve_cplx(ckt);
         for (row = 1; row <= neq; row++) {
             PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
             pac_set(g_pac_Cnew, row, M, m, v);
@@ -1714,8 +1747,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
 
-        SMPsolve(ckt->CKTmatrix, g_pac_rhs_re, g_pac_scratch);
-        SMPsolve(ckt->CKTmatrix, g_pac_rhs_im, g_pac_scratch);
+        pac_solve_cplx(ckt);
         for (row = 1; row <= neq; row++) {
             PACc v; v.re = g_pac_rhs_re[row]; v.im = g_pac_rhs_im[row];
             pac_set(g_pac_Cnew, row, M, m, v);
@@ -2502,6 +2534,8 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
                 const double *freqs, int nfreq,
                 const int *outrows, int nout,
                 PACc *Phi_out /* n*n, may be NULL */,
+                const PACc *Phi_in /* card #555: n*n monodromy of an earlier run on the SAME orbit, else NULL: pass 1 then
+                                      propagates only the forced columns */,
                 PACc *Y0_out  /* nout*nfreq */,
                 const double *fT /* card #489 second pass: n, NULL = ordinary
                                      driven (fixed-period) boundary condition */,
@@ -2510,7 +2544,8 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
                                 fT==NULL) */)
 {
     int n = PAC_NST(map), neq = SMPmatSize(ckt->CKTmatrix);
-    int M1 = n + nfreq, f, d, j, err;
+    int Mst = Phi_in ? 0 : n;   /* homogeneous (state) columns of pass 1 */
+    int M1 = Mst + nfreq, f, d, j, err;
     double *omega1, *ic_zero_placeholder = NULL;
     int *useforce1;
     PACc *ic0_1, *Phi, *z;
@@ -2534,7 +2569,7 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
     }
 
     memset(ic0_1, 0, (size_t) n * M1 * sizeof(PACc));
-    for (d = 0; d < n; d++) {
+    for (d = 0; d < Mst; d++) {
         omega1[d] = 0.0;
         useforce1[d] = 0;
         for (j = 0; j < n; j++) {
@@ -2543,8 +2578,8 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         }
     }
     for (f = 0; f < nfreq; f++) {
-        omega1[n + f] = 2.0 * M_PI * freqs[f];
-        useforce1[n + f] = 1;
+        omega1[Mst + f] = 2.0 * M_PI * freqs[f];
+        useforce1[Mst + f] = 1;
     }
 
     pac_state_set_ic(map, x0);
@@ -2558,11 +2593,13 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
 
     for (d = 0; d < n; d++) {
         int row_d = pac_map_row(map, d);
-        for (j = 0; j < n; j++)
-            Phi[(size_t) d * n + j] = pac_get(g_pac_Cprev, row_d, M1, j);
+        if (!Phi_in)
+            for (j = 0; j < n; j++)
+                Phi[(size_t) d * n + j] = pac_get(g_pac_Cprev, row_d, M1, j);
         for (f = 0; f < nfreq; f++)
-            z[(size_t) d * nfreq + f] = pac_get(g_pac_Cprev, row_d, M1, n + f);
+            z[(size_t) d * nfreq + f] = pac_get(g_pac_Cprev, row_d, M1, Mst + f);
     }
+    if (Phi_in) memcpy(Phi, Phi_in, (size_t) n * n * sizeof(PACc));
     /* card #465 FOURTH pass, task 4 (red-proof, TEST-ONLY, default off):
      * PAC_REDPROOF_FREEZE_PHI substitutes the identity matrix for the real,
      * per-step-propagated LPTV monodromy Phi computed above -- a stand-in
@@ -4562,7 +4599,7 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
             numNames, numNames == 1 ? "" : "s", "netlist AC-flagged source(s)");
 
     t0 = SPfrontEnd->IFseconds();
-    err = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq, outrows, numNames, NULL, Y0,
+    err = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq, outrows, numNames, NULL, NULL, Y0,
                           fT, trig_idx);
     t1 = SPfrontEnd->IFseconds();
     fprintf(stderr, "PAC-TD: %s, wall_time=%.3fs (%.4fs/point)\n",
@@ -4732,7 +4769,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     pac_sweep_fill(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop, freqs, nfreq);
 
     outrows[0] = node_b; outrows[1] = branch_probe;
-    Phi = TMALLOC(PACc, (size_t) n * n);
+    Phi = TMALLOC(PACc, (size_t) PAC_NST(&map) * PAC_NST(&map));   /* card #555: the engine's n is PAC_NST (generic path: more rows than n) */
     Y1 = TMALLOC(PACc, (size_t) 2 * nfreq);
     Y2 = TMALLOC(PACc, (size_t) 2 * nfreq);
     Tarr = TMALLOC(PACc, nfreq);
@@ -4744,11 +4781,17 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
             n, n == 1 ? "" : "s");
 
     t0 = SPfrontEnd->IFseconds();
-    err = pac_engine_run(ckt, job, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, NULL, Y1,
-                          fT, trig_idx);
-    if (!err)
-        err = pac_engine_run(ckt, job, &map, x0, T, br2, bi2, freqs, nfreq, outrows, 2, NULL, Y2,
+    {
+        /* card #555: both injections run on the same orbit and the same recorded trajectory, so the n homogeneous
+         * (monodromy) columns of pass 1 are identical: the second run takes Phi from the first and propagates only
+         * its forced columns.  PAC_NO_PHI_REUSE=1 runs both in full. */
+        int reuse = (getenv("PAC_NO_PHI_REUSE") == NULL) && Phi != NULL;
+        err = pac_engine_run(ckt, job, &map, x0, T, br1, bi1, freqs, nfreq, outrows, 2, reuse ? Phi : NULL, NULL, Y1,
                               fT, trig_idx);
+        if (!err)
+            err = pac_engine_run(ckt, job, &map, x0, T, br2, bi2, freqs, nfreq, outrows, 2, NULL, reuse ? Phi : NULL, Y2,
+                                  fT, trig_idx);
+    }
     t1 = SPfrontEnd->IFseconds();
     fprintf(stderr, "PSTB: %s, wall_time=%.3fs (%.4fs/point, 2 forcing patterns)\n",
             err ? "FAILED" : "done", t1 - t0, nfreq > 0 ? (t1 - t0) / (2 * nfreq) : 0.0);
@@ -5160,7 +5203,7 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                 } else {
                     PACc *Ycol = TMALLOC(PACc, nfreq);
                     int e2 = pac_engine_run(ckt, job, &map, x0, T, br, bi, freqs, nfreq,
-                                             one_out, 1, NULL, Ycol, fT, trig_idx);
+                                             one_out, 1, NULL, NULL, Ycol, fT, trig_idx);
                     if (e2) {
                         fprintf(stderr, "PXF-TD: engine failed for source '%s'\n",
                                 (char *) srclist[use_idx[s]].name);

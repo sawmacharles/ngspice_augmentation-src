@@ -12,6 +12,8 @@ Author: 1985 Thomas L. Quarles
 #include "ngspice/ngspice.h"
 #include "ngspice/cktdefs.h"
 #include "ngspice/sperror.h"
+#include <string.h>
+#include <stdlib.h>
 
 
 
@@ -20,7 +22,17 @@ CKTclrBreak(CKTcircuit *ckt)
 {
     double *tmp;
     int j;
+    static int inplace = -1;   /* card #555: NGSPICE_CLRBREAK_LEGACY=1 -> always the copying form */
 
+    if (inplace < 0)
+        inplace = !(getenv("NGSPICE_CLRBREAK_LEGACY") && atoi(getenv("NGSPICE_CLRBREAK_LEGACY")) != 0);
+
+    if (inplace && ckt->CKTbreakSize > 256) {
+        /* long table (a PSS period run with its recorded times forced: ~40000 entries): shift in place instead of
+         * calloc + copy + free of the whole table at every accepted step (same contents, same size bookkeeping) */
+        memmove(ckt->CKTbreaks, ckt->CKTbreaks + 1, (size_t) (ckt->CKTbreakSize - 1) * sizeof(double));
+        ckt->CKTbreakSize--;
+    } else
     if(ckt->CKTbreakSize >2) {
         tmp = TMALLOC(double, ckt->CKTbreakSize - 1);
         if(tmp == NULL) return(E_NOMEM);

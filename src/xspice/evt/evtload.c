@@ -255,7 +255,7 @@ int EVTload_with_event(
     DEVices[mod_type]->DEVpublic.cm_func (&cm_data);
 
     if (g_mif_info.errmsg && g_mif_info.errmsg[0] &&
-        cp_getvar("noisyxspice", CP_BOOL, NULL, 0)) {
+        MIFnoisyxspice()) {
         fprintf(stderr, "XSPICE instance %s: %s",
                 inst->MIFname, g_mif_info.errmsg);
         g_mif_info.errmsg = NULL;

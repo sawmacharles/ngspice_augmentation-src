@@ -105,6 +105,7 @@ What this does NOT do (see the card #458 report for the full list):
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "pssshoot.h"
 #include "pacshoot.h"   /* card #465: time-domain PAC/PSTB, hooked in after convergence below */
@@ -873,6 +874,53 @@ PSSreplayStep(CKTcircuit *ckt)
     ckt->CKTbreak = 0;
 }
 
+/* card #555: insert an ASCENDING list of times into ckt->CKTbreaks with exactly the rules of CKTsetBreak() (cktsetbk.c) --
+ * time within 3 ulp of CKTtime ignored; breakpoint within CKTminBreak after the new time replaced by it; new time within
+ * CKTminBreak after its predecessor skipped (also at the end) -- but on one growable copy with a binary search and a memmove
+ * of the tail only.  Returns 0 on success; nonzero (table untouched) if a time lies in the past or memory is short. */
+static int
+pss_set_breaks_bulk(CKTcircuit *ckt, const double *tm, int nt)
+{
+    int n = ckt->CKTbreakSize, k, i, lo, hi;
+    double *b;
+
+    if (!ckt->CKTbreaks || n < 1) return 1;
+    for (k = 0; k < nt; k++)
+        if (ckt->CKTtime > tm[k] && !AlmostEqualUlps(tm[k], ckt->CKTtime, 3)) return 1;
+    b = TMALLOC(double, (size_t) n + (size_t) nt);
+    if (!b) return 1;
+    memcpy(b, ckt->CKTbreaks, (size_t) n * sizeof(double));
+    for (k = 0; k < nt; k++) {
+        double time = tm[k];
+        if (AlmostEqualUlps(time, ckt->CKTtime, 3)) continue;
+        lo = 0; hi = n;                       /* first index with b[i] > time */
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (b[mid] > time) hi = mid; else lo = mid + 1;
+        }
+        i = lo;
+        if (i < n) {
+            if (b[i] - time <= ckt->CKTminBreak) { b[i] = time; continue; }
+            if (i > 0 && time - b[i - 1] <= ckt->CKTminBreak) continue;
+            memmove(b + i + 1, b + i, (size_t) (n - i) * sizeof(double));
+            b[i] = time; n++;
+        } else {
+            if (time - b[n - 1] <= ckt->CKTminBreak) continue;
+            b[n++] = time;
+        }
+    }
+    {
+        double *fin = TMALLOC(double, n);
+        if (!fin) { tfree(b); return 1; }
+        memcpy(fin, b, (size_t) n * sizeof(double));
+        tfree(b);
+        FREE(ckt->CKTbreaks);
+        ckt->CKTbreaks = fin;
+        ckt->CKTbreakSize = n;
+    }
+    return 0;
+}
+
 /* Called from dctran.c right after the restart-path breakpoint reset, when
  * PSSbreakInstallActive. Uses ngspice's own, unmodified CKTsetBreak(), so
  * every existing invariant it maintains (sorted list, CKTminBreak dedup,
@@ -972,6 +1020,17 @@ PSSbreakInstallHook(CKTcircuit *ckt)
                 ckt->CKTfinalTime, g_break_count ? g_break_times[g_break_count - 1] : -1.0,
                 g_break_count ? ckt->CKTfinalTime - g_break_times[g_break_count - 1] : -1.0);
     }
+    /* card #555: the stock CKTsetBreak() copies the whole table for every insert in the middle (one malloc + copy of up to
+     * ~40000 doubles per recorded time on R9: 41 k inserts x 20 runs, 16 % of the job).  The recorded times are ascending;
+     * pss_set_breaks_bulk() applies the SAME rules (dedup within CKTminBreak, replace-by-earlier) in one pass on a growable
+     * copy.  NGSPICE_PSS_BRKBULK=0 restores the per-time CKTsetBreak() calls. */
+    double *bulk_t = NULL;
+    int bulk_n = 0;
+    {
+        static int bulk_on = -1;
+        if (bulk_on < 0) bulk_on = !(getenv("NGSPICE_PSS_BRKBULK") && atoi(getenv("NGSPICE_PSS_BRKBULK")) == 0);
+        if (bulk_on && g_break_count > 16) bulk_t = TMALLOC(double, g_break_count);
+    }
     for (i = 0; i < g_break_count; i++) {
         double tt = g_break_times[i];
         if (g_break_is_event && g_break_is_event[i]) {
@@ -984,8 +1043,17 @@ PSSbreakInstallHook(CKTcircuit *ckt)
             continue;
         }
         skipping = 0;   /* first time we clear the floor, force everything after it */
-        if (tt > 0.0 && tt < ckt->CKTfinalTime)
-            CKTsetBreak(ckt, tt);
+        if (tt > 0.0 && tt < ckt->CKTfinalTime) {
+            if (bulk_t) bulk_t[bulk_n++] = tt;
+            else CKTsetBreak(ckt, tt);
+        }
+    }
+    if (bulk_t) {
+        if (pss_set_breaks_bulk(ckt, bulk_t, bulk_n)) {
+            /* allocation failure or a time in the past: no partial state to undo (nothing was installed) -> stock path */
+            for (i = 0; i < bulk_n; i++) CKTsetBreak(ckt, bulk_t[i]);
+        }
+        tfree(bulk_t);
     }
     if (getenv("PSS_SHOOT_DEBUG_BREAK"))
         fprintf(stderr, "DEBUGBREAK: skipped %d leading early breakpoint(s) "
@@ -1195,8 +1263,63 @@ pss_replay_enabled(void)
 
 static long g_pss_nruns = 0;
 static double g_pss_warm_periods = 0.0;   /* card #537: warm-up transient periods in this analysis */   /* card #537: period runs made through pss_run_period_ex() in this analysis */
+/* card #555: PSS_RUN_STATS=1 prints, at exit, the number of period runs and the wall time per run label (diagnostic only) */
+#define PSS_RS_MAX 40
+static struct { char name[72]; long n; double t; } g_rs[PSS_RS_MAX];
+static int g_rs_n = 0;
+static void
+pss_rs_dump(void)
+{
+    int i;
+    double tot = 0.0;
+    for (i = 0; i < g_rs_n; i++) tot += g_rs[i].t;
+    for (i = 0; i < g_rs_n; i++)
+        fprintf(stderr, "PSS-RUNSTATS %-62s runs=%5ld wall=%8.3f s (%5.1f %%) per run %.4f s\n", g_rs[i].name, g_rs[i].n, g_rs[i].t,
+                100.0 * g_rs[i].t / (tot > 0 ? tot : 1), g_rs[i].t / (g_rs[i].n ? g_rs[i].n : 1));
+    fprintf(stderr, "PSS-RUNSTATS total in period runs %.3f s\n", tot);
+}
+void
+PSSrunStatsAdd(const char *name, double dt)
+{
+    int i;
+    if (!g_rs_n) atexit(pss_rs_dump);
+    for (i = 0; i < g_rs_n; i++)
+        if (strncmp(g_rs[i].name, name, sizeof g_rs[i].name - 1) == 0) break;
+    if (i == g_rs_n) {
+        if (g_rs_n >= PSS_RS_MAX) return;
+        strncpy(g_rs[i].name, name, sizeof g_rs[i].name - 1);
+        g_rs[i].name[sizeof g_rs[i].name - 1] = '\0';
+        g_rs_n++;
+    }
+    g_rs[i].n++;
+    g_rs[i].t += dt;
+}
+double
+PSSrunStatsNow(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + 1e-9 * ts.tv_nsec;
+}
+
+static int pss_run_period_ex_inner(CKTcircuit *ckt, double T, const char *jobname, int record, int force);
 static int
 pss_run_period_ex(CKTcircuit *ckt, double T, const char *jobname,
+                   int record, int force)
+{
+    static int on = -1;
+    double t0;
+    int err;
+    if (on < 0) on = getenv("PSS_RUN_STATS") != NULL;
+    if (!on) return pss_run_period_ex_inner(ckt, T, jobname, record, force);
+    t0 = PSSrunStatsNow();
+    err = pss_run_period_ex_inner(ckt, T, jobname, record, force);
+    PSSrunStatsAdd(jobname, PSSrunStatsNow() - t0);
+    return err;
+}
+
+static int
+pss_run_period_ex_inner(CKTcircuit *ckt, double T, const char *jobname,
                    int record, int force)
 {
     int err;
@@ -3179,12 +3302,23 @@ pss_kry_gmres(PSSkry *c, const double *b, double *y, double eta, double abs_floo
  * (breakdown, also exact). Fills ritz[0..*m_eff), *rad (radius at m_eff),
  * *rad_prev (radius of the leading (m_eff-4)-block, -1 if m_eff < 8), *exact.
  * Returns 0, or the failing error / 1000 for an eigen-solve failure. */
+static int g_arn_prev_dim = -1;   /* card #555: dimension at which pss_kry_arnoldi()'s rad_prev was taken */
 static int
 pss_kry_arnoldi(PSSkry *c, int mmax, PSScomplex *ritz, int *m_eff, double *rad,
                 double *rad_prev, int *exact)
 {
     int n = c->n, i, j, k, err = 0, mm = 0, m;
-    double *V = NULL, *H = NULL, *Av = NULL, *Hm = NULL;
+    double *V = NULL, *H = NULL, *Av = NULL, *Hm = NULL, *rh = NULL;
+    static int early = -1;
+    static double early_tol = 1e-7;
+    /* card #555: stop as soon as the Ritz radius has agreed to early_tol (relative) at three consecutive dimensions >= 6
+     * (R7p: 0.89265049 from dimension 5, the old rule stopped at 10 = 8 period runs more; the PEX decks settle at 7-8).
+     * PSS_KRYLOV_ARN_EARLY=0 restores the m vs m-4 rule alone. */
+    if (early < 0) {
+        early = !(getenv("PSS_KRYLOV_ARN_EARLY") && atoi(getenv("PSS_KRYLOV_ARN_EARLY")) == 0);
+        if (getenv("PSS_KRYLOV_ARN_EARLY_TOL") && atof(getenv("PSS_KRYLOV_ARN_EARLY_TOL")) > 0.0) early_tol = atof(getenv("PSS_KRYLOV_ARN_EARLY_TOL"));
+    }
+    g_arn_prev_dim = -1;
     PSScomplex *e2 = NULL;
     double nrm = 0.0;
 
@@ -3196,7 +3330,9 @@ pss_kry_arnoldi(PSSkry *c, int mmax, PSScomplex *ritz, int *m_eff, double *rad,
     Hm = TMALLOC(double, (size_t) m * m);
     Av = TMALLOC(double, n);
     e2 = TMALLOC(PSScomplex, m);
-    if (!V || !H || !Hm || !Av || !e2) { err = E_NOMEM; goto done; }
+    rh = TMALLOC(double, (size_t) m + 2);
+    if (!V || !H || !Hm || !Av || !e2 || !rh) { err = E_NOMEM; goto done; }
+    for (k = 0; k < m + 2; k++) rh[k] = -1.0;
     for (k = 0; k < (m + 1) * m; k++) H[k] = 0.0;
     {
         unsigned long s = 2463534242UL;
@@ -3233,7 +3369,37 @@ pss_kry_arnoldi(PSSkry *c, int mmax, PSScomplex *ritz, int *m_eff, double *rad,
             if (ast < 0) { ast = getenv("PSS_KRYLOV_ARN_STEP") ? atoi(getenv("PSS_KRYLOV_ARN_STEP")) : 2; if (ast < 1) ast = 2; }
             checkpoint = (dim >= 8 && (dim <= 24 ? dim % ast == 0 : dim % 8 == 0));
         }
+        if (getenv("PSS_KRYLOV_ARN_TRACE") && dim >= 2) {   /* card #555: radius at every dimension (diagnostic) */
+            double *Ht = TMALLOC(double, (size_t) dim * dim);
+            PSScomplex *rt = TMALLOC(PSScomplex, dim);
+            if (Ht && rt) {
+                double r = 0.0;
+                for (i = 0; i < dim; i++)
+                    for (k = 0; k < dim; k++) Ht[i * dim + k] = H[i * m + k];
+                if (pss_eigenvalues(Ht, dim, rt) == 0) {
+                    for (i = 0; i < dim; i++) { double a = hypot(rt[i].re, rt[i].im); if (a > r) r = a; }
+                    fprintf(stderr, "ARN-TRACE dim %d radius %.8f\n", dim, r);
+                }
+            }
+            if (Ht) tfree(Ht);
+            if (rt) tfree(rt);
+        }
+        if (early && !*exact && dim >= 4 && dim < m) {
+            double r = 0.0;
+            for (i = 0; i < dim; i++)
+                for (k = 0; k < dim; k++) Hm[i * dim + k] = H[i * m + k];
+            if (pss_eigenvalues(Hm, dim, ritz) != 0) { err = 1000; goto done; }
+            for (i = 0; i < dim; i++) { double a = hypot(ritz[i].re, ritz[i].im); if (a > r) r = a; }
+            rh[dim] = r;
+            if (dim >= 6 && rh[dim - 1] > 0.0 && rh[dim - 2] > 0.0 &&
+                fabs(r - rh[dim - 1]) <= early_tol * r && fabs(rh[dim - 1] - rh[dim - 2]) <= early_tol * r &&
+                (r - 1.0) * (rh[dim - 1] - 1.0) > 0.0) {
+                *rad = r; *rad_prev = rh[dim - 1]; *m_eff = dim; g_arn_prev_dim = dim - 1;
+                break;
+            }
+        }
         if (*exact || dim == m || checkpoint) {
+            g_arn_prev_dim = dim - 4;
             for (i = 0; i < dim; i++)
                 for (k = 0; k < dim; k++) Hm[i * dim + k] = H[i * m + k];
             if (pss_eigenvalues(Hm, dim, ritz) != 0) { err = 1000; goto done; }
@@ -3275,6 +3441,7 @@ pss_kry_arnoldi(PSSkry *c, int mmax, PSScomplex *ritz, int *m_eff, double *rad,
     if (Hm) tfree(Hm);
     if (Av) tfree(Av);
     if (e2) tfree(e2);
+    if (rh) tfree(rh);
     return err;
 }
 
@@ -4579,6 +4746,18 @@ pss_detect_fast_states(CKTcircuit *ckt, PSSstateMap *map, double T,
 
 /* ------------------------------------------------------------------ */
 
+/* card #555: stage 1's Newton attempt starts at EXACTLY the x0 the fast-state detection just differenced, so the detection's
+ * monodromy slice is a fresh Jacobian for it (not a stale one, the case the sixth-pass rule "never stage 1" guarded against);
+ * recomputing it costs 2 x n_slow more period runs at the tight tolerance (R7: 12 of 38 + 12 + 13 runs).
+ * Opt-in: PSS_SEED_STAGE1=1 (the Newton path then differs from the unseeded one; the orbit stays inside the PSS tolerance). */
+static int
+pss_seed_stage1(void)
+{
+    static int on = -1;
+    if (on < 0) on = (getenv("PSS_SEED_STAGE1") && atoi(getenv("PSS_SEED_STAGE1")) != 0);   /* default OFF: changes the iterates */
+    return on;
+}
+
 int
 PSSshootDriven(CKTcircuit *ckt, PSSan *job)
 {
@@ -5194,7 +5373,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                                                  this_trust, broyden_enabled,
                                                  broyden_period, label,
                                                  &iter, &residual, Phi, use_analytic,
-                                                 (stage > 1 && seed_available) ? M_init : NULL,
+                                                 ((stage > 1 || pss_seed_stage1()) && seed_available) ? M_init : NULL,
                                                  &seed_used_this);
                 if (seed_used_this)
                     seed_available = 0;
@@ -5484,7 +5663,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                         ok = 0;   /* not converged by the maximum dimension, or ambiguous around 1 */
                 }
                 char cmp[64];
-                if (radp >= 0.0) snprintf(cmp, sizeof cmp, " (%.6f at dimension %d)", radp, m_eff - 4);
+                if (radp >= 0.0) snprintf(cmp, sizeof cmp, " (%.6f at dimension %d)", radp, g_arn_prev_dim >= 0 ? g_arn_prev_dim : m_eff - 4);
                 else cmp[0] = '\0';
                 fprintf(stdout, "PSS-SHOOT: Arnoldi estimate of the Floquet multipliers: dimension %d of %d%s, "
                         "%ld period runs; spectral radius %.6f%s%s\n",
@@ -5609,7 +5788,9 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * perturbation/trial run in the last Newton iteration, so this
          * is not a new approximation, just applying the existing one
          * consistently to the two call sites that had been missed). */
-        if (floquet_ok && pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet baseline)", 0, 1))
+        /* card #555: this run's result is never read (every column is a centred difference of two perturbed runs, none
+         * against it) and it latches no state (record=0): skipped.  PSS_FLOQUET_BASELINE=1 restores it. */
+        if (getenv("PSS_FLOQUET_BASELINE") && floquet_ok && pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet baseline)", 0, 1))
             floquet_ok = 0;
 
         for (j = 0; floquet_ok && j < n_slow; j++) {
@@ -6120,7 +6301,14 @@ pss_run_until_trigger(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
         g_hid_on = 0;
     g_hid_nolatch = 1;
     g_hid_T_ok = 0;
-    err = pss_run_until_trigger_core(ckt, map, x0, node_num, trigval, dir, max_period, x_T, T_measured, x_prev_out, t_prev_out);
+    {
+        static int rs_on = -1;
+        double rs_t0 = 0.0;
+        if (rs_on < 0) rs_on = getenv("PSS_RUN_STATS") != NULL;
+        if (rs_on) rs_t0 = PSSrunStatsNow();
+        err = pss_run_until_trigger_core(ckt, map, x0, node_num, trigval, dir, max_period, x_T, T_measured, x_prev_out, t_prev_out);
+        if (rs_on) PSSrunStatsAdd("PSS-FREERUN trigger run", PSSrunStatsNow() - rs_t0);
+    }
     g_hid_nolatch = save_nl;
     g_hid_on = save_on;
     return err;
@@ -6345,7 +6533,7 @@ pss_fr_stability(CKTcircuit *ckt, PSSstateMap *map, int n, const double *x0, con
                 if (!(diff <= 1e-2 * (rad > 1e-3 ? rad : 1e-3)) || (rad - 1.0) * (radp - 1.0) <= 0.0) {
                     res->status = 1;
                     snprintf(res->why, sizeof res->why, "Arnoldi estimate not settled at dimension %d (radius %.4g vs %.4g at dimension %d)",
-                             m_eff, rad, radp, m_eff - 4);
+                             m_eff, rad, radp, g_arn_prev_dim >= 0 ? g_arn_prev_dim : m_eff - 4);
                 }
             }
             if (!pass) { res->m_eff = m_eff; res->exact = exact; res->radp = radp; }

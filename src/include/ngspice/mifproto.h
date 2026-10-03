@@ -87,6 +87,8 @@ extern int MIFunsetup(
     CKTcircuit    *ckt
 );
 
+extern int MIFnoisyxspice(void);   /* card #555: cached `set noisyxspice` lookup */
+
 extern int MIFload(
     GENmodel      *inModel,
     CKTcircuit    *ckt 

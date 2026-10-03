@@ -246,4 +246,8 @@ int PSSsaltForceOrder1(CKTcircuit *ckt);
  * nonlinear reference sharing no code with this engine). */
 int PSSsaltEventsSeen(void);
 
+/* card #555: PSS_RUN_STATS diagnostics */
+void PSSrunStatsAdd(const char *name, double dt);
+double PSSrunStatsNow(void);
+
 #endif
