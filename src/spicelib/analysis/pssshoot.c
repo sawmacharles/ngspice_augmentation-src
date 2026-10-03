@@ -76,6 +76,10 @@ What this does NOT do (see the card #458 report for the full list):
     to linearise around is not populated by the shooting path.
 **********/
 
+#include <stdio.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include "ngspice/ngspice.h"
 #include "ngspice/cktdefs.h"
 #include "ngspice/trandefs.h"
@@ -586,6 +590,30 @@ PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who)
 int PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who) { (void) ckt; (void) kind; (void) who; return 0; }
 #endif
 
+/* card #553: PSS_MEM_TRACE=1 prints resident size and malloc in-use bytes after every period run (diagnostic only) */
+static void
+pss_mem_trace(const char *tag, const char *jobname)
+{
+    static int on = -1, cnt = 0;
+    if (on < 0) on = getenv("PSS_MEM_TRACE") != NULL;
+    if (!on) return;
+    long rss = 0, dummy = 0;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f) { if (fscanf(f, "%ld %ld", &dummy, &rss) != 2) rss = 0; fclose(f); }
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33)
+    struct mallinfo2 mi = mallinfo2();
+    fprintf(stderr, "PSS-MEM %s #%d %s rss=%.1fMB inuse=%.1fMB arena=%.1fMB mmap=%.1fMB\n", tag, ++cnt, jobname ? jobname : "",
+            rss * 4096.0 / 1048576.0, mi.uordblks / 1048576.0, mi.arena / 1048576.0, mi.hblkhd / 1048576.0);
+#else
+    fprintf(stderr, "PSS-MEM %s #%d %s rss=%.1fMB\n", tag, ++cnt, jobname ? jobname : "", rss * 4096.0 / 1048576.0);
+#endif
+}
+
+/* card #553: the output vectors of a period run are never read (the engine reads the circuit's own state); outitf.c keeps one point
+ * per vector while this is set.  PSS_KEEP_RUN_DATA=1 restores the old retention of every run's full plot (regression/red-proof). */
+int PSSdiscardRunData = 0;
+static int g_pss_keep_run_data = -1;   /* PSS_KEEP_RUN_DATA=1 -> 1, read once */
+
 static int
 pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
 {
@@ -621,7 +649,14 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
 #ifdef XSPICE
     PSSxsPostInitHook = (g_xs_on && XSsnapValid(g_xs_snap)) ? pss_xs_post_init : NULL;
 #endif
+    {
+        if (g_pss_keep_run_data < 0)
+            g_pss_keep_run_data = getenv("PSS_KEEP_RUN_DATA") != NULL && atoi(getenv("PSS_KEEP_RUN_DATA")) != 0;
+        /* the run that emits the converged trajectory is the plot the user reads (wrdata, plot): it keeps its data */
+        PSSdiscardRunData = !g_pss_keep_run_data && strncmp(jobname, "Time Domain Periodic Steady State Analysis", 42) != 0;
+    }
     err = DCtran(ckt, 1);   /* restart = 1: fresh run from t=0 */
+    PSSdiscardRunData = 0;
     PSShidActive = 0;
 #ifdef XSPICE
     PSSxsPostInitHook = NULL;
@@ -641,10 +676,14 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
     /* Defensive: some DCtran() error paths return without closing the
      * plot they opened; do not leak it across the (many) period runs one
      * Newton step needs. */
-    if (localjob.TRANplot)
+    if (localjob.TRANplot) {
+        PSSdiscardRunData = !g_pss_keep_run_data && strncmp(jobname, "Time Domain Periodic Steady State Analysis", 42) != 0;
         SPfrontEnd->OUTendPlot(localjob.TRANplot);
+        PSSdiscardRunData = 0;
+    }
 
     ckt->CKTcurJob = saveJob;
+    pss_mem_trace("run", jobname);
     return err;
 }
 

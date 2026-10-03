@@ -178,6 +178,7 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 
 typedef struct { double re, im; } PACc;
 
+extern int PSSdiscardRunData;   /* card #553, pssshoot.c */
 static PACc pc_add(PACc a, PACc b) { PACc r = { a.re + b.re, a.im + b.im }; return r; }
 static PACc pc_sub(PACc a, PACc b) { PACc r = { a.re - b.re, a.im - b.im }; return r; }
 static PACc pc_mul(PACc a, PACc b)
@@ -486,7 +487,10 @@ pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
 #ifdef XSPICE
         g_xs_toff = 0.0;   /* card #551: the td recording passes only see stateless analog code models (PSSxspicePolicy) */
 #endif
+        /* card #553: the recording pass's plot is never read; keep one point per vector (PSS_KEEP_RUN_DATA=1: old behaviour) */
+        PSSdiscardRunData = !(getenv("PSS_KEEP_RUN_DATA") && atoi(getenv("PSS_KEEP_RUN_DATA")) != 0);
         err = DCtran(ckt, 1);
+        PSSdiscardRunData = 0;
         ckt->CKTreltol = save_reltol;
     }
     PSSeventLocateActive = PSSswLagActive = 0;

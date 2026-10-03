@@ -200,6 +200,16 @@ static double *valueold, *valuenew;
 static bool savenone = FALSE;
 #endif
 
+#ifdef WITH_PSS
+/* card #553: set (pssshoot.c) while a `.pss method=shoot` period run executes: its plot vectors are never read, so they keep one
+ * point instead of the whole run (7300 rows x 430 vectors = 25 MB per run, hundreds of runs, was retained until the end). */
+extern int PSSdiscardRunData;
+extern void plot_discard(struct plot *pl);
+#define PSS_DISCARD (PSSdiscardRunData)
+#else
+#define PSS_DISCARD 0
+#endif
+
 /* The two "begin plot" routines share all their internals... */
 
 int
@@ -940,6 +950,21 @@ OUTendPlot(runDesc *plotPtr)
     tfree(valueold);
     tfree(valuenew);
 
+#ifdef WITH_PSS
+    /* card #553: a `.pss method=shoot` period run's plot is dropped at its end (its vectors held one point each, but the plot,
+     * its ~neq vector headers, names and keyword tables stayed in the plot list for the whole job: 90 KB per run at 490 states,
+     * 2300 runs in the dense monodromy).  plot_num is advanced as the retained plot would have done, so the names of the
+     * plots that are kept (the emitted trajectory: tran<N>) are the same as before. */
+    if (PSSdiscardRunData && !plotPtr->writeOut && plotPtr->runPlot) {
+        struct plot *pl = plotPtr->runPlot;
+        plotPtr->runPlot = NULL;
+        freeRun(plotPtr);
+        plot_discard(pl);
+        plot_num++;
+        return (OK);
+    }
+#endif
+
     freeRun(plotPtr);
 
     return (OK);
@@ -1286,6 +1311,8 @@ plotInit(runDesc *run)
 static inline int
 vlength2delta(int len)
 {
+    if (PSS_DISCARD)
+        return 1;
 #ifdef SHARED_MODULE
     if (savenone)
         /* We need just a vector length of 1 */
@@ -1329,6 +1356,8 @@ vlength2delta(int len)
 void
 AddRealValueToVector(struct dvec *v, double value)
 {
+    if (PSS_DISCARD)
+        v->v_length = 0;   /* card #553 */
 #ifdef SHARED_MODULE
     if (savenone)
         /* always save new data to same location */
@@ -1361,6 +1390,8 @@ plotAddComplexValue(dataDesc *desc, IFcomplex value)
 {
     struct dvec *v = desc->vec;
 
+    if (PSS_DISCARD)
+        v->v_length = 0;   /* card #553 */
 #ifdef SHARED_MODULE
     if (savenone)
         v->v_length = 0;

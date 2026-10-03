@@ -1514,6 +1514,16 @@ static void killplot(struct plot *pl)
     txfree(pl); /* va: also tfree pl itself (memory leak) */
 }
 
+/* card #553: drop a finished plot nobody will read (a `.pss method=shoot` period run's own plot); same as `destroy <plot>` */
+void
+plot_discard(struct plot *pl)
+{
+    if (!pl)
+        return;
+    DelPlotWindows(pl);
+    killplot(pl);
+}
+
 /* delete the const plot (called from com_quit) */
 void
 destroy_const_plot(void)
