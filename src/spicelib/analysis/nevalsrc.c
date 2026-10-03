@@ -37,6 +37,23 @@ extern CMat* iNoise;
 #include "../../maths/dense/denseinlines.h"
 #endif
 
+/* card #556: optional capture of the complex node-difference of every N_GAIN call (the flicker gain of a device noise
+ * routine), in call order.  Used by pacshoot.c's folded-flicker `.pnoise`; off (NULL) otherwise. */
+int g_nev_gain_cap = 0, g_nev_gain_n = 0, g_nev_gain_max = 0;
+double *g_nev_gain_re = NULL, *g_nev_gain_im = NULL;
+
+static void
+nev_gain_capture(double re, double im)
+{
+    if (g_nev_gain_cap) {
+        if (g_nev_gain_n < g_nev_gain_max) {
+            g_nev_gain_re[g_nev_gain_n] = re;
+            g_nev_gain_im[g_nev_gain_n] = im;
+        }
+        g_nev_gain_n++;
+    }
+}
+
 void
 NevalSrc(double* noise, double* lnNoise, CKTcircuit* ckt, int type, int node1, int node2, double param)
 {
@@ -114,6 +131,7 @@ NevalSrc(double* noise, double* lnNoise, CKTcircuit* ckt, int type, int node1, i
 
     case N_GAIN:
         *noise = gain;
+        nev_gain_capture(realVal, imagVal);
         break;
 
     }
@@ -341,6 +359,7 @@ NevalSrcInstanceTemp(double* noise, double* lnNoise, CKTcircuit* ckt, int type,
 
     case N_GAIN:
         *noise = gain;
+        nev_gain_capture(realVal, imagVal);
         break;
 
     }

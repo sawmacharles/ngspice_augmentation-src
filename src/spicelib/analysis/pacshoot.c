@@ -3540,6 +3540,165 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
  * PnInSrc). See docs/pss-pac.md's `.pnoise` section for the full
  * derivation, validation, and what was skipped. */
 
+
+/* card #556: folded flicker (1/f) noise on a time-varying orbit.
+ *
+ * A device noise source n(t) = g(t) w(t), w stationary with a power-law density S_w(f') = A / |f'|^ef, enters a periodic
+ * system.  The time-averaged output density at f is  Sum_q |G_q(f)|^2 S_w(f - q fs)  where G_q are the Fourier coefficients
+ * of the periodic function a(t) = g(t) H(t,f) (H = response at f to a unit source at t).  The recursion above evaluates the
+ * device density at the OUTPUT frequency f for every sideband, i.e. Sum_q |G_q|^2 S_w(f): exact for white noise (Parseval) and
+ * for flicker when a(t) has no harmonics (LTI bias, slow modulation), but it overstates a fast-modulated flicker source by
+ * S_w(f)/S_w(f - q fs).  Per flicker generator c and output frequency f this stores z_k = u_k sqrt(S_k) e^{+j w t_k} (u_k =
+ * complex gain of the generator's two nodes in nu_k, S_k = its density at f; |z_k|^2 = the density the sweep accumulated), the
+ * exact Parseval pairing  Sum_q |Sum_k z_k sinc(q ws w_k/2) e^{-j q ws tc_k}|^2 = T Sum_k |z_k|^2 / w_k  holds for the
+ * piecewise-constant (zero-order-hold, interval w_k centred at tc_k) a(t) the engine's own discretisation represents, and
+ * the correction  Delta = Sum_q |G_q|^2 (rho_q - 1),  rho_q = (f/|f - q fs|)^ef, is added to the accumulated density.  The
+ * sum runs over |q| <= Qmax (env PNOISE_FOLD_QMAX, default 2048) or until the unsummed part of the Parseval energy is
+ * below 1e-9; the rest is added with the density of a q^-2 tail, (f/(Q fs))^ef / (1+ef).  White and thermal sources are not
+ * touched (no flicker slot, or no flicker current: the correction is skipped and the result is bit-identical). */
+extern int g_nev_gain_cap, g_nev_gain_n, g_nev_gain_max;
+extern double *g_nev_gain_re, *g_nev_gain_im;
+
+typedef struct {
+    int nfl, nfreq, N;
+    int *slot, *tot;           /* [nfl] output-vector index of the flicker slot and of its instance total (-1: none) */
+    double *ef;                /* [nfl] exponent: S ~ f^-ef (from the density at f and 2f) */
+    int *ef_set;
+    int nonpow;                /* the density is not a power law in f for some generator: folding not applied */
+    int warned_sw;
+    double *zr, *zi;           /* [(c*nfreq + f)*N + k] */
+    double *E;                 /* [c*nfreq + f] energy accumulated by the sweep: Sum_k (T/w_k) |z_k|^2 */
+    double *tc, *wk;           /* [N] */
+    double *capr, *capi;       /* [nfl] N_GAIN capture buffer */
+} PACfold;
+
+static void
+pac_fold_free(PACfold *F)
+{
+    if (!F) return;
+    if (F->slot) tfree(F->slot);
+    if (F->tot) tfree(F->tot);
+    if (F->ef) tfree(F->ef);
+    if (F->ef_set) tfree(F->ef_set);
+    if (F->zr) tfree(F->zr);
+    if (F->zi) tfree(F->zi);
+    if (F->E) tfree(F->E);
+    if (F->tc) tfree(F->tc);
+    if (F->wk) tfree(F->wk);
+    if (F->capr) tfree(F->capr);
+    if (F->capi) tfree(F->capi);
+    memset(F, 0, sizeof(*F));
+}
+
+/* Apply the correction.  onoise_out[f] and (if not NULL) gen_dens[slot*nfreq + f] are corrected in place. */
+static void
+pac_fold_apply(PACfold *F, const double *freqs, double T, double *onoise_out, double *gen_dens)
+{
+    int N = F->N, nfreq = F->nfreq, nfl = F->nfl;
+    int np = nfl * nfreq, p, k, q, qmax = 2048;
+    double ws = 2.0 * M_PI / T, fs = 1.0 / T;
+    double *pr, *pi, *rr, *ri, *cr, *ci, *sr, *si, *bw, *sinc;
+    double *head, *sum, *clampc;
+    char *active;
+    int nactive = 0, qlast = 0, warned_clamp = 0;
+    const double fl_floor = 1e-3 * fs;      /* the 1/f density of a sideband at |f'| < 1e-3 fs is that of 1e-3 fs (S(0) is infinite) */
+    const char *qe = getenv("PNOISE_FOLD_QMAX");
+    int dbg = getenv("PNOISE_FOLD_DEBUG") != NULL;
+
+    if (qe && atoi(qe) > 0) qmax = atoi(qe);
+    pr = TMALLOC(double, N); pi = TMALLOC(double, N);
+    rr = TMALLOC(double, N); ri = TMALLOC(double, N);
+    cr = TMALLOC(double, N); ci = TMALLOC(double, N);
+    sr = TMALLOC(double, N); si = TMALLOC(double, N);
+    bw = TMALLOC(double, N); sinc = TMALLOC(double, N);
+    head = TMALLOC(double, np); sum = TMALLOC(double, np); clampc = TMALLOC(double, np);
+    active = TMALLOC(char, np);
+    if (!pr || !pi || !rr || !ri || !cr || !ci || !sr || !si || !bw || !sinc || !head || !sum || !clampc || !active) goto out;
+
+    for (k = 0; k < N; k++) {
+        pr[k] = 1.0; pi[k] = 0.0;
+        rr[k] = cos(ws * F->tc[k]); ri[k] = -sin(ws * F->tc[k]);     /* e^{-j ws tc_k} */
+        bw[k] = 0.5 * ws * F->wk[k];
+        cr[k] = 1.0; ci[k] = 0.0;                                     /* e^{+j q bw_k} */
+        sr[k] = cos(bw[k]); si[k] = sin(bw[k]);
+    }
+    for (p = 0; p < np; p++) {
+        int c = p / nfreq;
+        const double *zr = F->zr + (size_t) p * N, *zi = F->zi + (size_t) p * N;
+        double Gr = 0.0, Gi = 0.0;
+        active[p] = 0; head[p] = sum[p] = clampc[p] = 0.0;
+        if (!(F->E[p] > 0.0) || !(F->ef[c] > 1e-12)) continue;
+        for (k = 0; k < N; k++) { Gr += zr[k]; Gi += zi[k]; }
+        head[p] = sum[p] = Gr * Gr + Gi * Gi;
+        active[p] = 1; nactive++;
+    }
+    for (q = 1; q <= qmax && nactive > 0; q++) {
+        for (k = 0; k < N; k++) {
+            double t;
+            t = pr[k] * rr[k] - pi[k] * ri[k]; pi[k] = pr[k] * ri[k] + pi[k] * rr[k]; pr[k] = t;
+            t = cr[k] * sr[k] - ci[k] * si[k]; ci[k] = cr[k] * si[k] + ci[k] * sr[k]; cr[k] = t;
+            sinc[k] = (bw[k] > 0.0) ? ci[k] / ((double) q * bw[k]) : 1.0;
+            if (q % 256 == 0) {                       /* renormalise the rotating phasors */
+                double m = 1.0 / sqrt(pr[k] * pr[k] + pi[k] * pi[k]);
+                pr[k] *= m; pi[k] *= m;
+                m = 1.0 / sqrt(cr[k] * cr[k] + ci[k] * ci[k]);
+                cr[k] *= m; ci[k] *= m;
+            }
+        }
+        for (p = 0; p < np; p++) {
+            int c = p / nfreq, f = p % nfreq;
+            const double *zr, *zi;
+            double Pr = 0.0, Pi = 0.0, Mr = 0.0, Mi = 0.0, gp, gm, fa, ef, rp, rm;
+            if (!active[p]) continue;
+            zr = F->zr + (size_t) p * N; zi = F->zi + (size_t) p * N;
+            for (k = 0; k < N; k++) {
+                double ar = zr[k] * sinc[k], ai = zi[k] * sinc[k];
+                Pr += ar * pr[k] - ai * pi[k];  Pi += ar * pi[k] + ai * pr[k];      /* a e^{-j q ws tc} */
+                Mr += ar * pr[k] + ai * pi[k];  Mi += ai * pr[k] - ar * pi[k];      /* a e^{+j q ws tc} */
+            }
+            gp = Pr * Pr + Pi * Pi;  gm = Mr * Mr + Mi * Mi;
+            ef = F->ef[c];  fa = freqs[f];
+            {
+                double dp = fabs(fa - q * fs), dm = fabs(fa + q * fs);
+                if (dp < fl_floor) { dp = fl_floor; clampc[p] += gp * pow(fa / dp, ef); }
+                if (dm < fl_floor) { dm = fl_floor; clampc[p] += gm * pow(fa / dm, ef); }
+                rp = pow(fa / dp, ef);  rm = pow(fa / dm, ef);
+            }
+            sum[p] += gp * rp + gm * rm;
+            head[p] += gp + gm;
+            if (F->E[p] - head[p] <= 1e-9 * F->E[p]) { active[p] = 0; nactive--; }
+        }
+        qlast = q;
+    }
+    for (p = 0; p < np; p++) {
+        int c = p / nfreq, f = p % nfreq;
+        double tail, nw, delta;
+        if (!(F->E[p] > 0.0) || !(F->ef[c] > 1e-12)) continue;
+        tail = F->E[p] - head[p];
+        if (tail < 0.0) tail = 0.0;
+        nw = sum[p] + (active[p] ? tail * pow(freqs[f] / ((qlast + 1) * fs), F->ef[c]) / (1.0 + F->ef[c]) : 0.0);
+        delta = nw - F->E[p];
+        if (clampc[p] > 0.01 * nw && !warned_clamp) {
+            fprintf(stderr, "PNOISE-TD: WARNING output frequency %.6g Hz is within 1e-3 fs of a harmonic of fs = %.6g Hz and the "
+                    "orbit modulates a flicker source at that harmonic: the 1/f density at zero frequency is infinite, evaluated "
+                    "at 1e-3 fs instead (%.0f %% of this value)\n", freqs[f], fs, 100.0 * clampc[p] / nw);
+            warned_clamp = 1;
+        }
+        if (dbg)
+            fprintf(stderr, "PNOISE-FOLD: gen %d f=%.6g E=%.6e folded=%.6e ratio=%.6g ef=%.4g head/E=%.9f Q=%d\n",
+                    c, freqs[f], F->E[p], nw, nw / F->E[p], F->ef[c], head[p] / F->E[p], qlast);
+        onoise_out[f] += delta;
+        if (gen_dens) {
+            gen_dens[(size_t) F->slot[c] * nfreq + f] += delta;
+            if (F->tot[c] >= 0) gen_dens[(size_t) F->tot[c] * nfreq + f] += delta;
+        }
+    }
+out:
+    if (pr) tfree(pr); if (pi) tfree(pi); if (rr) tfree(rr); if (ri) tfree(ri);
+    if (cr) tfree(cr); if (ci) tfree(ci); if (sr) tfree(sr); if (si) tfree(si);
+    if (bw) tfree(bw); if (sinc) tfree(sinc); if (head) tfree(head); if (sum) tfree(sum); if (clampc) tfree(clampc); if (active) tfree(active);
+}
+
 /* card #509: restrict this engine to DEVnoise routines this derivation has
  * actually been checked against -- refuse (loudly) rather than silently
  * mis-account any other noisy device type. Matched by FUNCTION POINTER
@@ -3604,7 +3763,11 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
     int     ngen = 0;
     double *gen_dens = NULL;
     IFuid  *gen_names = NULL;
+    IFuid  *names_local = NULL;            /* card #556: the slot names (also kept when no table was asked for) */
+    PACfold fold;
+    int     fold_on = getenv("PNOISE_FLICKER_OLD") == NULL;   /* env: restore the pre-#556 flicker evaluation (red proof) */
 
+    memset(&fold, 0, sizeof(fold));
     memset(&nd, 0, sizeof(nd));
     *gen_dens_out = NULL; *gen_names_out = NULL; *ngen_out = 0;
 
@@ -3783,7 +3946,7 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
     nj.NstopFreq = freqs[nfreq - 1];
     nj.NnumSteps = nfreq;
     nj.NstpType = job->PACstepType;
-    nj.NStpsSm = want_table ? 1 : 0;
+    nj.NStpsSm = (want_table || fold_on) ? 1 : 0;
     nj.JOBname = "pnoise-td";
     nd.prtSummary = 0;
     oldJob = ckt->CKTcurJob;
@@ -3817,7 +3980,7 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
      * instance/model (RESnoise/DIOnoise/MOS1noise/BSIM4noise's own N_OPEN
      * cases all confirmed bias-independent), so any valid in-circuit
      * operating point works; step 0 is the cheapest one already at hand. */
-    if (want_table) {
+    if (want_table || fold_on) {
         double dummy = 0.0;
         if (pac_adj_refactor_at(ckt, &g_pac_traj[0], 1)) {
             fprintf(stderr, "PNOISE-TD: naming-pass refactor failed\n");
@@ -3828,12 +3991,67 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
                 DEVices[d]->DEVnoise(N_DENS, N_OPEN, ckt->CKThead[d], ckt, &nd, &dummy);
         ngen = nd.numPlots;
         if (ngen > 0) {
-            gen_dens = TMALLOC(double, (size_t) ngen * nfreq);
-            memset(gen_dens, 0, (size_t) ngen * nfreq * sizeof(double));
+            if (want_table) {
+                gen_dens = TMALLOC(double, (size_t) ngen * nfreq);
+                memset(gen_dens, 0, (size_t) ngen * nfreq * sizeof(double));
+            }
             nd.outpVector = TMALLOC(double, ngen);
             nd.prtSummary = 1;
-            gen_names = nd.namelist;   /* transfer ownership from nd */
-            nd.namelist = NULL;
+            names_local = nd.namelist;
+            if (want_table) {
+                gen_names = nd.namelist;   /* transfer ownership from nd */
+                nd.namelist = NULL;
+            }
+        }
+    }
+
+    /* card #556: folded flicker.  Flicker slots = names with "1overf" (not the sidewall one); each owns one N_GAIN call of
+     * the device noise routines, in the same instance order. */
+    if (fold_on && ngen > 0) {
+        int nfl = 0, s2, c;
+        int Ns = g_pac_traj_n;
+        for (s2 = 0; s2 < ngen; s2++) {
+            const char *nm = (const char *) names_local[s2];
+            if (nm && strstr(nm, "1overf") && !strstr(nm, "1overfsw")) nfl++;
+        }
+        if (nfl > 0 && (double) nfl * nfreq * Ns * 16.0 > 3.0e9) {
+            fprintf(stderr, "PNOISE-TD: WARNING folded-flicker table would need %.1f GB -- flicker evaluated at the output "
+                    "frequency only (the pre-card-#556 treatment)\n", (double) nfl * nfreq * Ns * 16.0 / 1e9);
+            nfl = 0;
+        }
+        if (nfl > 0) {
+            fold.nfl = nfl; fold.nfreq = nfreq; fold.N = Ns;
+            fold.slot = TMALLOC(int, nfl); fold.tot = TMALLOC(int, nfl);
+            fold.ef = TMALLOC(double, nfl); fold.ef_set = TMALLOC(int, nfl);
+            fold.zr = TMALLOC(double, (size_t) nfl * nfreq * Ns); fold.zi = TMALLOC(double, (size_t) nfl * nfreq * Ns);
+            fold.E = TMALLOC(double, (size_t) nfl * nfreq);
+            fold.tc = TMALLOC(double, Ns); fold.wk = TMALLOC(double, Ns);
+            fold.capr = TMALLOC(double, nfl); fold.capi = TMALLOC(double, nfl);
+            if (!fold.slot || !fold.tot || !fold.ef || !fold.ef_set || !fold.zr || !fold.zi || !fold.E || !fold.tc ||
+                !fold.wk || !fold.capr || !fold.capi) {
+                err = PAC_ADJOINT_FAIL; goto done;
+            }
+            memset(fold.zr, 0, (size_t) nfl * nfreq * Ns * sizeof(double));
+            memset(fold.zi, 0, (size_t) nfl * nfreq * Ns * sizeof(double));
+            memset(fold.E, 0, (size_t) nfl * nfreq * sizeof(double));
+            memset(fold.ef_set, 0, nfl * sizeof(int));
+            memset(fold.ef, 0, nfl * sizeof(double));
+            c = 0;
+            for (s2 = 0; s2 < ngen; s2++) {
+                const char *nm = (const char *) names_local[s2];
+                if (nm && strstr(nm, "1overf") && !strstr(nm, "1overfsw")) {
+                    int t2, tot = -1;
+                    size_t ln = strlen(nm);
+                    fold.slot[c] = s2;
+                    for (t2 = s2 + 1; t2 < ngen; t2++) {
+                        const char *tn = (const char *) names_local[t2];
+                        size_t lt = tn ? strlen(tn) : 0;
+                        if (tn && lt < ln && strncmp(tn, nm, lt) == 0) { tot = t2; break; }
+                    }
+                    fold.tot[c] = tot;
+                    c++;
+                }
+            }
         }
     }
 
@@ -3964,11 +4182,67 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
                 nd.delFreq = 0.0;
                 if (ngen > 0) {
                     nd.outNumber = 0;
+                    if (fold.nfl > 0 && !fold.nonpow) {
+                        g_nev_gain_cap = 1; g_nev_gain_n = 0; g_nev_gain_max = fold.nfl;
+                        g_nev_gain_re = fold.capr; g_nev_gain_im = fold.capi;
+                    }
                     for (d = 0; d < DEVmaxnum; d++)
                         if (DEVices[d] && DEVices[d]->DEVnoise && ckt->CKThead[d])
                             DEVices[d]->DEVnoise(N_DENS, N_CALC, ckt->CKThead[d], ckt, &nd, &dens);
-                    for (d = 0; d < ngen; d++)
-                        gen_dens[(size_t) d * nfreq + f] += nd.outpVector[d] * T / wk;
+                    g_nev_gain_cap = 0;
+                    if (gen_dens)
+                        for (d = 0; d < ngen; d++)
+                            gen_dens[(size_t) d * nfreq + f] += nd.outpVector[d] * T / wk;
+                    if (fold.nfl > 0 && !fold.nonpow) {
+                        if (g_nev_gain_n != fold.nfl) {
+                            fprintf(stderr, "PNOISE-TD: WARNING %d flicker gain evaluations for %d flicker slots -- flicker "
+                                    "evaluated at the output frequency only (pre-card-#556 treatment)\n",
+                                    g_nev_gain_n, fold.nfl);
+                            fold.nonpow = 1;
+                        } else {
+                            double dummy2 = 0.0;
+                            int cc;
+                            double *F1v = TMALLOC(double, fold.nfl);
+                            int need2 = 0;
+                            for (cc = 0; cc < fold.nfl; cc++) {
+                                F1v[cc] = nd.outpVector[fold.slot[cc]];
+                                if (F1v[cc] > 0.0) need2 = 1;
+                            }
+                            if (need2) {
+                                /* density at 2f: the exponent of a power law (and a test that it is one) */
+                                nd.freq = 2.0 * freqs[f];
+                                nd.outNumber = 0;
+                                for (d = 0; d < DEVmaxnum; d++)
+                                    if (DEVices[d] && DEVices[d]->DEVnoise && ckt->CKThead[d])
+                                        DEVices[d]->DEVnoise(N_DENS, N_CALC, ckt->CKThead[d], ckt, &nd, &dummy2);
+                                nd.freq = freqs[f];
+                            }
+                            for (cc = 0; cc < fold.nfl; cc++) {
+                                double u_re = fold.capr[cc], u_im = fold.capi[cc];
+                                double u2 = u_re * u_re + u_im * u_im, Fv = F1v[cc];
+                                size_t idx = ((size_t) cc * nfreq + f) * fold.N + k;
+                                if (Fv > 0.0 && u2 > 0.0) {
+                                    double F2 = nd.outpVector[fold.slot[cc]];
+                                    double sc = sqrt(Fv / u2);
+                                    double ph_re = cos(w * step->t), ph_im = sin(w * step->t);
+                                    double zre = u_re * sc, zim = u_im * sc;
+                                    fold.zr[idx] = zre * ph_re - zim * ph_im;
+                                    fold.zi[idx] = zre * ph_im + zim * ph_re;
+                                    fold.E[(size_t) cc * nfreq + f] += Fv * T / wk;
+                                    if (F2 > 0.0) {
+                                        double e = log(Fv / F2) / log(2.0);
+                                        if (!fold.ef_set[cc]) { fold.ef[cc] = e; fold.ef_set[cc] = 1; }
+                                        else if (fabs(e - fold.ef[cc]) > 1e-6 * (1.0 + fabs(e)))
+                                            fold.nonpow = 1;
+                                    } else
+                                        fold.nonpow = 1;
+                                }
+                            }
+                            tfree(F1v);
+                            fold.tc[k] = step->t + 0.25 * (h_next - step->h);
+                            fold.wk[k] = wk;
+                        }
+                    }
                 } else {
                     for (d = 0; d < DEVmaxnum; d++)
                         if (DEVices[d] && DEVices[d]->DEVnoise && ckt->CKThead[d])
@@ -4021,6 +4295,16 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
     ckt->CKTag[0] = save_ag0; ckt->CKTag[1] = save_ag1;
     have_ckt_saved = 0;
 
+    if (fold.nfl > 0) {
+        if (fold.nonpow) {
+            fprintf(stderr, "PNOISE-TD: WARNING a flicker density is not a power law in frequency (BSIM4 fnoimod=1?) -- flicker "
+                    "evaluated at the output frequency only (the pre-card-#556 treatment, exact for a bias that does not "
+                    "vary fast)\n");
+        } else {
+            pac_fold_apply(&fold, freqs, T, onoise_out, gen_dens);
+        }
+    }
+
     err = PAC_ADJOINT_OK;
     *ngen_out = ngen;
     *gen_dens_out = gen_dens;  gen_dens = NULL;
@@ -4033,6 +4317,8 @@ pac_engine_run_adjoint_noise(CKTcircuit *ckt, PSSan *job, PACstateMap *map,
         ckt->CKTag[0] = save_ag0; ckt->CKTag[1] = save_ag1;
     }
     if (have_job_saved) ckt->CKTcurJob = oldJob;
+    g_nev_gain_cap = 0;
+    pac_fold_free(&fold);
     if (Mw) tfree(Mw);
     pac_traj_free();
     if (Cdiag) tfree(Cdiag);
