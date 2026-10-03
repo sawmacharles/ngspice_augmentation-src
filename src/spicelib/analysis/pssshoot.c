@@ -1640,7 +1640,11 @@ pss_fd_perturb_side(CKTcircuit *ckt, PSSstateMap *map, double T,
  * Newton-tolerance level where the circuit has an algebraic latch loop
  * (R4/R4d) or a free-running trigger orbit (R5): the start vector of the
  * first Newton solve of those runs is the previous run's end.  Hence
- * opt-in (research/transient-acceleration.md sec. 22). */
+ * opt-in (research/transient-acceleration.md sec. 22).
+ *
+ * Not wired: the free-running engine's dense trigger-run columns (a first version existed): byte-identical on R8 dense
+ * (428 -> 220 s with 8 workers) but the R5 dense iteration (cold start, 13-15 Newton steps) took another path and on a second machine
+ * ended in "no trigger crossing found" at step 10 where it converged on the first machine; the matrix-free default does not use them. */
 typedef int (*pss_pcol_fn)(void *ctx, int j, double *out);
 static int g_pss_in_worker = 0;
 
@@ -6782,41 +6786,6 @@ pss_run_until_trigger_core(CKTcircuit *ckt, PSSstateMap *map, const double *x0,
  * at h and h/2 (step halving): noise-dominated differences scale like 1/h and truncation-dominated like h, so
  * they disagree exactly when the estimate is not trustworthy, and then the verdict is UNKNOWN(not-computed), never
  * a wrong stable/UNSTABLE. Dense: eigenvalues of the two monodromies; matrix-free: two Arnoldi processes. */
-/* card #558: trigger-run columns (free-running dense monodromy: +h and -h from x0, or one-sided stability columns) as forked workers.
- * out: [0..n)=plus [n..2n)=minus (two-sided) [2n]=failing side [2n+1]=h */
-typedef struct {
-    CKTcircuit *ckt; PSSstateMap *map; int n; const double *x0; const double *hs; double eps_d; int two_sided;
-    int node_num; double trigval; int dir; double max_period;
-} PSSpcolTrig;
-
-static int
-pss_pcol_trig(void *vc, int j, double *out)
-{
-    PSSpcolTrig *c = vc;
-    int k, n = c->n, err;
-    double h, Tm, *xt = TMALLOC(double, n);
-    if (!xt) return E_NOMEM;
-    if (c->two_sided) {
-        h = fabs(c->x0[j]) * c->eps_d;
-        if (h < 1e-9 * (c->eps_d / 1e-6)) h = 1e-9 * (c->eps_d / 1e-6);
-    } else
-        h = c->hs[j];
-    out[2 * n + 1] = h;
-    for (k = 0; k < n; k++) xt[k] = c->x0[k];
-    xt[j] += h;
-    err = pss_run_until_trigger(c->ckt, c->map, xt, c->node_num, c->trigval, c->dir, c->max_period, out, &Tm, NULL, NULL);
-    if (err) { out[2 * n] = 0; goto done; }
-    if (c->two_sided) {
-        for (k = 0; k < n; k++) xt[k] = c->x0[k];
-        xt[j] -= h;
-        err = pss_run_until_trigger(c->ckt, c->map, xt, c->node_num, c->trigval, c->dir, c->max_period, out + n, &Tm, NULL, NULL);
-        if (err) out[2 * n] = 1;
-    }
- done:
-    tfree(xt);
-    return err;
-}
-
 typedef struct {
     int status;           /* 0 trusted, 1 the two estimates disagree / not settled / ambiguous around 1, 2 a pass failed */
     double ra, rb, rad;   /* radii at h and h/2; the reported one (the larger, conservative) */
@@ -6924,31 +6893,6 @@ pss_fr_stability(CKTcircuit *ckt, PSSstateMap *map, int n, const double *x0, con
             rr[pass] = rad;
         } else {
             double *Mp = pass ? Mb : M;
-            if (pss_par_nworkers(n) > 0) {   /* card #558: the n one-sided columns as forked workers */
-                PSSpcolTrig tc;
-                int *terr = TMALLOC(int, n), tpar = 0;
-                double *tres = TMALLOC(double, (size_t) n * (2 * n + 2));
-                if (terr && tres) {
-                    memset(&tc, 0, sizeof tc);
-                    tc.ckt = ckt; tc.map = map; tc.n = n; tc.x0 = x0; tc.hs = hs; tc.two_sided = 0;
-                    tc.node_num = node_num; tc.trigval = trigval; tc.dir = dir; tc.max_period = max_period;
-                    tpar = pss_par_cols(n, 2 * n + 2, pss_pcol_trig, &tc, tres, terr, "freerun stability");
-                }
-                if (tpar) {
-                    for (j = 0; j < n; j++) {
-                        const double *o = tres + (size_t) j * (2 * n + 2);
-                        if (terr[j]) {
-                            res->status = 2; snprintf(res->why, sizeof res->why, "a perturbed trigger run (state %d) lost the crossing", j);
-                            tfree(terr); tfree(tres);
-                            goto out;
-                        }
-                        for (k = 0; k < n; k++) Mp[k * n + j] = (o[k] - Pt[k]) / hs[j];
-                    }
-                }
-                if (terr) tfree(terr);
-                if (tres) tfree(tres);
-                if (tpar) goto stab_cols_done;
-            }
             for (j = 0; j < n; j++) {
                 for (k = 0; k < n; k++) ic[k] = x0[k];
                 ic[j] += hs[j];
@@ -6958,7 +6902,6 @@ pss_fr_stability(CKTcircuit *ckt, PSSstateMap *map, int n, const double *x0, con
                 }
                 for (k = 0; k < n; k++) Mp[k * n + j] = (op[k] - Pt[k]) / hs[j];
             }
-          stab_cols_done:
             rr[pass] = pss_fr_dense_radius(Mp, n, pass ? eb : eig);
             if (pass == 0 && rr[0] < 0.0 && n > 1) { res->status = 2; snprintf(res->why, sizeof res->why, "the eigenvalue solver did not converge"); goto out; }
         }
@@ -7220,34 +7163,6 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
         if (!fr_kry) {
         /* central-FD monodromy -- see this file's card #489 header
          * comment for why this is already the terminal-projected M. */
-        {   /* card #558: the 2n trigger runs as forked workers (PSS_FORK_COLS; the loop below is the default and the fallback) */
-            PSSpcolTrig tc;
-            int *terr = TMALLOC(int, n), tpar = 0;
-            double *tres = TMALLOC(double, (size_t) n * (2 * n + 2));
-            if (terr && tres && pss_par_nworkers(n) > 0) {
-                memset(&tc, 0, sizeof tc);
-                tc.ckt = ckt; tc.map = &map; tc.n = n; tc.x0 = x0; tc.eps_d = eps_d; tc.two_sided = 1;
-                tc.node_num = node_num; tc.trigval = trigval; tc.dir = dir; tc.max_period = max_period;
-                tpar = pss_par_cols(n, 2 * n + 2, pss_pcol_trig, &tc, tres, terr, "freerun monodromy");
-            }
-            if (tpar) {
-                for (j = 0; j < n; j++) {
-                    const double *o = tres + (size_t) j * (2 * n + 2);
-                    if (terr[j]) {
-                        fprintf(stderr, "PSS-FREERUN: monodromy perturbation (%ch, "
-                                "state %d) lost the trigger crossing at iter=%d; "
-                                "treating this attempt as non-convergent.\n", o[2 * n] > 0.5 ? '-' : '+', j, iter);
-                        tfree(terr); tfree(tres);
-                        goto fr_fail;
-                    }
-                    for (k = 0; k < n; k++) M[k * n + j] = o[k];
-                    for (k = 0; k < n; k++) M[k * n + j] = (M[k * n + j] - o[n + k]) / (2.0 * o[2 * n + 1]);
-                }
-            }
-            if (terr) tfree(terr);
-            if (tres) tfree(tres);
-            if (tpar) goto fr_fd_done;
-        }
         for (j = 0; j < n; j++) {
             double h = fabs(x0[j]) * eps_d; double Tp, Tm;
             if (h < 1e-9 * (eps_d / 1e-6)) h = 1e-9 * (eps_d / 1e-6);
@@ -7277,7 +7192,6 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
             for (k = 0; k < n; k++)
                 M[k * n + j] = (M[k * n + j] - x1trial[k]) / (2.0 * h);
         }
-        fr_fd_done:
         for (k = 0; k < n * n; k++) A[k] = M[k];
         for (k = 0; k < n; k++) A[k * n + k] -= 1.0;
         for (k = 0; k < n; k++) b[k] = -F[k];
