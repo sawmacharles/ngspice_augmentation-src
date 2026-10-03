@@ -156,6 +156,7 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 #include "cap/capdefs.h"
 #include "ind/inddefs.h"
 #include "vsrc/vsrcdefs.h"
+#include "sw/swdefs.h"   /* card #559: switch power nodes with device-model charge */
 #include "isrc/isrcdefs.h"
 #ifdef XSPICE
 #include "ngspice/miftypes.h"
@@ -1682,52 +1683,131 @@ pac_gen_refuse_message(const char *who)
             "device's charge history (card #542).\n", who, g_pac_gen_badname);
 }
 
-/* card #544: saltation with model charges.  The event jump is applied at posRow/negRow with the native local capacitance
- * (or inductance) as denominator, so it is only correct if the loaded charge matrix at that row and column is the one the native
- * capacitors / inductors alone produce.  Compare the sums of |C| in the row and in the column (diagonal and off-diagonal
- * separately) with the native expectation; any model charge (MOS gate/junction caps, diode cj, ...) at a switched node, or a
- * mutual inductance on the branch, shows up as a difference and the analysis is refused. */
+/* card #544/#559: saltation with model charges.  A row r of the loaded charge matrix is "native" when the sums of |C| in its row and
+ * in its column (diagonal and off-diagonal separately) are those of the native capacitors / inductors on it alone.  A power node of
+ * a switch that is NOT native carries device-model charge (diode cj/tt, MOS junction/overlap/intrinsic, ...): since #559 its jump is
+ * formed on the charge vector (the charge-rate jump of the switch current, no capacitance in it, then the state jump C dy = dQ over
+ * the state rows), and the prepass records such nodes (pac_salq_note()).  Every other row the jump is applied to (a capacitor node
+ * or an inductor branch, divided by the native local capacitance / inductance) must be native, else the analysis is REFUSED
+ * (a mutual inductance on the branch, a model charge at a row the jump does not treat as a charge row). */
+static int
+pac_gen_row_native(CKTcircuit *ckt, int r, double *pad, double *pao, double *ped, double *peo)
+{
+    int captype = CKTtypelook("Capacitor"), indtype = CKTtypelook("Inductor");
+    int j;
+    double ed = 0.0, eo = 0.0, ad = 0.0, ao = 0.0, ad2 = 0.0, ao2 = 0.0;
+    CAPmodel *cm; CAPinstance *ci;
+    INDmodel *im; INDinstance *ii;
+    if (captype >= 0)
+        for (cm = (CAPmodel *) ckt->CKThead[captype]; cm; cm = CAPnextModel(cm))
+            for (ci = CAPinstances(cm); ci; ci = CAPnextInstance(ci)) {
+                int p = ci->CAPposNode, q = ci->CAPnegNode;
+                if (p != r && q != r) continue;
+                ed += fabs(ci->CAPcapac);
+                if ((p == r ? q : p) > 0) eo += fabs(ci->CAPcapac);
+            }
+    if (indtype >= 0)
+        for (im = (INDmodel *) ckt->CKThead[indtype]; im; im = INDnextModel(im))
+            for (ii = INDinstances(im); ii; ii = INDnextInstance(ii))
+                if (ii->INDbrEq == r)
+                    ed += fabs(ii->INDinduct);
+    for (j = 0; j < g_pac_C.n; j++) {
+        double v = fabs(g_pac_C.v[j]);
+        if (g_pac_C.ri[j] == r) { if (g_pac_C.ci[j] == r) ad += v; else ao += v; }
+        if (g_pac_C.ci[j] == r && g_pac_C.ri[j] != r) ao2 += v;
+        if (g_pac_C.ci[j] == r && g_pac_C.ri[j] == r) ad2 += v;
+    }
+    if (pad) *pad = ad;
+    if (pao) *pao = ao;
+    if (ped) *ped = ed;
+    if (peo) *peo = eo;
+    return !(fabs(ad - ed) > 1e-6 * (ad + ed) + 1e-30 || fabs(ao - eo) > 1e-6 * (ao + eo) + 1e-30 ||
+             fabs(ao2 - eo) > 1e-6 * (ao2 + eo) + 1e-30 || fabs(ad2 - ed) > 1e-6 * (ad2 + ed) + 1e-30);
+}
+
+/* card #559: power nodes of ideal switches that carry device-model charge anywhere on the orbit (recorded by the prepass), with the
+ * largest total diagonal |C| seen there.  PSSsaltModelCapHook reads them while a generic pass runs. */
+static unsigned char *g_salq = NULL;
+static double *g_salqC = NULL;
+static int g_salq_n = 0, g_salq_any = 0;
+
+static int
+pac_salq_off(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAC_SALT_NOQ") != NULL || getenv("PAC_SALT_NATIVEJUMP") != NULL;   /* red proofs: refusal / old native-only jump */
+    return off;
+}
+
+static double
+pac_salq_hook(CKTcircuit *ckt, int node)
+{
+    (void) ckt;
+    if (!g_pac_gen || !g_salq || node <= 0 || node > g_salq_n || pac_salq_off())
+        return 0.0;
+    return g_salq[node] ? g_salqC[node] : 0.0;
+}
+
+/* prepass step: note the switch power nodes whose loaded charge row is not native */
+static void
+pac_salq_note(CKTcircuit *ckt)
+{
+    int swtype = CKTtypelook("Switch");
+    SWmodel *sm; SWinstance *si;
+    if (!g_salq || swtype < 0) return;
+    for (sm = (SWmodel *) ckt->CKThead[swtype]; sm; sm = SWnextModel(sm))
+        for (si = SWinstances(sm); si; si = SWnextInstance(si)) {
+            int k, nd[2];
+            nd[0] = si->SWposNode; nd[1] = si->SWnegNode;
+            for (k = 0; k < 2; k++) {
+                double ad;
+                if (nd[k] <= 0 || nd[k] > g_salq_n) continue;
+                if (!pac_gen_row_native(ckt, nd[k], &ad, NULL, NULL, NULL)) {
+                    g_salq[nd[k]] = 1; g_salq_any = 1;
+                    if (ad > g_salqC[nd[k]]) g_salqC[nd[k]] = ad;
+                }
+            }
+        }
+}
+
 static int
 pac_gen_salt_guard(CKTcircuit *ckt, const PSSsaltEvent *ev, int n_ev)
 {
-    int captype = CKTtypelook("Capacitor"), indtype = CKTtypelook("Inductor");
     int i, k;
+    if (getenv("PAC_SALT_NATIVEJUMP")) return 0;   /* red proof (card #559): the pre-#559 jump (divided by the native capacitance) without the refusal */
     for (i = 0; i < n_ev; i++) {
         int rows[4];
         /* posRow/negRow are where the jump is applied (capacitor node or inductor branch); the switch's own power nodes carry the
          * charge the jump would have to move when the jump is routed through an inductor (no capacitor at the switched node): a
-         * model charge there (diode cj at the switch node) makes the node a state the native jump does not describe. */
+         * model charge there makes the node a state the native jump does not describe, unless the event treats it as a charge
+         * row (posQ/negQ, #559). */
         rows[0] = ev[i].posRow; rows[1] = ev[i].negRow; rows[2] = ev[i].posNode; rows[3] = ev[i].negNode;
         for (k = 0; k < 4; k++) {
-            int r = rows[k], j;
-            double ed = 0.0, eo = 0.0, ad = 0.0, ao = 0.0, ad2 = 0.0, ao2 = 0.0;
-            CAPmodel *cm; CAPinstance *ci;
-            INDmodel *im; INDinstance *ii;
+            int r = rows[k];
+            double ad, ao, ed, eo;
             if (r <= 0) continue;
-            if (captype >= 0)
-                for (cm = (CAPmodel *) ckt->CKThead[captype]; cm; cm = CAPnextModel(cm))
-                    for (ci = CAPinstances(cm); ci; ci = CAPnextInstance(ci)) {
-                        int p = ci->CAPposNode, q = ci->CAPnegNode;
-                        if (p != r && q != r) continue;
-                        ed += fabs(ci->CAPcapac);
-                        if ((p == r ? q : p) > 0) eo += fabs(ci->CAPcapac);
-                    }
-            if (indtype >= 0)
-                for (im = (INDmodel *) ckt->CKThead[indtype]; im; im = INDnextModel(im))
-                    for (ii = INDinstances(im); ii; ii = INDnextInstance(ii))
-                        if (ii->INDbrEq == r)
-                            ed += fabs(ii->INDinduct);
-            for (j = 0; j < g_pac_C.n; j++) {
-                double v = fabs(g_pac_C.v[j]);
-                if (g_pac_C.ri[j] == r) { if (g_pac_C.ci[j] == r) ad += v; else ao += v; }
-                if (g_pac_C.ci[j] == r && g_pac_C.ri[j] != r) ao2 += v;
-                if (g_pac_C.ci[j] == r && g_pac_C.ri[j] == r) ad2 += v;
+            if ((r == ev[i].posNode && ev[i].posQ) || (r == ev[i].negNode && ev[i].negQ)) {
+                /* card #559 validated envelope: the model charge sits on top of a NATIVE capacitor at the same node (a switch-node
+                 * capacitor, Coss modelled as a C, ...), so the node is a charge state on the whole orbit and its fast transient is
+                 * resolved by the steps.  A node whose only charge is device-model charge (reverse-biased diode: cj only, forward: tt*I)
+                 * and that is small (tens of pF) turns the event into a ps-scale unresolved transient: pac_r6od with the node capacitor
+                 * removed 0.06-0.10 dB off and drifting with reltol, a diode-only inductor-adjacent node 0.30 dB off and 3 dB off at reltol
+                 * 1e-6, while the native-capacitor decks hold 0.013-0.02 dB at every reltol: refused (PAC_SALT_QONLY=1 overrides). */
+                double ad, ao, ed, eo;
+                (void) pac_gen_row_native(ckt, r, &ad, &ao, &ed, &eo);
+                if ((ed <= 0.0 || ad <= 0.0) && !getenv("PAC_SALT_QONLY")) {
+                    fprintf(stderr, "PAC-TD: REFUSED -- an ideal-switch (saltation) event (%s) at a node that carries device-model charge but "
+                            "no native capacitor (loaded |C| diag %g, native %g): the state jump of such a node is validated only with a native "
+                            "capacitor at the node (card #559: 0.06-0.3 dB and reltol-dependent without; PAC_SALT_QONLY=1 overrides, "
+                            "unvalidated).\n", ev[i].name ? ev[i].name : "sw", ad, ed);
+                    return 1;
+                }
+                continue;
             }
-            if (fabs(ad - ed) > 1e-6 * (ad + ed) + 1e-30 || fabs(ao - eo) > 1e-6 * (ao + eo) + 1e-30 ||
-                fabs(ao2 - eo) > 1e-6 * (ao2 + eo) + 1e-30 || fabs(ad2 - ed) > 1e-6 * (ad2 + ed) + 1e-30) {
+            if (!pac_gen_row_native(ckt, r, &ad, &ao, &ed, &eo)) {
                 fprintf(stderr, "PAC-TD: REFUSED -- an ideal-switch (saltation) event (%s) at a row that carries device-model "
                         "charge or a mutual inductance (loaded |C| row %g/%g, native %g/%g): the state jump of the event is "
-                        "derived for the native capacitor/inductor at the switched node only (card #544).\n",
+                        "derived for the native capacitor/inductor at the switched node only (cards #544, #559).\n",
                         ev[i].name ? ev[i].name : "sw", ad, ao, ed, eo);
                 return 1;
             }
@@ -1883,12 +1963,155 @@ static void pac_hid_rhs(int m, int M) { (void) m; (void) M; }
 static void pac_hid_update(int m, int M) { (void) m; (void) M; }
 #endif
 
+/* card #559: ideal-switch event at a power node that carries device-model charge.  Fang's jump on the charge vector:
+ *     dq+ = dq- - (F+ - F-) dt_e ,   dt_e = -(grad h . dx-) / h_dot ,   F+ - F- = (-dI at pos, +dI at neg)  [charge rate: the switch current]
+ * so dQ(row) = coeff * dqdt with coeff = (y(posCntrl) - y(negCntrl)) / h_dot exactly as the native branch, but nothing is divided by a
+ * capacitance.  The state jump that goes with it is C dy = dQ over the charge-coupled block of state rows (C_k at the event: a model
+ * capacitance couples the node to its neighbours, e.g. Cgd to the gate: the charge of the neighbour does not jump, its voltage does,
+ * a capacitive divider); y of those rows is moved by dy so the recorded perturbation and the Floquet closure see the jump.  Q_k = C_k y_k
+ * is then Q_smooth + dQ.  Where the block is singular (a floating pair of nodes) y is moved by dQ / (diagonal C); Q_k is Q_smooth + dQ exactly
+ * either way.  T_k = ag0 (Q_smooth - Q_{k-1}) - a1 T_{k-1} is formed from the SMOOTH part BEFORE the jump is added (the derivative of the flow
+ * after the event, not dQ/h: the trapezoidal recursion would re-inject the spike as a1 T_k into the next step), so no forced order-1 window is
+ * needed (PSS_SALT_QSTEPS=N forces N steps, experiments only: N = 0..2 give the same curve to 1e-3 dB on pac_r6od; the earlier tau-window
+ * scheme moved the answer by 3 dB with the window length).
+ * Returns 0 (no model-charged power node on these events), 1 (formed; pac_salt_qjump_finish() adds dQ and dy after T_k), -1 (no memory). */
+static int
+pac_salt_qjump_prepare(const PSSsaltEvent *ev, int n_ev, int neq, int M, PACc **pdq, PACc **pdy)
+{
+    int i, m, any = 0;
+    size_t sz = (size_t) (neq + 1) * M;
+    PACc *dq, *dy;
+    unsigned char *inb, *isst;
+    int *idx, *lst, nb = 0, ns, grew, j;
+    double *A = NULL;
+    for (i = 0; i < n_ev; i++)
+        if (ev[i].posQ || ev[i].negQ) any = 1;
+    if (!any) return 0;
+    dq = TMALLOC(PACc, sz); dy = TMALLOC(PACc, sz);
+    inb = TMALLOC(unsigned char, neq + 1); isst = TMALLOC(unsigned char, neq + 1);
+    idx = TMALLOC(int, neq + 1); lst = TMALLOC(int, neq + 1);
+    if (!dq || !dy || !inb || !isst || !idx || !lst) return -1;
+    memset(dq, 0, sz * sizeof(PACc)); memset(dy, 0, sz * sizeof(PACc));
+    memset(inb, 0, (size_t) neq + 1); memset(isst, 0, (size_t) neq + 1);
+    ns = g_pac_map->ns;
+    for (i = 0; i < ns; i++) { int r = g_pac_map->srows[i]; if (r > 0 && r <= neq) isst[r] = 1; }
+    for (m = 0; m < M; m++)
+        for (i = 0; i < n_ev; i++) {
+            const PSSsaltEvent *e = &ev[i];
+            PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m), Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
+            PACc coeff = pc_scale(pc_sub(Sp, Sn), 1.0 / e->h_dot);
+            if (e->posQ && e->posRow > 0)
+                dq[(size_t) e->posRow * M + m] = pc_add(dq[(size_t) e->posRow * M + m], pc_scale(coeff, e->dqdt_pos));
+            if (e->negQ && e->negRow > 0)
+                dq[(size_t) e->negRow * M + m] = pc_add(dq[(size_t) e->negRow * M + m], pc_scale(coeff, e->dqdt_neg));
+        }
+    /* charge-coupled block of state rows containing the jumped rows */
+    for (i = 0; i < n_ev; i++) {
+        if (ev[i].posQ && ev[i].posRow > 0 && isst[ev[i].posRow]) inb[ev[i].posRow] = 1;
+        if (ev[i].negQ && ev[i].negRow > 0 && isst[ev[i].negRow]) inb[ev[i].negRow] = 1;
+    }
+    do {
+        grew = 0;
+        for (j = 0; j < g_pac_C.n; j++) {
+            int r = g_pac_C.ri[j], cc = g_pac_C.ci[j];
+            if (r <= 0 || cc <= 0 || g_pac_C.v[j] == 0.0 || !isst[r] || !isst[cc]) continue;
+            if (inb[r] && !inb[cc]) { inb[cc] = 1; grew = 1; }
+            if (inb[cc] && !inb[r]) { inb[r] = 1; grew = 1; }
+        }
+    } while (grew);
+    for (i = 1; i <= neq; i++) { idx[i] = -1; if (inb[i]) { idx[i] = nb; lst[nb++] = i; } }
+    {
+        int ok = 0;
+        if (nb > 0) A = TMALLOC(double, (size_t) nb * nb);
+        if (A) {
+            int a, b, k;
+            memset(A, 0, (size_t) nb * nb * sizeof(double));
+            for (j = 0; j < g_pac_C.n; j++) {
+                int r = g_pac_C.ri[j], cc = g_pac_C.ci[j];
+                if (r > 0 && cc > 0 && idx[r] >= 0 && idx[cc] >= 0) A[(size_t) idx[r] * nb + idx[cc]] += g_pac_C.v[j];
+            }
+            {   /* LU with partial pivoting kept in place, solved per column m */
+                double amax = 0.0;
+                int *piv = TMALLOC(int, nb);
+                for (a = 0; a < nb * nb; a++) if (fabs(A[a]) > amax) amax = fabs(A[a]);
+                ok = (piv != NULL && amax > 0.0);
+                for (k = 0; ok && k < nb; k++) {
+                    int p = k;
+                    double pm = fabs(A[(size_t) k * nb + k]);
+                    for (a = k + 1; a < nb; a++) if (fabs(A[(size_t) a * nb + k]) > pm) { pm = fabs(A[(size_t) a * nb + k]); p = a; }
+                    if (pm <= 1e-10 * amax) { ok = 0; break; }
+                    piv[k] = p;
+                    if (p != k) for (b = 0; b < nb; b++) { double t = A[(size_t) k * nb + b]; A[(size_t) k * nb + b] = A[(size_t) p * nb + b]; A[(size_t) p * nb + b] = t; }
+                    for (a = k + 1; a < nb; a++) {
+                        double f = A[(size_t) a * nb + k] / A[(size_t) k * nb + k];
+                        A[(size_t) a * nb + k] = f;
+                        for (b = k + 1; b < nb; b++) A[(size_t) a * nb + b] -= f * A[(size_t) k * nb + b];
+                    }
+                }
+                if (ok)
+                    for (m = 0; m < M; m++) {
+                        PACc *x = TMALLOC(PACc, nb);
+                        if (!x) { ok = 0; break; }
+                        for (a = 0; a < nb; a++) x[a] = dq[(size_t) lst[a] * M + m];
+                        for (k = 0; k < nb; k++) {   /* apply the row permutation and forward-eliminate */
+                            PACc t = x[k]; x[k] = x[piv[k]]; x[piv[k]] = t;
+                            for (a = k + 1; a < nb; a++) {
+                                x[a].re -= A[(size_t) a * nb + k] * x[k].re; x[a].im -= A[(size_t) a * nb + k] * x[k].im;
+                            }
+                        }
+                        for (k = nb - 1; k >= 0; k--) {
+                            for (b = k + 1; b < nb; b++) { x[k].re -= A[(size_t) k * nb + b] * x[b].re; x[k].im -= A[(size_t) k * nb + b] * x[b].im; }
+                            x[k].re /= A[(size_t) k * nb + k]; x[k].im /= A[(size_t) k * nb + k];
+                        }
+                        for (a = 0; a < nb; a++) dy[(size_t) lst[a] * M + m] = x[a];
+                        tfree(x);
+                    }
+                if (piv) tfree(piv);
+            }
+        }
+        if (!ok) {   /* singular block: dy = dQ / diagonal C on the jumped rows (the residual is added to Q exactly) */
+            memset(dy, 0, sz * sizeof(PACc));
+            for (i = 0; i < n_ev; i++) {
+                int sd, r = 0;
+                for (sd = 0; sd < 2; sd++) {
+                    double dg = 0.0;
+                    r = sd ? (ev[i].negQ ? ev[i].negRow : 0) : (ev[i].posQ ? ev[i].posRow : 0);
+                    if (r <= 0) continue;
+                    for (j = 0; j < g_pac_C.n; j++) if (g_pac_C.ri[j] == r && g_pac_C.ci[j] == r) dg += g_pac_C.v[j];
+                    if (dg == 0.0) continue;
+                    for (m = 0; m < M; m++)
+                        dy[(size_t) r * M + m] = pc_add(dy[(size_t) r * M + m], pc_scale(dq[(size_t) r * M + m], 1.0 / dg));
+                }
+            }
+        }
+    }
+    if (A) tfree(A);
+    tfree(inb); tfree(isst); tfree(idx); tfree(lst);
+    *pdq = dq; *pdy = dy;
+    return 1;
+}
+
+/* After T_k has been formed from the SMOOTH part of the step (Q_smooth = C y_smooth, so the derivative history carries no jump spike: the derivative
+ * of the flow after the event, not dQ/h -- the trapezoidal recursion would otherwise re-inject the spike as a1 T_k into the next step), add the
+ * jump itself: Q_k = Q_smooth + dQ (exactly, whatever the state jump dy could resolve) and y_k = y_smooth + dy. */
+static void
+pac_salt_qjump_finish(int neq, int M, PACc *dq, PACc *dy)
+{
+    size_t sz = (size_t) (neq + 1) * M, i;
+    for (i = 0; i < sz; i++) {
+        g_pac_Qnew[i].re += dq[i].re; g_pac_Qnew[i].im += dq[i].im;
+        g_pac_Cnew[i].re += dy[i].re; g_pac_Cnew[i].im += dy[i].im;
+    }
+    tfree(dq); tfree(dy);
+}
+
 /* One accepted step of the generic recursion for all M columns. */
 static int
 pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new,
                 const PSSsaltEvent *salt_ev, int n_salt)
 {
-    int neq = g_pac_neq, M = g_pac_M, m, row;
+    int neq = g_pac_neq, M = g_pac_M, m, row, qjump = 0;
+    PACc *dq = NULL, *dy = NULL;
     double a1 = (order == 2) ? ag1 : 0.0;
 
 #ifdef XSPICE
@@ -2041,12 +2264,14 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
             }
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 const PSSsaltEvent *e = &salt_ev[i_salt];
-                if (e->posRow > 0)
+                if (e->posRow > 0 && !e->posQ)
                     pac_set(g_pac_Cnew, e->posRow, M, m, pc_add(pac_get(g_pac_Cnew, e->posRow, M, m), djump[i_salt][0]));
-                if (e->negRow > 0)
+                if (e->negRow > 0 && !e->negQ)
                     pac_set(g_pac_Cnew, e->negRow, M, m, pc_add(pac_get(g_pac_Cnew, e->negRow, M, m), djump[i_salt][1]));
             }
         }
+        qjump = pac_salt_qjump_prepare(salt_ev, n_salt, neq, M, &dq, &dy);
+        if (qjump < 0) return 1;
     }
     pac_C_mul(&g_pac_C, g_pac_Cnew, g_pac_Qnew, neq, M);
     for (row = 1; row <= neq; row++)
@@ -2057,6 +2282,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
             Tn.im = ag0 * (g_pac_Qnew[ix].im - g_pac_Qprev[ix].im) - a1 * g_pac_Tprev[ix].im;
             g_pac_Tnew[ix] = Tn;
         }
+    if (qjump > 0) pac_salt_qjump_finish(neq, M, dq, dy);   /* card #559: after T (see there) */
     { PACc *tmp = g_pac_Qprev; g_pac_Qprev = g_pac_Qnew; g_pac_Qnew = tmp; }
     return 0;
 }
@@ -2114,6 +2340,7 @@ pac_prepass_step(CKTcircuit *ckt)
         return;
     }
     g_pp_steps++;
+    if (g_salq) pac_salq_note(ckt);   /* card #559 */
 #ifdef XSPICE
     if (g_hid_nc > 0 && getenv("PAC_HID_TRACE") && (g_pp_steps <= 2 || ckt->CKTtime >= 0.999999 * ckt->CKTfinalTime)) {
         int hi;
@@ -2795,30 +3022,53 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
     return has;
 }
 
-/* BSIM3/BSIM4 non-quasi-static models carry an internal charge-relaxation state (qcheq) that is a CKTstate
- * history of its own, not a node charge: the node-charge recursion does not contain it, so a deck that enables it
- * is refused (measured on a BSIM4 common-source deck with trnqsmod=1: affine-in-ag0 check passes but the result
- * is 3e-5 off the .ac value, larger NQS time constants would give more). */
+/* Non-quasi-static MOS models.  BSIM4 (trnqsmod=1) and BSIM3v3.3 (nqsmod=1) carry the channel-charge relaxation in an extra circuit
+ * node (qNode, "charge deficit"), stamped with charge terms proportional to ag0 (the affine-in-ag0 guard of the generic path passes) and
+ * conductive terms, so its relaxation is an ordinary state of the generic charge recursion; since card #559 it is accepted:
+ * td .pac vs a transient FRA of the same trnqsmod=1 model (LTI bias, 1..30 MHz, wt = 1 at 10 MHz): 1e-4 relative or better, 1e-5 typical
+ * (BSIM4 and BSIM3); on a 1 MHz LO-switched BSIM4 stage 0.003 dB / 0.01 deg vs the transient FRA (docs/pss-pac.md).  `.ac` is NOT the
+ * reference: its acnqsmod is a different (single-pole) approximation, 20-40 % away from the transient model at omega*tau ~ 1.
+ * acnqsmod alone (trnqsmod=0) does not change the transient model, hence not a td analysis: accepted with a note.  An NQS-capable device
+ * of any OTHER family is still refused (not validated), and so is every NQS model in `.pnoise` (strict: the noise of the relaxation node is
+ * not validated).  PAC_NQS_REFUSE=1 restores the pre-#559 refusal of every NQS model (red proof).
+ * Returns the refusal text (static) or NULL; *note is set to a text to print once when an NQS model is accepted. */
 static const char *
-pac_find_nqs_device(CKTcircuit *ckt)
+pac_find_nqs_device(CKTcircuit *ckt, const char **note, int strict)
 {
     int i, k;
-    static char buf[96];
+    static char buf[96], nbuf[160];
+    *note = NULL;
     for (i = 0; i < DEVmaxnum; i++) {
         SPICEdev *d = DEVices[i];
         GENmodel *m;
+        const char *dn;
         if (!d || !ckt->CKThead[i] || !d->DEVmodAsk || !d->DEVpublic.modelParms || !d->DEVpublic.numModelParms)
             continue;
+        dn = d->DEVpublic.name ? d->DEVpublic.name : "?";
         for (k = 0; k < *d->DEVpublic.numModelParms; k++) {
             const char *kw = d->DEVpublic.modelParms[k].keyword;
-            if (!kw || (strcasecmp(kw, "trnqsmod") && strcasecmp(kw, "acnqsmod") && strcasecmp(kw, "nqsmod")))
+            int is_tr, is_ac;
+            if (!kw)
+                continue;
+            is_tr = !strcasecmp(kw, "trnqsmod") || !strcasecmp(kw, "nqsmod");
+            is_ac = !strcasecmp(kw, "acnqsmod");
+            if (!is_tr && !is_ac)
                 continue;
             for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
                 IFvalue v;
                 memset(&v, 0, sizeof v);
-                if (d->DEVmodAsk(ckt, m, d->DEVpublic.modelParms[k].id, &v) == OK && v.iValue != 0) {
-                    snprintf(buf, sizeof buf, "%s (%s=%d)", d->DEVpublic.name ? d->DEVpublic.name : "?", kw, v.iValue);
+                if (d->DEVmodAsk(ckt, m, d->DEVpublic.modelParms[k].id, &v) != OK || v.iValue == 0)
+                    continue;
+                if (getenv("PAC_NQS_REFUSE") || (is_tr && (strict || (strcmp(dn, "BSIM4") && strcmp(dn, "BSIM3"))))) {
+                    snprintf(buf, sizeof buf, "%s (%s=%d)", dn, kw, v.iValue);
                     return buf;
+                }
+                if (is_tr) {
+                    snprintf(nbuf, sizeof nbuf, "%s %s=%d: the channel-charge relaxation node is an ordinary state of the generic charge recursion (card #559)", dn, kw, v.iValue);
+                    *note = nbuf;
+                } else if (!*note) {
+                    snprintf(nbuf, sizeof nbuf, "%s %s=%d affects .ac only: this td analysis linearises the transient model (quasi-static unless trnqsmod/nqsmod is on; card #559)", dn, kw, v.iValue);
+                    *note = nbuf;
                 }
             }
         }
@@ -3006,14 +3256,17 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         return E_UNSUPP;
     }
     {
-        const char *nqs = pac_find_nqs_device(ckt);
+        const char *note = NULL;
+        const char *nqs = pac_find_nqs_device(ckt, &note, !strcmp(who, "PNOISE-TD"));
         if (nqs && !getenv("PAC_ALLOW_NQS")) {
             fprintf(stderr, "%s: REFUSED -- %s: the non-quasi-static model carries an internal charge-relaxation state "
-                    "that is not a node charge and is not part of the generic history (card #542). Use the "
-                    "quasi-static model (trnqsmod=0 / nqsmod=0). PAC_ALLOW_NQS=1 overrides (result then only "
-                    "approximate).\n", who, nqs);
+                    "that is not validated here (card #542; BSIM4 trnqsmod and BSIM3 nqsmod are accepted in .pac/.pstb/.pxf since "
+                    "card #559, not in .pnoise). Use the quasi-static model (trnqsmod=0 / nqsmod=0). PAC_ALLOW_NQS=1 overrides "
+                    "(result then unvalidated).\n", who, nqs);
             return E_UNSUPP;
         }
+        if (note)
+            fprintf(stderr, "%s: non-quasi-static MOS model: %s\n", who, note);
     }
     /* card #549: method=gear is carried by the generic (charge-history) recursion only, so it is taken for native decks too */
     force_gen = getenv("PAC_FORCE_GENERIC") != NULL || ckt->CKTintegrateMethod == GEAR;
@@ -3051,11 +3304,23 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     g_pp_xend = TMALLOC(double, neq + 1);
     if (!g_pp_xend) { tfree(g_pp_col); g_pp_col = NULL; return E_NOMEM; }
     g_pp_neq = neq;
+    /* card #559: switch power nodes with device-model charge (recorded by the prepass steps) */
+    PSSsaltModelCapHook = NULL;
+    if (g_salq) { tfree(g_salq); g_salq = NULL; }
+    if (g_salqC) { tfree(g_salqC); g_salqC = NULL; }
+    g_salq_n = 0; g_salq_any = 0;
+    if (CKTtypelook("Switch") >= 0 && ckt->CKThead[CKTtypelook("Switch")]) {
+        g_salq = TMALLOC(unsigned char, neq + 1);
+        g_salqC = TMALLOC(double, neq + 1);
+        if (g_salq && g_salqC) g_salq_n = neq;
+        else { if (g_salq) tfree(g_salq); if (g_salqC) tfree(g_salqC); g_salq = NULL; g_salqC = NULL; }
+    }
     /* two prepass periods: the first from whatever state the PSS left, the second from the first one's
      * end state (periodic continuation, see g_pac_xinit); the second one is what the recording passes
      * reproduce, so its steps/columns define the state set. */
     for (npass = 0; npass < 2; npass++) {
         memset(g_pp_col, 0, (size_t) neq + 1);
+        if (g_salq) { memset(g_salq, 0, (size_t) neq + 1); memset(g_salqC, 0, (size_t) (neq + 1) * sizeof(double)); g_salq_any = 0; }
         memset(g_pp_xend, 0, (size_t) (neq + 1) * sizeof(double));
         g_pp_steps = 0; g_pp_cmax = 0.0;
         g_pac_gen_bad = 0; g_pac_gen_badname[0] = '\0';
@@ -3135,6 +3400,13 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
 #endif
     map->ns = ns;
     map->generic = 1;
+    if (g_salq && g_salq_any) {
+        int sn, nq = 0;
+        for (sn = 1; sn <= g_salq_n; sn++) if (g_salq[sn]) nq++;
+        PSSsaltModelCapHook = pac_salq_hook;
+        fprintf(stderr, "%s: ideal-switch power nodes with device-model charge (card #559): %d node(s); their saltation jump is formed on the "
+                "charge vector%s\n", who, nq, pac_salq_off() ? " [DISABLED by PAC_SALT_NOQ / PAC_SALT_NATIVEJUMP: native-only jump]" : "");
+    }
     tfree(g_pp_col); g_pp_col = NULL;
     tfree(g_pp_xend); g_pp_xend = NULL;
     fprintf(stderr, "%s: generic charge-based history (card #542): %d native C/L + model-charge states -> "

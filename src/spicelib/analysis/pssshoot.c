@@ -2235,6 +2235,7 @@ int PSSsaltActive = 1;   /* PSS_SALTATION=0 env var disables (red-proof toggle) 
 
 static int g_salt_first_step_pending = 0;   /* card #494 third pass: restart filter */
 static double g_salt_prev_time = -1.0;      /* card #494 fifth pass: h_dot's true-elapsed-time tracker */
+static int g_salt_qsteps_left = 0;          /* card #559: order-1 steps still to force after a model-charged event */
 static double g_salt_settle_until = -1.0;   /* card #494 fifth pass: force-order-1 window deadline */
 static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
 static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_ind_jump() */
@@ -2257,6 +2258,7 @@ PSSsaltReset(void)
     g_salt_prev_time = -1.0;
     g_salt_vsw_have_prev = 0;
     g_salt_settle_until = -1.0;
+    g_salt_qsteps_left = 0;
     g_salt_events_seen = 0;
     g_salt_ind_warned = 0;   /* card #510 step 1: once per analysis (fresh period/recording run) */
 }
@@ -2275,6 +2277,7 @@ PSSsaltEventsSeen(void)
 int
 PSSsaltForceOrder1(CKTcircuit *ckt)
 {
+    if (g_salt_qsteps_left > 0) { g_salt_qsteps_left--; return 1; }   /* card #559 */
     return (g_salt_settle_until > 0.0 && ckt->CKTtime < g_salt_settle_until);
 }
 
@@ -2289,6 +2292,8 @@ pss_salt_is_on(double state)
  * derivation comment above for why this is exactly the right denominator
  * for that node's own (f+-f-) state jump. 0 if node<=0 (ground/unused) or
  * no capacitor is directly there. */
+double (*PSSsaltModelCapHook)(CKTcircuit *ckt, int node) = NULL;   /* card #559, see pssshoot.h */
+
 static double
 pss_salt_local_cap(CKTcircuit *ckt, int node)
 {
@@ -2299,6 +2304,11 @@ pss_salt_local_cap(CKTcircuit *ckt, int node)
 
     if (node <= 0)
         return 0.0;
+    if (PSSsaltModelCapHook) {   /* card #559: a node with device-model charge is a charge state whatever the native capacitors say */
+        double cm_ = PSSsaltModelCapHook(ckt, node);
+        if (cm_ > 0.0)
+            return cm_;
+    }
 
     captype = CKTtypelook("Capacitor");
     if (captype < 0)
@@ -2910,6 +2920,16 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             ev[n].dfdt_pos = dfdt_pos;
             ev[n].dfdt_neg = dfdt_neg;
             ev[n].name = here->SWname;
+            ev[n].posQ = ev[n].negQ = 0;
+            ev[n].dqdt_pos = ev[n].dqdt_neg = 0.0;
+            if (PSSsaltModelCapHook) {   /* card #559: model-charged power nodes (see PSSsaltEvent) */
+                if (here->SWposNode > 0 && PSSsaltModelCapHook(ckt, here->SWposNode) > 0.0) {
+                    ev[n].posQ = 1; ev[n].posRow = here->SWposNode; ev[n].dqdt_pos = -dI;
+                }
+                if (here->SWnegNode > 0 && PSSsaltModelCapHook(ckt, here->SWnegNode) > 0.0) {
+                    ev[n].negQ = 1; ev[n].negRow = here->SWnegNode; ev[n].dqdt_neg = dI;
+                }
+            }
 
             /* card #494 fifth pass (task 2): estimate this event's own
              * settle-window requirement from its power nodes' local RC --
@@ -2918,6 +2938,18 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             Gneg = pss_salt_local_cond(ckt, here->SWnegNode);
             tau_pos = (Cpos > 0.0 && Gpos > 0.0) ? Cpos / Gpos : 0.0;
             tau_neg = (Cneg > 0.0 && Gneg > 0.0) ? Cneg / Gneg : 0.0;
+            if (ev[n].posQ || ev[n].negQ) {
+                /* card #559: a model-charged node has no RC estimate (the stored charge of a diode, tt * I, is not a capacitor through a
+                 * conductance, and the conductance that matters, the freewheel diode's, is not on at the accepted point of the event
+                 * step): the order-1 settle window is a number of accepted STEPS, the event step included.  Measured against the converged
+                 * perturbed PSS (pac_r6od: diode cj+tt at the switch node): 1 step 9 dB off, 2 steps 0.013 dB, 3 0.02, 4 0.03, 6 0.09,
+                 * a 100-step window +1.7 dB (order 1 with the trapezoidal matrix drops the derivative history of the slow states). */
+                static int qsteps = -1;
+                if (qsteps < 0) { const char *e_ = getenv("PSS_SALT_QSTEPS"); qsteps = e_ ? atoi(e_) : 0; }
+                if (qsteps > g_salt_qsteps_left) g_salt_qsteps_left = qsteps;
+                if (ev[n].posQ) tau_pos = 0.0;
+                if (ev[n].negQ) tau_neg = 0.0;
+            }
             if (tau_pos > tau_max) tau_max = tau_pos;
             if (tau_neg > tau_max) tau_max = tau_neg;
             /* card #510: same settle-window estimate, inductor-routed case
@@ -2932,7 +2964,8 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     if (n > 0)
         g_salt_events_seen += n;   /* card #494 sixth pass: see PSSsaltEventsSeen() */
     if (n > 0 && tau_max > 0.0) {
-        double deadline = ckt->CKTtime + PSS_SALT_SETTLE_TAUS * tau_max;
+        double deadline;
+        deadline = ckt->CKTtime + PSS_SALT_SETTLE_TAUS * tau_max;
         if (deadline > g_salt_settle_until)
             g_salt_settle_until = deadline;
     }

@@ -175,7 +175,17 @@ typedef struct {
                                    * posRow==0 */
     double dfdt_neg;             /* (f+-f-) for negRow, mirror of dfdt_pos */
     const char *name;           /* instance name, for diagnostics */
+    /* card #559: posQ/negQ = 1 when that power node carries DEVICE-MODEL charge (diode cj/tt, MOS junction/overlap, ...) in the
+     * generic td-PAC charge matrix; the jump of that node is then formed on the charge vector (dqdt_pos/neg = the charge-rate
+     * jump of the switch current, -dI / +dI, no capacitance in it) by pac_step_generic(), not divided by a native capacitance.
+     * dfdt_pos/neg of such a node stays the rate over the node's total diagonal charge (used for the settle estimate only). */
+    int posQ, negQ;
+    double dqdt_pos, dqdt_neg;
 } PSSsaltEvent;
+
+/* card #559: set by pacshoot.c while a generic-charge td-PAC pass runs: returns the total diagonal |C| (Farads) of the node when its
+ * loaded charge row carries more than the native capacitors/inductors on it (device-model charge), else 0. */
+extern double (*PSSsaltModelCapHook)(CKTcircuit *ckt, int node);
 
 #define PSS_SALT_MAX_EVENTS 8
 
