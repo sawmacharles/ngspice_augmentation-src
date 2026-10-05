@@ -78,16 +78,13 @@ void
 initw(void)
 {
 
-    /* initialize the uniform generator */
-    srand((unsigned int) getpid());
-    // srand(17);
-    TausSeed();
+    /* bug 873 (upstream 059066b53): the uniform generator is seeded by com_sseed() in main.c before initw() */
 
     /* set up the two pools */
-    pool1 = TMALLOC(double, n);
-    pool2 = TMALLOC(double, n);
-    addrif = TMALLOC(unsigned int, (n + NOTRANS));
-    addrib = TMALLOC(unsigned int, (n + NOTRANS));
+    pool1 = TREALLOC(double, pool1, n);
+    pool2 = TREALLOC(double, pool2, n);
+    addrif = TREALLOC(unsigned int, addrif, (n + NOTRANS));
+    addrib = TREALLOC(unsigned int, addrib, (n + NOTRANS));
 
     wallace_fill();
 }
