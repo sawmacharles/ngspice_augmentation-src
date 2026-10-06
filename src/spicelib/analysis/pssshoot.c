@@ -3073,6 +3073,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             int n_extra = 0, extra_row[PSS_SALT_MAX_EVENTS];
             double extra_dfdt[PSS_SALT_MAX_EVENTS];
             double Cq_pos = 0.0, Cq_neg = 0.0;
+            int force_fast = 0;
             double k_pos = 0.0, k_neg = 0.0, dv_pos = 0.0, dv_neg = 0.0;
 
             sw_idx++;
@@ -3124,6 +3125,23 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
 
             Cpos = pss_salt_local_cap(ckt, here->SWposNode);
             Cneg = pss_salt_local_cap(ckt, here->SWnegNode);
+            {   /* card #580: a switch node with a capacitor whose diode feeds another capacitor (boost: the output capacitor), no RC
+                 * snubber: treated as a fast node (routed jump + continuation, which also carries the diode-fed capacitor's jump and
+                 * the output impulse).  As a capacitor-jump node the same decks are 0.14-0.18 dB / 0.55-0.74 deg off, whatever the
+                 * step and the settle window; as a fast node 0.002-0.033 dB.  A buck node (diode to ground or to a source: nothing
+                 * fed) keeps the capacitor jump.  PSS_SALT_NOFARFAST=1 switches this off (red proof); PSS_SALT_FORCEFAST=1 forces
+                 * the fast-node treatment on every capacitor node (experiments: wrong on a half bridge). */
+                int side_;
+                int forceall = getenv("PSS_SALT_FORCEFAST") != NULL, off = getenv("PSS_SALT_NOFARFAST") != NULL;
+                for (side_ = 0; side_ < 2; side_++) {
+                    int nd_ = side_ ? here->SWnegNode : here->SWposNode, fr_[2];
+                    double a_[2], b_[2], c_[2], *C_ = side_ ? &Cneg : &Cpos, *Cq_ = side_ ? &Cq_neg : &Cq_pos;
+                    if (*C_ <= 0.0 || nd_ <= 0) continue;
+                    if (forceall || (!off && !pss_salt_has_snubber(ckt, nd_) && pss_salt_diode_far(ckt, nd_, fr_, a_, b_, c_, 2) > 0)) {
+                        *Cq_ = *C_; *C_ = 0.0; force_fast = 1;
+                    }
+                }
+            }
             {   /* card #575: device-model charge only (no native capacitor) at a power node: try the inductor-routed jump first; the
                  * charge value is kept for the charge-jump fallback when no inductor is there */
                 PSSsaltModelCapHookFn hk = PSSsaltModelCapHook;
@@ -3284,6 +3302,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                                     if ((di_->DIOposNode == nd || di_->DIOnegNode == nd) && (dm_->DIOjunctionCap > 0.0 || dm_->DIOtransitTime > 0.0))
                                         cont_too = 1;
                     }
+                    if (force_fast) cont_too = 1;
                     if ((fast || cont_too) && slot >= 0) {
                         PSSsaltCont *c = &g_salt_cont[slot];
                         c->active = 1; c->node = nd; c->nrow = 1 + nfar; c->row[0] = side ? negRow : posRow;
