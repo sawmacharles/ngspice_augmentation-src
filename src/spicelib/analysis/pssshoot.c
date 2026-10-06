@@ -2230,6 +2230,17 @@ pss_solve_dense(double *A, double *b, int n, double *x)
  * confirmed by regression). */
 
 #define PSS_SALT_SETTLE_TAUS 30.0   /* generous safety margin -- see report */
+/* card #568: the window also ends after this many accepted steps (PSS_SALT_MAXSTEPS=n; -1 = time only, the rule up to s115).
+ * The time rule alone is 30 x C/G with G from resistors and switches only (pss_salt_local_cond): when the conductance that
+ * really discharges the node is another device's (a freewheel diode, chargeless or not on this path), tau is far too long
+ * and the override runs for many steps.  Order 1 on this recursion while the trajectory was integrated at order 2 drops the
+ * derivative history of the slow states, so every forced step costs accuracy: pac_r6od with cj = tt = 0 (10 ohm snubber,
+ * 1 nF, diode at the switch node) had 10..92 forced steps per event and was 5.3 dB off the perturbed PSS at 20/50/100 kHz
+ * with no message.  Forced steps after the event step -> error on that deck: 0 -> 9 dB (the window is needed), 1 -> 0.014, 2 -> 0.021,
+ * 3 -> 0.032, 4 -> 0.052, 6 -> 0.18, 10 -> 1.3 dB.  One backward-Euler step already crushes a spike on a node that is
+ * stiff against the step (1/(1 + h/tau)); a node that is not stiff does not ring under order 2.  R6o / R6ob / R6om
+ * (14..71 forced steps before, node stiff throughout) move by <= 0.0013 dB. */
+#define PSS_SALT_SETTLE_MAXSTEPS 2
 
 int PSSsaltActive = 1;   /* PSS_SALTATION=0 env var disables (red-proof toggle) */
 
@@ -2237,6 +2248,8 @@ static int g_salt_first_step_pending = 0;   /* card #494 third pass: restart fil
 static double g_salt_prev_time = -1.0;      /* card #494 fifth pass: h_dot's true-elapsed-time tracker */
 static int g_salt_qsteps_left = 0;          /* card #559: order-1 steps still to force after a model-charged event */
 static double g_salt_settle_until = -1.0;   /* card #494 fifth pass: force-order-1 window deadline */
+static int g_salt_win_steps = 0;            /* card #568: accepted steps inside the current order-1 window */
+static double g_salt_win_last_t = -1.0;
 static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
 static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_ind_jump() */
 /* card #535: terminal voltage of every sw instance at the PREVIOUS accepted
@@ -2278,7 +2291,14 @@ int
 PSSsaltForceOrder1(CKTcircuit *ckt)
 {
     if (g_salt_qsteps_left > 0) { g_salt_qsteps_left--; return 1; }   /* card #559 */
-    return (g_salt_settle_until > 0.0 && ckt->CKTtime < g_salt_settle_until);
+    if (g_salt_settle_until > 0.0 && ckt->CKTtime < g_salt_settle_until) {
+        static int maxsteps = -2;
+        if (maxsteps == -2) { const char *e_ = getenv("PSS_SALT_MAXSTEPS"); maxsteps = e_ ? atoi(e_) : PSS_SALT_SETTLE_MAXSTEPS; }
+        if (maxsteps >= 0 && g_salt_win_steps >= maxsteps && ckt->CKTtime != g_salt_win_last_t) return 0;
+        if (ckt->CKTtime != g_salt_win_last_t) { g_salt_win_steps++; g_salt_win_last_t = ckt->CKTtime; }
+        return 1;
+    }
+    return 0;
 }
 
 static int
@@ -2965,9 +2985,14 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
         g_salt_events_seen += n;   /* card #494 sixth pass: see PSSsaltEventsSeen() */
     if (n > 0 && tau_max > 0.0) {
         double deadline;
-        deadline = ckt->CKTtime + PSS_SALT_SETTLE_TAUS * tau_max;
+        static double taus = -1.0;
+        if (taus < 0.0) { const char *e_ = getenv("PSS_SALT_TAUS"); taus = e_ ? atof(e_) : PSS_SALT_SETTLE_TAUS; }
+        if (getenv("PSS_SALT_TRACE") && g_salt_win_steps > 0)
+            fprintf(stderr, "SALT-WIN previous window: %d forced order-1 steps\n", g_salt_win_steps);
+        deadline = ckt->CKTtime + taus * tau_max;
         if (deadline > g_salt_settle_until)
             g_salt_settle_until = deadline;
+        g_salt_win_steps = 0; g_salt_win_last_t = ckt->CKTtime;
     }
     if (n > 0 && getenv("PSS_SALT_TRACE"))
         fprintf(stderr, "SALT-TRACE t=%.9g dt_actual=%.6g (CKTdelta=%.4g) n_events=%d ev0=%s dG=%.6g "
