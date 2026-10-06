@@ -2273,6 +2273,7 @@ typedef struct {
 } PSSsaltCont;
 static PSSsaltCont g_salt_cont[PSS_SALT_CONT_MAX];
 static double g_salt_ind_k = 0.0, g_salt_ind_dv = 0.0;
+int PSSsaltNoRoutedWindow = 0;   /* card #583: set by pacshoot.c while its generic recursion forms T from the smooth part for routed jumps */
 static int g_salt_use_vbefore = 0;   /* card #582: set by the caller when another switch at the node flips in the same step */   /* sign / L and dV of the last pss_salt_ind_jump() that returned 1 */
 static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
 static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_ind_jump() */
@@ -3043,7 +3044,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                     n++; any = 1;
                     c->i_emit[k_] = i0_[k_];
                 }
-                if (any && 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS > tau_max) tau_max = 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS;
+                if (any && !PSSsaltNoRoutedWindow && 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS > tau_max) tau_max = 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS;
                 if (any && getenv("PSS_SALT_TRACE"))
                     fprintf(stderr, "SALT-CONT t=%.9g %s node %d step %d dv=%.6g%s%s\n", ckt->CKTtime, c->name ? c->name : "sw", c->node, c->steps, dv,
                             final ? " final" : "", flips ? " (hand-over)" : "");
@@ -3376,8 +3377,10 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             /* card #510: same settle-window estimate, inductor-routed case
              * (tau_ind_pos/neg, filled by pss_salt_ind_jump() above -- 0
              * when that path did not apply). */
-            if (tau_ind_pos > tau_max) tau_max = tau_ind_pos;
-            if (tau_ind_neg > tau_max) tau_max = tau_ind_neg;
+            if (!PSSsaltNoRoutedWindow) {
+                if (tau_ind_pos > tau_max) tau_max = tau_ind_pos;
+                if (tau_ind_neg > tau_max) tau_max = tau_ind_neg;
+            }
 
             n++;
             {   /* card #575: the snubber-capacitor jumps of this event (chargeless routed node) */
@@ -3609,6 +3612,7 @@ PSSsensRecordStep(CKTcircuit *ckt)
          * for every column j below (see PSSsaltFindEvents()'s header
          * comment in this file for the derivation). */
         PSSsaltEvent salt_ev[PSS_SALT_MAX_EVENTS];
+        PSSsaltNoRoutedWindow = 0;   /* card #583: this (native) recursion needs the window */
         int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
 
         /* card #510: PSSsaltFindEvents() already printed why; a REFUSE

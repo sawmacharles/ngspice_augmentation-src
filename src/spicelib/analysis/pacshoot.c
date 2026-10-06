@@ -2123,6 +2123,15 @@ pac_salt_qjump_finish(int neq, int M, PACc *dq, PACc *dy)
     tfree(dq); tfree(dy);
 }
 
+/* card #583: PAC_SALT_SMOOTHT=0 restores jumps-before-T with the order-1 window (red proof / comparison) */
+static int
+pac_smooth_t(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("PAC_SALT_SMOOTHT"); v = e ? atoi(e) : 1; }
+    return v;
+}
+
 /* One accepted step of the generic recursion for all M columns. */
 static int
 pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, double t_new,
@@ -2130,6 +2139,8 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
 {
     int neq = g_pac_neq, M = g_pac_M, m, row, qjump = 0;
     PACc *dq = NULL, *dy = NULL;
+    PACc *dy2 = NULL;
+    int smooth_t = pac_smooth_t();
     double a1 = (order == 2) ? ag1 : 0.0;
 
 #ifdef XSPICE
@@ -2282,9 +2293,19 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
             }
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 const PSSsaltEvent *e = &salt_ev[i_salt];
-                if (e->posRow > 0 && !e->posQ)
+                /* card #583: a routed jump (inductor branch row, a capacitor fed through a snubber or a diode, a continuation) is
+                 * added AFTER T has been formed from the smooth part, like the charge jump of #559: T then carries no dy / h spike
+                 * and no order-1 step is needed after it.  A native capacitor jump at the switch's own node keeps the old order. */
+                int rt_pos = smooth_t && e->posRow > 0 && !e->posQ && (e->dG == 0.0 || e->posRow != e->posNode);
+                int rt_neg = smooth_t && e->negRow > 0 && !e->negQ && (e->dG == 0.0 || e->negRow != e->negNode);
+                if (rt_pos || rt_neg) {
+                    if (!dy2) { dy2 = TMALLOC(PACc, (size_t) (neq + 1) * M); if (!dy2) return 1; memset(dy2, 0, (size_t) (neq + 1) * M * sizeof(PACc)); }
+                }
+                if (rt_pos) dy2[(size_t) e->posRow * M + m] = pc_add(dy2[(size_t) e->posRow * M + m], djump[i_salt][0]);
+                else if (e->posRow > 0 && !e->posQ)
                     pac_set(g_pac_Cnew, e->posRow, M, m, pc_add(pac_get(g_pac_Cnew, e->posRow, M, m), djump[i_salt][0]));
-                if (e->negRow > 0 && !e->negQ)
+                if (rt_neg) dy2[(size_t) e->negRow * M + m] = pc_add(dy2[(size_t) e->negRow * M + m], djump[i_salt][1]);
+                else if (e->negRow > 0 && !e->negQ)
                     pac_set(g_pac_Cnew, e->negRow, M, m, pc_add(pac_get(g_pac_Cnew, e->negRow, M, m), djump[i_salt][1]));
             }
         }
@@ -2301,6 +2322,17 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
             g_pac_Tnew[ix] = Tn;
         }
     if (qjump > 0) pac_salt_qjump_finish(neq, M, dq, dy);   /* card #559: after T (see there) */
+    if (dy2) {   /* card #583 */
+        PACc *dq2 = TMALLOC(PACc, (size_t) (neq + 1) * M);
+        size_t i2, sz2 = (size_t) (neq + 1) * M;
+        if (!dq2) { tfree(dy2); return 1; }
+        pac_C_mul(&g_pac_C, dy2, dq2, neq, M);
+        for (i2 = 0; i2 < sz2; i2++) {
+            g_pac_Qnew[i2].re += dq2[i2].re; g_pac_Qnew[i2].im += dq2[i2].im;
+            g_pac_Cnew[i2].re += dy2[i2].re; g_pac_Cnew[i2].im += dy2[i2].im;
+        }
+        tfree(dq2); tfree(dy2);
+    }
     { PACc *tmp = g_pac_Qprev; g_pac_Qprev = g_pac_Qnew; g_pac_Qnew = tmp; }
     return 0;
 }
@@ -2594,6 +2626,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
      * PSSsaltFindEvents()/PSSsensRecordStep() for the shared derivation
      * (real there, complex here: same formula, coeff is now a PACc). */
     PSSsaltEvent salt_ev[PSS_SALT_MAX_EVENTS];
+    PSSsaltNoRoutedWindow = (g_pac_gen && pac_smooth_t()) ? 1 : 0;   /* card #583, before the events of this step are formed */
     int n_salt = PSSsaltFindEvents(ckt, salt_ev, PSS_SALT_MAX_EVENTS);
     int i_salt;
 
@@ -3160,6 +3193,15 @@ pac_switch_node_without_cap(CKTcircuit *ckt)
                             if (vi->VSRCposNode == nd || vi->VSRCnegNode == nd) held = 1;
                 }
                 if (!held) return 1;
+                {   /* card #583: a diode at the switch node: the node may be treated as a fast node (boost-type, #580), whose routed
+                     * jumps are added after T in the generic recursion only */
+                    int dt = CKTtypelook("Diode");
+                    DIOmodel *dm; DIOinstance *di;
+                    if (dt >= 0)
+                        for (dm = (DIOmodel *) ckt->CKThead[dt]; dm; dm = DIOnextModel(dm))
+                            for (di = DIOinstances(dm); di; di = DIOnextInstance(di))
+                                if (di->DIOposNode == nd || di->DIOnegNode == nd) return 1;
+                }
             }
     return 0;
 }

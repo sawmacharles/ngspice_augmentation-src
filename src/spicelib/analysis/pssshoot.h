@@ -194,6 +194,7 @@ extern double (*PSSsaltModelCapHook)(CKTcircuit *ckt, int node);
 extern double (*PSSsaltModelCapMinHook)(CKTcircuit *ckt, int node);
 
 int PSSsaltContActive(void);   /* card #579 */
+extern int PSSsaltNoRoutedWindow;   /* card #583 */
 #define PSS_SALT_MAX_EVENTS 8
 
 extern int PSSsaltActive;   /* env-var gated (PSS_SALTATION, default on); see pssshoot.c */
