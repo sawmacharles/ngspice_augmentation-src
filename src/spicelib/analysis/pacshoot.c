@@ -157,6 +157,7 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 #include "ind/inddefs.h"
 #include "vsrc/vsrcdefs.h"
 #include "sw/swdefs.h"   /* card #559: switch power nodes with device-model charge */
+#include "dio/diodefs.h"   /* card #581: diode commutation note */
 #include "isrc/isrcdefs.h"
 #ifdef XSPICE
 #include "ngspice/miftypes.h"
@@ -2348,6 +2349,41 @@ static int g_pac_xls_n = 0, g_pac_xls_have = 0;
 static int g_imp_on = 0, g_imp_pc = 0, g_imp_nc = 0, g_imp_nx = 0, g_imp_x[4 * PSS_SALT_MAX_EVENTS];
 static double g_imp_hdot = 0.0;
 
+/* card #581: discontinuous conduction.  When an inductor's current runs out, the diode that carried it stops conducting somewhere
+ * inside an accepted step; no switch flips, the step control does not see it, and the orbit and the small-signal result are first
+ * order in the step.  Measured on a DCM buck (pac_r6od, chargeless diode, 60 ohm load) against tools/pac_perturbed.py: 0.40 dB / 0.40 deg
+ * at 200 points per period, 0.06 dB at 2000, 0.03 dB at 20000, whatever reltol.  Detected as an inductor whose current stays below
+ * 1e-3 of its largest value for more than 1 % of the period; said once, with the remedy.  PAC_NO_DCM_NOTE=1 silences it. */
+#define PAC_DCM_NIND 64
+static double g_dcm_imax[PAC_DCM_NIND], g_dcm_tzero[PAC_DCM_NIND], g_dcm_tprev = -1.0;
+static int g_dcm_said = 0;
+
+static void
+pac_dcm_note(CKTcircuit *ckt, int n_salt)
+{
+    int it = CKTtypelook("Inductor"), k = 0;
+    INDmodel *im; INDinstance *ii;
+    double h = (g_dcm_tprev >= 0.0 && ckt->CKTtime > g_dcm_tprev) ? ckt->CKTtime - g_dcm_tprev : 0.0;
+    (void) n_salt;
+    if (ckt->CKTtime < g_dcm_tprev) memset(g_dcm_tzero, 0, sizeof g_dcm_tzero);   /* a new period run */
+    g_dcm_tprev = ckt->CKTtime;
+    if (it < 0 || g_dcm_said || g_pac_T <= 0.0) return;
+    for (im = (INDmodel *) ckt->CKThead[it]; im; im = INDnextModel(im))
+        for (ii = INDinstances(im); ii && k < PAC_DCM_NIND; ii = INDnextInstance(ii), k++) {
+            double a = fabs(ckt->CKTrhsOld[ii->INDbrEq]);
+            if (a > g_dcm_imax[k]) g_dcm_imax[k] = a;
+            if (g_dcm_imax[k] > 1e-9 && a < 1e-3 * g_dcm_imax[k]) g_dcm_tzero[k] += h;
+            if (g_dcm_tzero[k] > 0.01 * g_pac_T && !getenv("PAC_NO_DCM_NOTE")) {
+                fprintf(stderr, "PAC-TD: note -- the current of inductor %s is zero for part of the period (discontinuous conduction): the "
+                        "instant its diode stops conducting is not located by the step control, so the result is first order in the "
+                        "step. On a DCM buck: 0.40 dB off at 200 points per period, 0.06 dB at 2000, 0.03 dB at 20000 (card #581). "
+                        "Raise the points of the .pss/.pac line.\n", ii->INDname);
+                g_dcm_said = 1;
+                return;
+            }
+        }
+}
+
 static void
 pac_imp_note(const PSSsaltEvent *ev, int n_ev)
 {
@@ -2561,6 +2597,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
         return;
     }
     pac_imp_note(salt_ev, n_salt);   /* card #579 */
+    pac_dcm_note(ckt, n_salt);       /* card #581 */
 
     /* card #494 fifth pass (task 2): same L-stable-settle-window override
      * as PSSsensRecordStep() (pssshoot.c) -- see PSSsaltForceOrder1()'s
