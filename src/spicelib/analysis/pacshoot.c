@@ -3175,6 +3175,12 @@ pac_switch_node_without_cap(CKTcircuit *ckt)
     int st = CKTtypelook("Switch"), ct = CKTtypelook("Capacitor"), vt = CKTtypelook("Vsource"), k;
     SWmodel *sm; SWinstance *si;
     if (st < 0) return 0;
+    /* card #585: every circuit with an ideal switch.  The legacy per-C/L recursion is 12.4 dB / 94 deg off on a half bridge whose
+     * switch node has neither capacitor nor diode (same events and orbit as the deck with a chargeless diode there, which is right; not
+     * a stale matrix: reloading and refactoring before the legacy solve changes nothing; cause not found), and nothing ties that
+     * defect to the node being capacitor-less.  The generic recursion agrees with it to 1e-6 where the legacy one is validated and is
+     * right where it is not.  PAC_LEGACY_SW=1 keeps the narrower rule of cards #582 / #583 below (comparison). */
+    if (!getenv("PAC_LEGACY_SW") && ckt->CKThead[st]) return 1;
     for (sm = (SWmodel *) ckt->CKThead[st]; sm; sm = SWnextModel(sm))
         for (si = SWinstances(sm); si; si = SWnextInstance(si))
             for (k = 0; k < 2; k++) {
