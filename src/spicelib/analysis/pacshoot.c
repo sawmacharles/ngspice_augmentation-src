@@ -2396,6 +2396,14 @@ pac_imp_note(const PSSsaltEvent *ev, int n_ev)
         if (ev[i].dG == 0.0 || (ev[i].posRow > 0 && ev[i].posRow != ev[i].posNode) || (ev[i].negRow > 0 && ev[i].negRow != ev[i].negNode)) routed = 1;
     if (!routed) return;
     for (i = 0; i < n_ev; i++) {
+        /* the same event function with the control terminals swapped (the two switches of a half bridge) is the same coefficient */
+        if (i > 0 && ev[i].posCntrl == g_imp_nc && ev[i].negCntrl == g_imp_pc && ev[i].h_dot == -g_imp_hdot) {
+            if (ev[i].dG != 0.0) {
+                if (ev[i].posRow > 0 && ev[i].posRow == ev[i].posNode && !ev[i].posF) g_imp_x[g_imp_nx++] = ev[i].posRow;
+                if (ev[i].negRow > 0 && ev[i].negRow == ev[i].negNode && !ev[i].negF) g_imp_x[g_imp_nx++] = ev[i].negRow;
+            }
+            continue;
+        }
         if (i > 0 && (ev[i].posCntrl != g_imp_pc || ev[i].negCntrl != g_imp_nc || ev[i].h_dot != g_imp_hdot)) {
             static int warned = 0;
             if (!warned) {
@@ -3127,6 +3135,35 @@ pac_sweep_fill(int stepType, int np, double fstart, double fstop, double *freqs,
  * is used.  PAC_FORCE_GENERIC=1 forces it on native circuits (cross-check), PAC_NATIVE_HISTORY=1
  * forces the legacy history on any circuit (red proof: it reproduces the card #539 bug).
  * Returns 0 (ok, map->generic set or not), or an SPICE error code to return (REFUSED). */
+/* card #582: is there an ideal switch with a power node that has neither a native capacitor nor a voltage source on it? */
+static int
+pac_switch_node_without_cap(CKTcircuit *ckt)
+{
+    int st = CKTtypelook("Switch"), ct = CKTtypelook("Capacitor"), vt = CKTtypelook("Vsource"), k;
+    SWmodel *sm; SWinstance *si;
+    if (st < 0) return 0;
+    for (sm = (SWmodel *) ckt->CKThead[st]; sm; sm = SWnextModel(sm))
+        for (si = SWinstances(sm); si; si = SWnextInstance(si))
+            for (k = 0; k < 2; k++) {
+                int nd = k ? si->SWnegNode : si->SWposNode, held = 0;
+                if (nd <= 0) continue;
+                if (ct >= 0) {
+                    CAPmodel *cm; CAPinstance *ci;
+                    for (cm = (CAPmodel *) ckt->CKThead[ct]; cm && !held; cm = CAPnextModel(cm))
+                        for (ci = CAPinstances(cm); ci && !held; ci = CAPnextInstance(ci))
+                            if (ci->CAPposNode == nd || ci->CAPnegNode == nd) held = 1;
+                }
+                if (vt >= 0 && !held) {
+                    VSRCmodel *vm; VSRCinstance *vi;
+                    for (vm = (VSRCmodel *) ckt->CKThead[vt]; vm && !held; vm = VSRCnextModel(vm))
+                        for (vi = VSRCinstances(vm); vi && !held; vi = VSRCnextInstance(vi))
+                            if (vi->VSRCposNode == nd || vi->VSRCnegNode == nd) held = 1;
+                }
+                if (!held) return 1;
+            }
+    return 0;
+}
+
 static int
 pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
 {
@@ -3407,6 +3444,12 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     }
     /* card #549: method=gear is carried by the generic (charge-history) recursion only, so it is taken for native decks too */
     force_gen = getenv("PAC_FORCE_GENERIC") != NULL || ckt->CKTintegrateMethod == GEAR;
+    if (!force_gen && !getenv("PAC_NO582_GENERIC") && pac_switch_node_without_cap(ckt)) {
+        /* card #582: an ideal switch at a node with no capacitor (and no voltage source): the legacy per-C/L recursion was 12 dB / 94 deg
+         * off on a half bridge without dead time, node capacitor or diode (same events, same orbit; cause not found), the generic
+         * recursion is right there and equal or better on every chargeless matrix deck: use it for such circuits */
+        force_gen = 1;
+    }
 #ifdef XSPICE
     if (g_hid_nc > 0 || g_hid_nhy > 0) force_gen = 1;   /* card #557 */
 #endif

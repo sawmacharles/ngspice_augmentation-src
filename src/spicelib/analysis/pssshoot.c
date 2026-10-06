@@ -2272,7 +2272,8 @@ typedef struct {
     const char *name;
 } PSSsaltCont;
 static PSSsaltCont g_salt_cont[PSS_SALT_CONT_MAX];
-static double g_salt_ind_k = 0.0, g_salt_ind_dv = 0.0;   /* sign / L and dV of the last pss_salt_ind_jump() that returned 1 */
+static double g_salt_ind_k = 0.0, g_salt_ind_dv = 0.0;
+static int g_salt_use_vbefore = 0;   /* card #582: set by the caller when another switch at the node flips in the same step */   /* sign / L and dV of the last pss_salt_ind_jump() that returned 1 */
 static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
 static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_ind_jump() */
 /* card #535: terminal voltage of every sw instance at the PREVIOUS accepted
@@ -2795,7 +2796,7 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
                 for (di = DIOinstances(dm); di; di = DIOnextInstance(di))
                     if (di->DIOposNode == node && di->DIOposPrimeNode != di->DIOposNode) dio_rs = 1;
         if (getenv("PSS_SALT_NO579")) handover = dio_rs = 0;   /* red proof: the s118 choice */
-        if (other || handover || dio_rs || getenv("PSS_SALT_VBEFORE"))
+        if (other || handover || dio_rs || g_salt_use_vbefore || getenv("PSS_SALT_VBEFORE"))
             V_prev = v_before;
     }
 
@@ -3074,6 +3075,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             double extra_dfdt[PSS_SALT_MAX_EVENTS];
             double Cq_pos = 0.0, Cq_neg = 0.0;
             int force_fast = 0;
+            int skip_pos = 0, skip_neg = 0, coflip_pos = 0, coflip_neg = 0;
             double k_pos = 0.0, k_neg = 0.0, dv_pos = 0.0, dv_neg = 0.0;
 
             sw_idx++;
@@ -3174,12 +3176,38 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
              * purely algebraic/resistive one, see the derivation comment
              * above pss_salt_ind_jump(). A REFUSE (-1) from
              * pss_salt_ind_jump() aborts the whole call immediately. */
+            {   /* card #582: two switches at one node flipping in the same step (a half bridge without dead time) are ONE event at
+                 * that node.  Each switch's own routed jump took the other one's conductance as already flipped and the pre-event
+                 * node equation as if only this switch had moved: 42 dB off on a closed-loop synchronous buck without node
+                 * capacitor, no message.  The first flipping switch (list order) gives the node's jump with the pre-flip node
+                 * voltage; the others give none there.  PSS_SALT_NO582=1 restores the per-switch jumps (red proof). */
+                int side_;
+                skip_pos = skip_neg = 0; coflip_pos = coflip_neg = 0;
+                if (!getenv("PSS_SALT_NO582"))
+                    for (side_ = 0; side_ < 2; side_++) {
+                        int nd_ = side_ ? here->SWnegNode : here->SWposNode, seen_me = 0, earlier = 0, others = 0;
+                        SWmodel *m2_; SWinstance *h2_;
+                        if (nd_ <= 0) continue;
+                        for (m2_ = (SWmodel *) ckt->CKThead[swtype]; m2_; m2_ = SWnextModel(m2_))
+                            for (h2_ = SWinstances(m2_); h2_; h2_ = SWnextInstance(h2_)) {
+                                if (h2_ == here) { seen_me = 1; continue; }
+                                if (h2_->SWposNode != nd_ && h2_->SWnegNode != nd_) continue;
+                                if (pss_salt_is_on(ckt->CKTstate0[h2_->SWswitchstate]) == pss_salt_is_on(ckt->CKTstate1[h2_->SWswitchstate])) continue;
+                                others++;
+                                if (!seen_me) earlier++;
+                            }
+                        if (others > 0) { if (side_) { coflip_neg = 1; skip_neg = earlier > 0; } else { coflip_pos = 1; skip_pos = earlier > 0; } }
+                    }
+            }
             if (Cpos > 0.0) {
                 posRow = here->SWposNode;
                 dfdt_pos = -dI / Cpos;
+            } else if (skip_pos) {
+                posRow = 0; dfdt_pos = 0.0;
             } else {
                 posRow = 0;
                 dfdt_pos = 0.0;
+                g_salt_use_vbefore = coflip_pos;
                 indrc = pss_salt_ind_jump(ckt, here, here->SWposNode, here->SWnegNode,
                                            g_prev, dt_actual, &posRow, &dfdt_pos, &tau_ind_pos, &why,
                                            (sw_idx >= 0 && sw_idx < g_salt_vsw_n) ? g_salt_vnd_prev[2 * sw_idx] : ckt->CKTrhsOld[here->SWposNode]);
@@ -3195,12 +3223,16 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 }
             }
 
+            g_salt_use_vbefore = 0;
             if (Cneg > 0.0) {
                 negRow = here->SWnegNode;
                 dfdt_neg = dI / Cneg;
+            } else if (skip_neg) {
+                negRow = 0; dfdt_neg = 0.0;
             } else {
                 negRow = 0;
                 dfdt_neg = 0.0;
+                g_salt_use_vbefore = coflip_neg;
                 indrc = pss_salt_ind_jump(ckt, here, here->SWnegNode, here->SWposNode,
                                            g_prev, dt_actual, &negRow, &dfdt_neg, &tau_ind_neg, &why,
                                            (sw_idx >= 0 && sw_idx < g_salt_vsw_n) ? g_salt_vnd_prev[2 * sw_idx + 1] : ckt->CKTrhsOld[here->SWnegNode]);
@@ -3235,11 +3267,13 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 /* card #575: model charge, no native capacitor, one inductor at the node: the routed jump with its continuation
                  * (PSSsaltCont), not a charge jump.  PAC_SALT_QONLY=1 keeps the charge jump (unvalidated, for comparison). */
                 int qonly = getenv("PAC_SALT_QONLY") != NULL;
-                if (here->SWposNode > 0 && PSSsaltModelCapHook(ckt, here->SWposNode) > 0.0) {
+                if (skip_pos) { ev[n].posF = 1; /* card #582: the node's event is the co-flipping switch's; the guard must not ask this one for it */ }
+                else if (here->SWposNode > 0 && PSSsaltModelCapHook(ckt, here->SWposNode) > 0.0) {
                     if (routed_pos && !qonly) ev[n].posF = 1;
                     else { ev[n].posQ = 1; ev[n].posRow = here->SWposNode; ev[n].dqdt_pos = -dI; }
                 }
-                if (here->SWnegNode > 0 && PSSsaltModelCapHook(ckt, here->SWnegNode) > 0.0) {
+                if (skip_neg) { ev[n].negF = 1; }
+                else if (here->SWnegNode > 0 && PSSsaltModelCapHook(ckt, here->SWnegNode) > 0.0) {
                     if (routed_neg && !qonly) ev[n].negF = 1;
                     else { ev[n].negQ = 1; ev[n].negRow = here->SWnegNode; ev[n].dqdt_neg = dI; }
                 }
@@ -3379,6 +3413,13 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
         if (deadline > g_salt_settle_until)
             g_salt_settle_until = deadline;
         g_salt_win_steps = 0; g_salt_win_last_t = ckt->CKTtime;
+    }
+    if (n > 1 && getenv("PSS_SALT_TRACE")) {
+        int it_;
+        for (it_ = 1; it_ < n; it_++)
+            fprintf(stderr, "SALT-EV%d %s dG=%.4g posRow=%d negRow=%d dfdt_pos=%.6g dfdt_neg=%.6g posQ=%d negQ=%d posF=%d negF=%d h_dot=%.6g cntrl=%d/%d\n", it_,
+                    ev[it_].name ? ev[it_].name : "?", ev[it_].dG, ev[it_].posRow, ev[it_].negRow, ev[it_].dfdt_pos, ev[it_].dfdt_neg,
+                    ev[it_].posQ, ev[it_].negQ, ev[it_].posF, ev[it_].negF, ev[it_].h_dot, ev[it_].posCntrl, ev[it_].negCntrl);
     }
     if (n > 0 && getenv("PSS_SALT_TRACE"))
         fprintf(stderr, "SALT-TRACE t=%.9g dt_actual=%.6g (CKTdelta=%.4g) n_events=%d ev0=%s dG=%.6g "
