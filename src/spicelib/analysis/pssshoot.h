@@ -193,6 +193,7 @@ extern double (*PSSsaltModelCapHook)(CKTcircuit *ckt, int node);
 /* card #575: the smallest device-model part of that node's diagonal charge on the orbit (the reverse-biased junction, typically) */
 extern double (*PSSsaltModelCapMinHook)(CKTcircuit *ckt, int node);
 
+int PSSsaltContActive(void);   /* card #579 */
 #define PSS_SALT_MAX_EVENTS 8
 
 extern int PSSsaltActive;   /* env-var gated (PSS_SALTATION, default on); see pssshoot.c */

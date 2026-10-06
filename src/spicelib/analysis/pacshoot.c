@@ -657,6 +657,7 @@ static int g_pac_force_exact_jac = 0;
 static PACc *g_pac_first_y = NULL;
 static double g_pac_first_t = 0.0;
 static int g_pac_have_first = 0;
+static int g_pac_xls_have;   /* card #579, defined with pac_imp_roll() */
 
 /* ------------------------------------------------------------------ */
 /* card #504: TRAJECTORY RECORDER for the true-adjoint `.pxf ... adjoint=1`
@@ -932,6 +933,7 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
         memset(g_pac_demod, 0, (size_t) neq * M * sizeof(PACc));
         memset(g_pac_first_y, 0, (size_t) (neq + 1) * M * sizeof(PACc));
     }
+    g_pac_xls_have = 0;
     g_pac_have_first = 0;
     g_pac_first_t = 0.0;
     for (m = 0; m < M; m++) {
@@ -2334,6 +2336,84 @@ pac_traj_attach_generic(void)
     g_pac_traj_bytes += bytes;
 }
 
+/* card #579: the impulse an event leaves in an ALGEBRAIC output.  A quantity that is discontinuous at the event (the output of a boost
+ * through its capacitor's ESR: i_D jumps by I_L; a switch current; the switch node itself when it has no capacitor) changes, when the
+ * event moves by dt_e, by a pulse of area (y+ - y-) x (-dt_e): an impulse in the perturbation that no state carries and the recursion
+ * never shows.  Its sideband-0 weight is J x coeff x exp(-j w t_e), J = the large-signal change of the row across the event step
+ * (and across each continuation step of a fast node), coeff the event coefficient the state jumps use.  Rows that get a stiff
+ * capacitor-node state jump at the switch itself are left out (the decaying spike of the recursion stands for the same thing there).
+ * Buck outputs are continuous at the event (J ~ 0): unchanged.  PAC_NO_IMPULSE=1 switches it off (red proof). */
+static double *g_pac_xls_prev = NULL;
+static int g_pac_xls_n = 0, g_pac_xls_have = 0;
+static int g_imp_on = 0, g_imp_pc = 0, g_imp_nc = 0, g_imp_nx = 0, g_imp_x[4 * PSS_SALT_MAX_EVENTS];
+static double g_imp_hdot = 0.0;
+
+static void
+pac_imp_note(const PSSsaltEvent *ev, int n_ev)
+{
+    int i, routed = 0;
+    g_imp_on = 0; g_imp_nx = 0;
+    if (n_ev <= 0 || getenv("PAC_NO_IMPULSE")) return;
+    /* only a flip whose node is algebraic or fast (the jump went to an inductor branch row, or this is a continuation) leaves a
+     * discontinuity: with a capacitor at the switch node everything but the switch current is continuous */
+    for (i = 0; i < n_ev; i++)
+        if (ev[i].dG == 0.0 || (ev[i].posRow > 0 && ev[i].posRow != ev[i].posNode) || (ev[i].negRow > 0 && ev[i].negRow != ev[i].negNode)) routed = 1;
+    if (!routed) return;
+    for (i = 0; i < n_ev; i++) {
+        if (i > 0 && (ev[i].posCntrl != g_imp_pc || ev[i].negCntrl != g_imp_nc || ev[i].h_dot != g_imp_hdot)) {
+            static int warned = 0;
+            if (!warned) {
+                fprintf(stderr, "PAC-TD: note -- two different switches flip within one accepted step: the output impulse of that step "
+                        "is not attributed (card #579).\n");
+                warned = 1;
+            }
+            g_imp_on = 0;
+            return;
+        }
+        g_imp_pc = ev[i].posCntrl; g_imp_nc = ev[i].negCntrl; g_imp_hdot = ev[i].h_dot; g_imp_on = 1;
+        /* capacitor-node jump rows at the switch's own power nodes (native capacitor or charge jump): excluded */
+        if (ev[i].dG == 0.0) continue;   /* a continuation or a far-capacitor row of the same flip, not the switch itself */
+        if (ev[i].posRow > 0 && ev[i].posRow == ev[i].posNode && !ev[i].posF) g_imp_x[g_imp_nx++] = ev[i].posRow;
+        if (ev[i].negRow > 0 && ev[i].negRow == ev[i].negNode && !ev[i].negF) g_imp_x[g_imp_nx++] = ev[i].negRow;
+        /* a charge-jump event: the recursion carries the node's own transient from the jumped charge, every row follows it */
+        if (ev[i].posQ || ev[i].negQ) { g_imp_on = 0; return; }
+    }
+}
+
+static void
+pac_imp_apply(CKTcircuit *ckt, int neq, int M, double t_e)
+{
+    int m, row, k;
+    if (!g_imp_on || !g_pac_xls_have || g_pac_xls_n != neq || fabs(g_imp_hdot) < 1e-30) return;
+    for (m = 0; m < M; m++) {
+        PACc Sp = pac_get(g_pac_Cprev, g_imp_pc, M, m);
+        PACc Sn = pac_get(g_pac_Cprev, g_imp_nc, M, m);
+        PACc coeff = pc_mul(pc_scale(pc_sub(Sp, Sn), 1.0 / g_imp_hdot), pc_conjexp(g_pac_omega[m] * t_e));
+        for (row = 1; row <= neq; row++) {
+            double J = ckt->CKTrhsOld[row] - g_pac_xls_prev[row];
+            size_t idx = (size_t) (row - 1) * M + m;
+            int skip = 0;
+            for (k = 0; k < g_imp_nx; k++) if (g_imp_x[k] == row) skip = 1;
+            if (skip || J == 0.0) continue;
+            g_pac_demod[idx] = pc_add(g_pac_demod[idx], pc_scale(coeff, J));
+        }
+    }
+}
+
+static void
+pac_imp_roll(CKTcircuit *ckt, int neq)
+{
+    if (g_pac_xls_n != neq) {
+        g_pac_xls_prev = TREALLOC(double, g_pac_xls_prev, neq + 1);
+        g_pac_xls_n = g_pac_xls_prev ? neq : 0;
+    }
+    /* while a routed jump is being continued the reference stays where the last impulse was given (the steps in between are part
+     * of the same event: their change is given with the next continuation event or its final flush) */
+    if (g_pac_xls_prev && (!g_pac_xls_have || g_imp_on || !PSSsaltContActive())) {
+        memcpy(g_pac_xls_prev, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double)); g_pac_xls_have = 1;
+    }
+}
+
 /* prepass step: accumulate the set of columns of C (state-set discovery) and run the affinity check. */
 static void
 pac_prepass_step(CKTcircuit *ckt)
@@ -2480,6 +2560,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
         g_pac_failed = 1;
         return;
     }
+    pac_imp_note(salt_ev, n_salt);   /* card #579 */
 
     /* card #494 fifth pass (task 2): same L-stable-settle-window override
      * as PSSsensRecordStep() (pssshoot.c) -- see PSSsaltForceOrder1()'s
@@ -2627,6 +2708,10 @@ PSSpacRecordStep(CKTcircuit *ckt)
             g_pac_Tnew[(size_t) d * M + m] = val;
         }
     }
+
+    if (g_pac_demod_active && !is_first_call)
+        pac_imp_apply(ckt, neq, M, t_new);   /* card #579: before Cprev is swapped (the event coefficient reads it) */
+    pac_imp_roll(ckt, neq);
 
     if (g_pac_demod_active) {
         if (is_first_call) {

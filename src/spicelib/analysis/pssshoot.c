@@ -2265,7 +2265,10 @@ typedef struct {
     int active, node, posCntrl, negCntrl, quiet, steps, fast, nrow;
     int row[PSS_SALT_CONT_ROWS];        /* [0] the inductor branch; [1..] capacitor nodes behind a resistor at the node (snubber) */
     double k[PSS_SALT_CONT_ROWS];       /* d(state rate) / d(node voltage): sign / L; G / C_far */
-    double v_last, rmax, h_dot;         /* rmax: largest |dV/dt| of the node since the event */
+    double il_last;                              /* inductor current at the last accepted point */
+    double v_last, v_emit, rmax, imax, h_dot;   /* v_last: node voltage at the last accepted point; v_emit: up to where the jump has been
+                                                 * given; rmax / imax: largest |dV/dt| of the node / far-capacitor rate since the event */
+    double i_last[PSS_SALT_CONT_ROWS], i_emit[PSS_SALT_CONT_ROWS];   /* the same two marks for the diode currents into far capacitors */
     const char *name;
 } PSSsaltCont;
 static PSSsaltCont g_salt_cont[PSS_SALT_CONT_MAX];
@@ -2296,6 +2299,15 @@ PSSsaltReset(void)
     memset(g_salt_cont, 0, sizeof g_salt_cont);   /* card #575 */
     g_salt_events_seen = 0;
     g_salt_ind_warned = 0;   /* card #510 step 1: once per analysis (fresh period/recording run) */
+}
+
+/* card #579: is a routed jump still being continued?  (pacshoot.c keeps its impulse reference point while one is) */
+int
+PSSsaltContActive(void)
+{
+    int i;
+    for (i = 0; i < PSS_SALT_CONT_MAX; i++) if (g_salt_cont[i].active) return 1;
+    return 0;
 }
 
 int
@@ -2551,6 +2563,35 @@ pss_salt_has_snubber(CKTcircuit *ckt, int node)
     return found;
 }
 
+/* card #579: the capacitor nodes a diode at `node` feeds (boost: the output capacitor behind the output diode).  The diode current
+ * into such a node changes by a finite amount at the event, so that capacitor's rate jumps by (i_D now - i_D before) / C_far.  Fills
+ * rows[] / dfdt[] (rate jumps, to be scaled by the event coefficient like every other jump); returns the count. */
+static int
+pss_salt_diode_far(CKTcircuit *ckt, int node, int *rows, double *i_now, double *i_prev, double *cfar, int maxn)
+{
+    int diotype = CKTtypelook("Diode"), n = 0;
+    DIOmodel *dm; DIOinstance *di;
+    PSSsaltModelCapHookFn hk = PSSsaltModelCapHook;
+    if (diotype < 0 || node <= 0 || getenv("PSS_SALT_NODIOFAR")) return 0;
+    PSSsaltModelCapHook = NULL;
+    for (dm = (DIOmodel *) ckt->CKThead[diotype]; dm; dm = DIOnextModel(dm))
+        for (di = DIOinstances(dm); di; di = DIOnextInstance(di)) {
+            int far;
+            double cf, sg;
+            if (di->DIOposNode == node) { far = di->DIOnegNode; sg = 1.0; }          /* anode -> cathode current enters the cathode */
+            else if (di->DIOnegNode == node) { far = di->DIOposNode; sg = -1.0; }
+            else continue;
+            if (far <= 0 || far == node || n >= maxn) continue;
+            cf = pss_salt_local_cap(ckt, far);
+            if (cf <= 0.0) continue;
+            rows[n] = far; cfar[n] = cf;
+            i_now[n] = sg * ckt->CKTstate0[di->DIOcurrent]; i_prev[n] = sg * ckt->CKTstate1[di->DIOcurrent];
+            n++;
+        }
+    PSSsaltModelCapHook = hk;
+    return n;
+}
+
 /* card #575: is a device of a kind the counterfactual node equation of pss_salt_ind_jump() does not model (anything but R, switch,
  * diode, L, C, independent sources) connected to `node`?  Returns its type name, or NULL. */
 static const char *
@@ -2742,7 +2783,19 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
          * accepted point, i.e. just before the flip, instead (the counterfactual 'no flip' voltage up to the slow drift over one
          * step).  PSS_SALT_VBEFORE=1 uses it everywhere (test). */
         const char *other = pss_salt_unmodelled_at(ckt, node);
-        if (other || getenv("PSS_SALT_VBEFORE"))
+        int ic_, handover = 0, dio_rs = 0;
+        /* card #579: (a) a diode whose anode is at the node behind its series resistance (internal node) is not in the equation
+         * above either (boost: the output diode; V_prev came out as -I_L / g_off, the jump 1e5 times too large); (b) a new event
+         * at a node whose previous event is still being continued (dead time of a half bridge): the node is not at the quasi-
+         * static voltage the equation gives, the continuation of the old event ends at the actual voltage. */
+        for (ic_ = 0; ic_ < PSS_SALT_CONT_MAX; ic_++)
+            if (g_salt_cont[ic_].active && g_salt_cont[ic_].node == node) handover = 1;
+        if (diotype >= 0)
+            for (dm = (DIOmodel *) ckt->CKThead[diotype]; dm; dm = DIOnextModel(dm))
+                for (di = DIOinstances(dm); di; di = DIOnextInstance(di))
+                    if (di->DIOposNode == node && di->DIOposPrimeNode != di->DIOposNode) dio_rs = 1;
+        if (getenv("PSS_SALT_NO579")) handover = dio_rs = 0;   /* red proof: the s118 choice */
+        if (other || handover || dio_rs || getenv("PSS_SALT_VBEFORE"))
             V_prev = v_before;
     }
 
@@ -2915,47 +2968,86 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     if (swtype < 0)
         return 0;
 
-    {   /* card #575: continuations of earlier routed jumps (see PSSsaltCont) */
+    {   /* card #575: continuations of earlier routed jumps (see PSSsaltCont).  card #579: what is given is always the difference to
+         * the last GIVEN value (v_emit, i_emit), so the sum telescopes to the settled value whatever steps are skipped; a final
+         * flush when the node is quiet; and a continuation whose node flips again in this step is flushed up to the previous
+         * accepted point and ended before the new event is formed (hand-over, e.g. the dead time of a half bridge). */
         int ic;
         static int cont_off = -1;
+        static double frac = -1.0;
         if (cont_off < 0) cont_off = getenv("PSS_SALT_NOCONT") != NULL;   /* red proof: the single-step routed jump */
+        if (frac < 0.0) { const char *e_ = getenv("PSS_SALT_CONT_FRAC"); frac = e_ ? atof(e_) : 1e-3; }
         for (ic = 0; ic < PSS_SALT_CONT_MAX && n < max; ic++) {
             PSSsaltCont *c = &g_salt_cont[ic];
-            double v, dv;
+            int fr_[PSS_SALT_CONT_ROWS], nf_, k_, flips = 0, emit, final = 0;
+            double i0_[PSS_SALT_CONT_ROWS], i1_[PSS_SALT_CONT_ROWS], cf_[PSS_SALT_CONT_ROWS];
+            double v, v_to, rate = 0.0, irate = 0.0;
             if (!c->active) continue;
             if (cont_off) { c->active = 0; continue; }
-            v = ckt->CKTrhsOld[c->node];
-            dv = v - c->v_last;
-            c->v_last = v;
-            c->steps++;
-            {
-                /* the node is still in its own (fast) transient while it moves at a rate comparable with the fastest seen since the
-                 * event; once it only follows the slow states the recursion carries that motion itself (adding it would count it twice) */
-                static double frac = -1.0;
-                double rate = fabs(dv) / (dt_actual > 0.0 ? dt_actual : 1.0);
-                int ir;
-                if (frac < 0.0) { const char *e_ = getenv("PSS_SALT_CONT_FRAC"); frac = e_ ? atof(e_) : 1e-3; }
-                if (rate > c->rmax) c->rmax = rate;
-                if (rate > frac * c->rmax && fabs(dv) > 1e-9) {
-                    for (ir = 0; ir < c->nrow && n < max; ir++) {
-                        memset(&ev[n], 0, sizeof ev[n]);
-                        ev[n].posNode = ir == 0 ? c->node : c->row[ir]; ev[n].negNode = 0;
-                        ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl;
-                        ev[n].h_dot = c->h_dot;
-                        ev[n].posRow = c->row[ir]; ev[n].negRow = 0;
-                        ev[n].dfdt_pos = c->k[ir] * dv;
-                        ev[n].name = c->name;
-                        ev[n].posF = ir == 0 ? c->fast : 0;
-                        n++;
-                    }
-                    c->quiet = 0;
-                    if (2.0 * dt_actual / PSS_SALT_SETTLE_TAUS > tau_max) tau_max = 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS;
-                    if (getenv("PSS_SALT_TRACE"))
-                        fprintf(stderr, "SALT-CONT t=%.9g %s node %d step %d dv=%.6g rate=%.3g\n", ckt->CKTtime, c->name ? c->name : "sw", c->node, c->steps, dv, rate);
-                } else if (++c->quiet >= 2) {
-                    c->active = 0;
-                }
+            {   /* does a switch at this node flip in this step? */
+                SWmodel *m_; SWinstance *h_;
+                for (m_ = (SWmodel *) ckt->CKThead[swtype]; m_; m_ = SWnextModel(m_))
+                    for (h_ = SWinstances(m_); h_; h_ = SWnextInstance(h_))
+                        if ((h_->SWposNode == c->node || h_->SWnegNode == c->node) &&
+                            pss_salt_is_on(ckt->CKTstate0[h_->SWswitchstate]) != pss_salt_is_on(ckt->CKTstate1[h_->SWswitchstate]))
+                            flips = 1;
             }
+            nf_ = pss_salt_diode_far(ckt, c->node, fr_, i0_, i1_, cf_, PSS_SALT_CONT_ROWS);
+            if (nf_ != c->nrow - 1) nf_ = 0;   /* (cannot change within a run) */
+            if (flips) {
+                v_to = c->v_last;                                  /* the previous accepted point */
+                for (k_ = 0; k_ < nf_; k_++) i0_[k_] = c->i_last[k_];
+                emit = 1; final = 1;
+            } else {
+                v = ckt->CKTrhsOld[c->node];
+                rate = fabs(v - c->v_last) / (dt_actual > 0.0 ? dt_actual : 1.0);
+                if (rate > c->rmax) c->rmax = rate;
+                for (k_ = 0; k_ < nf_; k_++) {
+                    double r_ = fabs(i0_[k_] - c->i_last[k_]) / (dt_actual > 0.0 ? dt_actual : 1.0);
+                    if (r_ > irate) irate = r_;
+                    c->i_last[k_] = i0_[k_];
+                }
+                {   /* the diode current into a far capacitor is still in its own transient (turn-on, reverse recovery) while it moves
+                     * much faster than the inductor current it will end up following (or zero) */
+                    double il = ckt->CKTrhsOld[c->row[0]];
+                    double ilrate = fabs(il - c->il_last) / (dt_actual > 0.0 ? dt_actual : 1.0);
+                    c->il_last = il;
+                    emit = (rate > frac * c->rmax && fabs(v - c->v_last) > 1e-9) || (nf_ > 0 && irate > 10.0 * ilrate && irate > 0.0);
+                }
+                c->v_last = v; v_to = v;
+                c->steps++;
+                if (emit) c->quiet = 0;
+                else if (++c->quiet >= 2) { emit = 1; final = 1; }
+            }
+            if (emit) {
+                double dv = v_to - c->v_emit;
+                int any = 0;
+                if (dv != 0.0 && n < max) {
+                    memset(&ev[n], 0, sizeof ev[n]);
+                    ev[n].posNode = c->node;
+                    ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                    ev[n].posRow = c->row[0]; ev[n].dfdt_pos = c->k[0] * dv;
+                    ev[n].name = c->name; ev[n].posF = 1;
+                    n++; any = 1;
+                    c->v_emit = v_to;
+                }
+                for (k_ = 0; k_ < nf_ && n < max; k_++) {
+                    double di_ = i0_[k_] - c->i_emit[k_];
+                    if (di_ == 0.0) continue;
+                    memset(&ev[n], 0, sizeof ev[n]);
+                    ev[n].posNode = fr_[k_];
+                    ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                    ev[n].posRow = fr_[k_]; ev[n].dfdt_pos = di_ / cf_[k_];
+                    ev[n].name = c->name; ev[n].posF = 1;   /* the diode's own charge at its far node is no obstacle to a jump of the native capacitor there */
+                    n++; any = 1;
+                    c->i_emit[k_] = i0_[k_];
+                }
+                if (any && 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS > tau_max) tau_max = 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS;
+                if (any && getenv("PSS_SALT_TRACE"))
+                    fprintf(stderr, "SALT-CONT t=%.9g %s node %d step %d dv=%.6g%s%s\n", ckt->CKTtime, c->name ? c->name : "sw", c->node, c->steps, dv,
+                            final ? " final" : "", flips ? " (hand-over)" : "");
+            }
+            if (final) c->active = 0;
             if (c->active && c->steps >= PSS_SALT_CONT_STEPS) {
                 fprintf(stderr, "PSS-SALT: REFUSED -- the node of switch %s has not settled %d accepted steps after its event "
                         "(t=%.9g): the routed jump needs the settled node voltage (card #575).\n", c->name ? c->name : "sw", c->steps, ckt->CKTtime);
@@ -3142,10 +3234,12 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 int side;
                 n_extra = 0;
                 for (side = 0; side < 2; side++) {
-                    int nd = side ? here->SWnegNode : here->SWposNode, ic, slot = -1, fast = side ? ev[n].negF : ev[n].posF;
+                    int nd = side ? here->SWnegNode : here->SWposNode, ic, slot = -1, cont_too = 0, fast = side ? ev[n].negF : ev[n].posF;
                     double dv = side ? dv_neg : dv_pos;
                     int rt_ = CKTtypelook("Resistor");
                     RESmodel *rm_; RESinstance *ri_;
+                    int nfar = 0, far_row[PSS_SALT_CONT_ROWS];
+                    double far_i0[PSS_SALT_CONT_ROWS], far_i1[PSS_SALT_CONT_ROWS], far_cf[PSS_SALT_CONT_ROWS];
                     if (!(side ? routed_neg : routed_pos) || (side ? ev[n].negQ : ev[n].posQ)) continue;
                     if (rt_ >= 0 && !getenv("PSS_SALT_NOSNUB"))
                         for (rm_ = (RESmodel *) ckt->CKThead[rt_]; rm_; rm_ = RESnextModel(rm_))
@@ -3172,17 +3266,35 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                                     extra_row[n_extra] = far_; extra_dfdt[n_extra] = ri_->RESconduct / cf_ * dv; n_extra++;
                                 }
                             }
+                    nfar = pss_salt_diode_far(ckt, nd, far_row, far_i0, far_i1, far_cf, PSS_SALT_CONT_ROWS - 1);
+                    for (ic = 0; ic < nfar && n_extra < PSS_SALT_MAX_EVENTS; ic++) {
+                        extra_row[n_extra] = far_row[ic]; extra_dfdt[n_extra] = (far_i0[ic] - far_i1[ic]) / far_cf[ic]; n_extra++;
+                    }
                     for (ic = 0; ic < PSS_SALT_CONT_MAX; ic++) {
                         if (g_salt_cont[ic].active && g_salt_cont[ic].node == nd) g_salt_cont[ic].active = 0;   /* a new event at the node supersedes */
                         if (!g_salt_cont[ic].active && slot < 0) slot = ic;
                     }
-                    if (fast && slot >= 0) {
+                    {   /* card #579: a diode with charge whose junction sits behind its series resistance (anode at the node) leaves
+                         * no charge on the node's own row, but the node is not settled at the event point either */
+                        int dt_ = CKTtypelook("Diode");
+                        DIOmodel *dm_; DIOinstance *di_;
+                        if (dt_ >= 0 && !fast)
+                            for (dm_ = (DIOmodel *) ckt->CKThead[dt_]; dm_; dm_ = DIOnextModel(dm_))
+                                for (di_ = DIOinstances(dm_); di_; di_ = DIOnextInstance(di_))
+                                    if ((di_->DIOposNode == nd || di_->DIOnegNode == nd) && (dm_->DIOjunctionCap > 0.0 || dm_->DIOtransitTime > 0.0))
+                                        cont_too = 1;
+                    }
+                    if ((fast || cont_too) && slot >= 0) {
                         PSSsaltCont *c = &g_salt_cont[slot];
-                        c->active = 1; c->node = nd; c->nrow = 1; c->row[0] = side ? negRow : posRow;
+                        c->active = 1; c->node = nd; c->nrow = 1 + nfar; c->row[0] = side ? negRow : posRow;
                         c->posCntrl = here->SWposCntrlNode; c->negCntrl = here->SWnegCntrlNode;
                         c->quiet = 0; c->steps = 0; c->fast = fast;
-                        c->k[0] = side ? k_neg : k_pos; c->v_last = ckt->CKTrhsOld[nd]; c->h_dot = h_dot; c->name = here->SWname;
+                        c->k[0] = side ? k_neg : k_pos; c->h_dot = h_dot; c->name = here->SWname;
+                        c->v_last = c->v_emit = ckt->CKTrhsOld[nd];
+                        c->il_last = ckt->CKTrhsOld[c->row[0]];
+                        for (ic = 0; ic < nfar; ic++) { c->row[1 + ic] = far_row[ic]; c->i_last[ic] = c->i_emit[ic] = far_i0[ic]; }
                         c->rmax = fabs(dv) / (dt_actual > 0.0 ? dt_actual : 1.0);
+                        c->imax = 0.0;
                     }
                 }
             }
@@ -3225,6 +3337,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                     ev[n].posRow = extra_row[ix];
                     ev[n].dfdt_pos = extra_dfdt[ix];
                     ev[n].name = here->SWname;
+                    ev[n].posF = 1;
                     n++;
                 }
             }
