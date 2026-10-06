@@ -181,11 +181,17 @@ typedef struct {
      * dfdt_pos/neg of such a node stays the rate over the node's total diagonal charge (used for the settle estimate only). */
     int posQ, negQ;
     double dqdt_pos, dqdt_neg;
+    /* card #575: posF/negF = 1 when that power node carries device-model charge and NO native capacitor, and the jump is routed to
+     * the one inductor at the node (posRow/negRow = its branch row): the node is treated as a fast (slaved) variable, see
+     * PSSsaltCont in pssshoot.c.  pac_gen_salt_guard() accepts the model charge at such a node. */
+    int posF, negF;
 } PSSsaltEvent;
 
 /* card #559: set by pacshoot.c while a generic-charge td-PAC pass runs: returns the total diagonal |C| (Farads) of the node when its
  * loaded charge row carries more than the native capacitors/inductors on it (device-model charge), else 0. */
 extern double (*PSSsaltModelCapHook)(CKTcircuit *ckt, int node);
+/* card #575: the smallest device-model part of that node's diagonal charge on the orbit (the reverse-biased junction, typically) */
+extern double (*PSSsaltModelCapMinHook)(CKTcircuit *ckt, int node);
 
 #define PSS_SALT_MAX_EVENTS 8
 

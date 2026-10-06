@@ -2250,6 +2250,26 @@ static int g_salt_qsteps_left = 0;          /* card #559: order-1 steps still to
 static double g_salt_settle_until = -1.0;   /* card #494 fifth pass: force-order-1 window deadline */
 static int g_salt_win_steps = 0;            /* card #568: accepted steps inside the current order-1 window */
 static double g_salt_win_last_t = -1.0;
+/* card #575: continuation of an inductor-routed jump.  The routed jump is (V_after - V_before) / L x dt_e, V_after being the switch
+ * node's voltage once the event is over.  For a node without any charge that is the accepted event point.  A node that carries
+ * device-model charge (diode cj / tt, MOS junction and overlap charge) and no native capacitor is still on its way there: it
+ * relaxes over the next few accepted steps (ps..ns, usually not resolved).  The linearised recursion cannot carry a charge jump
+ * through that unresolved, strongly nonlinear transient (card #559: 0.3 dB and 3 dB off, reltol-dependent); the slow state the
+ * event really changes is the inductor current, by the integral of the time-shifted node voltage, which telescopes to
+ * (V_settled - V_before) / L x dt_e.  So each following step adds (V_j - V_{j-1}) / L as a further routed jump with the same
+ * event function, until the node is quiet for two steps.  A chargeless node is quiet at once: nothing is added. */
+#define PSS_SALT_CONT_MAX 8
+#define PSS_SALT_CONT_STEPS 2000
+#define PSS_SALT_CONT_ROWS 4
+typedef struct {
+    int active, node, posCntrl, negCntrl, quiet, steps, fast, nrow;
+    int row[PSS_SALT_CONT_ROWS];        /* [0] the inductor branch; [1..] capacitor nodes behind a resistor at the node (snubber) */
+    double k[PSS_SALT_CONT_ROWS];       /* d(state rate) / d(node voltage): sign / L; G / C_far */
+    double v_last, rmax, h_dot;         /* rmax: largest |dV/dt| of the node since the event */
+    const char *name;
+} PSSsaltCont;
+static PSSsaltCont g_salt_cont[PSS_SALT_CONT_MAX];
+static double g_salt_ind_k = 0.0, g_salt_ind_dv = 0.0;   /* sign / L and dV of the last pss_salt_ind_jump() that returned 1 */
 static int g_salt_events_seen = 0;          /* card #494 sixth pass: see PSSsaltEventsSeen() */
 static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_ind_jump() */
 /* card #535: terminal voltage of every sw instance at the PREVIOUS accepted
@@ -2262,6 +2282,7 @@ static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_in
  * ron*Csw transient (R6o: 4.8 V instead of 11.5 V at the first event, 7.2 V
  * instead of -0.007 V at the second). */
 static double *g_salt_vsw_prev = NULL, *g_salt_vsw_cur = NULL;
+static double *g_salt_vnd_prev = NULL, *g_salt_vnd_cur = NULL;   /* card #575: [2*i] pos node, [2*i+1] neg node voltage of switch i */
 static int g_salt_vsw_n = 0, g_salt_vsw_have_prev = 0;
 
 void
@@ -2272,6 +2293,7 @@ PSSsaltReset(void)
     g_salt_vsw_have_prev = 0;
     g_salt_settle_until = -1.0;
     g_salt_qsteps_left = 0;
+    memset(g_salt_cont, 0, sizeof g_salt_cont);   /* card #575 */
     g_salt_events_seen = 0;
     g_salt_ind_warned = 0;   /* card #510 step 1: once per analysis (fresh period/recording run) */
 }
@@ -2287,13 +2309,20 @@ PSSsaltEventsSeen(void)
  * call that found a real event? See the derivation comment above (task
  * 2). Called by PSSsensRecordStep()/PSSpacRecordStep() right after their
  * own ag1-based order inference to override it to 1 for the duration. */
+static int
+pss_salt_maxsteps(void)
+{
+    static int maxsteps = -2;
+    if (maxsteps == -2) { const char *e_ = getenv("PSS_SALT_MAXSTEPS"); maxsteps = e_ ? atoi(e_) : PSS_SALT_SETTLE_MAXSTEPS; }
+    return maxsteps;
+}
+
 int
 PSSsaltForceOrder1(CKTcircuit *ckt)
 {
     if (g_salt_qsteps_left > 0) { g_salt_qsteps_left--; return 1; }   /* card #559 */
     if (g_salt_settle_until > 0.0 && ckt->CKTtime < g_salt_settle_until) {
-        static int maxsteps = -2;
-        if (maxsteps == -2) { const char *e_ = getenv("PSS_SALT_MAXSTEPS"); maxsteps = e_ ? atoi(e_) : PSS_SALT_SETTLE_MAXSTEPS; }
+        int maxsteps = pss_salt_maxsteps();
         if (maxsteps >= 0 && g_salt_win_steps >= maxsteps && ckt->CKTtime != g_salt_win_last_t) return 0;
         if (ckt->CKTtime != g_salt_win_last_t) { g_salt_win_steps++; g_salt_win_last_t = ckt->CKTtime; }
         return 1;
@@ -2312,6 +2341,8 @@ pss_salt_is_on(double state)
  * derivation comment above for why this is exactly the right denominator
  * for that node's own (f+-f-) state jump. 0 if node<=0 (ground/unused) or
  * no capacitor is directly there. */
+typedef double (*PSSsaltModelCapHookFn)(CKTcircuit *ckt, int node);
+double (*PSSsaltModelCapMinHook)(CKTcircuit *ckt, int node) = NULL;   /* card #575, see pssshoot.h */
 double (*PSSsaltModelCapHook)(CKTcircuit *ckt, int node) = NULL;   /* card #559, see pssshoot.h */
 
 static double
@@ -2498,6 +2529,51 @@ pss_salt_local_cond(CKTcircuit *ckt, int node)
  * voltage source's own terminal (algebraically fixed by the source
  * regardless of current -- the same "exogenous node" pss_salt_local_
  * cap()'s own comment already argues can never jump). */
+/* card #575: a resistor (not a leak: G >= 1e-6 S) from `node` to a node with a native capacitor -- an RC snubber */
+static int
+pss_salt_has_snubber(CKTcircuit *ckt, int node)
+{
+    int rt = CKTtypelook("Resistor");
+    RESmodel *rm; RESinstance *ri;
+    PSSsaltModelCapHookFn hk = PSSsaltModelCapHook;
+    int found = 0;
+    if (rt < 0 || node <= 0) return 0;
+    PSSsaltModelCapHook = NULL;
+    for (rm = (RESmodel *) ckt->CKThead[rt]; rm && !found; rm = RESnextModel(rm))
+        for (ri = RESinstances(rm); ri && !found; ri = RESnextInstance(ri)) {
+            int far;
+            if (ri->RESposNode != node && ri->RESnegNode != node) continue;
+            far = ri->RESposNode == node ? ri->RESnegNode : ri->RESposNode;
+            if (far <= 0 || far == node || ri->RESconduct < 1e-6) continue;
+            if (pss_salt_local_cap(ckt, far) > 0.0) found = 1;
+        }
+    PSSsaltModelCapHook = hk;
+    return found;
+}
+
+/* card #575: is a device of a kind the counterfactual node equation of pss_salt_ind_jump() does not model (anything but R, switch,
+ * diode, L, C, independent sources) connected to `node`?  Returns its type name, or NULL. */
+static const char *
+pss_salt_unmodelled_at(CKTcircuit *ckt, int node)
+{
+    static const char *known[] = {"Resistor", "Switch", "Diode", "Inductor", "Capacitor", "Vsource", "Isource", "mutual", NULL};
+    int t;
+    for (t = 0; t < DEVmaxnum; t++) {
+        GENmodel *m;
+        GENinstance *g;
+        int k, kn = 0, terms;
+        if (!DEVices[t] || !ckt->CKThead[t] || !DEVices[t]->DEVpublic.name) continue;
+        for (k = 0; known[k]; k++) if (!strcmp(DEVices[t]->DEVpublic.name, known[k])) { kn = 1; break; }
+        if (kn) continue;
+        terms = DEVices[t]->DEVpublic.terms ? *DEVices[t]->DEVpublic.terms : 0;
+        for (m = ckt->CKThead[t]; m; m = m->GENnextModel)
+            for (g = m->GENinstances; g; g = g->GENnextInstance)
+                for (k = 0; k < terms; k++)
+                    if (GENnode(g)[k] == node) return DEVices[t]->DEVpublic.name;
+    }
+    return NULL;
+}
+
 static int
 pss_salt_node_is_stable(CKTcircuit *ckt, int node)
 {
@@ -2535,7 +2611,7 @@ pss_salt_node_is_stable(CKTcircuit *ckt, int node)
 static int
 pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
                    double g_prev, double dt_actual, int *out_row, double *out_djump,
-                   double *out_tau, const char **out_why)
+                   double *out_tau, const char **out_why, double v_before)
 {
     int indtype, n_found = 0;
     INDmodel *im;
@@ -2660,9 +2736,19 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
     I_L = ckt->CKTrhsOld[found->INDbrEq];
 
     V_prev = (g_prev * V_other + Ksum - (double) found_sign * I_L) / (g_prev + Gsum);
+    {
+        /* card #575: the node equation above knows resistors, switches and diodes.  With any other device at the node (a MOSFET
+         * as the freewheel device, a controlled source) it is not the node's equation: take the node voltage of the previous
+         * accepted point, i.e. just before the flip, instead (the counterfactual 'no flip' voltage up to the slow drift over one
+         * step).  PSS_SALT_VBEFORE=1 uses it everywhere (test). */
+        const char *other = pss_salt_unmodelled_at(ckt, node);
+        if (other || getenv("PSS_SALT_VBEFORE"))
+            V_prev = v_before;
+    }
 
     dV = V_now - V_prev;
     *out_djump = (double) found_sign * dV / found->INDinduct;
+    g_salt_ind_k = (double) found_sign / found->INDinduct; g_salt_ind_dv = dV;   /* card #575 */
     *out_row = found->INDbrEq;
 
     /* card #510 step 2 (accuracy pass, superseding the step-1 L/R-based
@@ -2727,10 +2813,9 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
      * tests/test_pac.py's new check_pac_ind_jump_warning(). */
     if (!g_salt_ind_warned) {
         g_salt_ind_warned = 1;
-        fprintf(stderr, "PAC-TD: WARNING -- saltation via inductor-routed jump at node %s "
-                "(no capacitor at the switch node): validated to 0.5 dB/3 deg vs an "
-                "independent reference on ONE fixture only (card #510); cross-check with tools/pac_perturbed.py "
-                "-- see docs/pss-pac.md's card #510 section.\n",
+        fprintf(stderr, "PAC-TD: WARNING -- saltation via inductor-routed jump at node %s (no dominant capacitor at the switch node; "
+                "cards #510, #575: 0.001-0.06 dB / <= 0.34 deg vs tools/pac_perturbed.py on 14 asynchronous-buck "
+                "decks at 20-100 kHz; 0.14 dB at reltol 1e-4 with an RC snubber at a chargeless node, tighten reltol there).\n",
                 NODENAME(ckt, node));
     }
     return 1;
@@ -2780,17 +2865,26 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             if (cnt != g_salt_vsw_n) {
                 g_salt_vsw_prev = TREALLOC(double, g_salt_vsw_prev, cnt > 0 ? cnt : 1);
                 g_salt_vsw_cur  = TREALLOC(double, g_salt_vsw_cur,  cnt > 0 ? cnt : 1);
+                g_salt_vnd_prev = TREALLOC(double, g_salt_vnd_prev, cnt > 0 ? 2 * cnt : 2);
+                g_salt_vnd_cur  = TREALLOC(double, g_salt_vnd_cur,  cnt > 0 ? 2 * cnt : 2);
                 g_salt_vsw_n = cnt;
                 g_salt_vsw_have_prev = 0;
             }
-            if (g_salt_vsw_have_prev)
+            if (g_salt_vsw_have_prev) {
                 memcpy(g_salt_vsw_prev, g_salt_vsw_cur, (size_t) cnt * sizeof(double));
+                memcpy(g_salt_vnd_prev, g_salt_vnd_cur, (size_t) (2 * cnt) * sizeof(double));
+            }
             cnt = 0;
             for (m_ = (SWmodel *) ckt->CKThead[st_]; m_; m_ = SWnextModel(m_))
                 for (h_ = SWinstances(m_); h_; h_ = SWnextInstance(h_)) {
                     g_salt_vsw_cur[cnt] = ckt->CKTrhsOld[h_->SWposNode] - ckt->CKTrhsOld[h_->SWnegNode];
-                    if (!g_salt_vsw_have_prev)
+                    g_salt_vnd_cur[2 * cnt] = ckt->CKTrhsOld[h_->SWposNode];
+                    g_salt_vnd_cur[2 * cnt + 1] = ckt->CKTrhsOld[h_->SWnegNode];
+                    if (!g_salt_vsw_have_prev) {
                         g_salt_vsw_prev[cnt] = g_salt_vsw_cur[cnt];
+                        g_salt_vnd_prev[2 * cnt] = g_salt_vnd_cur[2 * cnt];
+                        g_salt_vnd_prev[2 * cnt + 1] = g_salt_vnd_cur[2 * cnt + 1];
+                    }
                     cnt++;
                 }
             g_salt_vsw_have_prev = 1;
@@ -2821,6 +2915,55 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     if (swtype < 0)
         return 0;
 
+    {   /* card #575: continuations of earlier routed jumps (see PSSsaltCont) */
+        int ic;
+        static int cont_off = -1;
+        if (cont_off < 0) cont_off = getenv("PSS_SALT_NOCONT") != NULL;   /* red proof: the single-step routed jump */
+        for (ic = 0; ic < PSS_SALT_CONT_MAX && n < max; ic++) {
+            PSSsaltCont *c = &g_salt_cont[ic];
+            double v, dv;
+            if (!c->active) continue;
+            if (cont_off) { c->active = 0; continue; }
+            v = ckt->CKTrhsOld[c->node];
+            dv = v - c->v_last;
+            c->v_last = v;
+            c->steps++;
+            {
+                /* the node is still in its own (fast) transient while it moves at a rate comparable with the fastest seen since the
+                 * event; once it only follows the slow states the recursion carries that motion itself (adding it would count it twice) */
+                static double frac = -1.0;
+                double rate = fabs(dv) / (dt_actual > 0.0 ? dt_actual : 1.0);
+                int ir;
+                if (frac < 0.0) { const char *e_ = getenv("PSS_SALT_CONT_FRAC"); frac = e_ ? atof(e_) : 1e-3; }
+                if (rate > c->rmax) c->rmax = rate;
+                if (rate > frac * c->rmax && fabs(dv) > 1e-9) {
+                    for (ir = 0; ir < c->nrow && n < max; ir++) {
+                        memset(&ev[n], 0, sizeof ev[n]);
+                        ev[n].posNode = ir == 0 ? c->node : c->row[ir]; ev[n].negNode = 0;
+                        ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl;
+                        ev[n].h_dot = c->h_dot;
+                        ev[n].posRow = c->row[ir]; ev[n].negRow = 0;
+                        ev[n].dfdt_pos = c->k[ir] * dv;
+                        ev[n].name = c->name;
+                        ev[n].posF = ir == 0 ? c->fast : 0;
+                        n++;
+                    }
+                    c->quiet = 0;
+                    if (2.0 * dt_actual / PSS_SALT_SETTLE_TAUS > tau_max) tau_max = 2.0 * dt_actual / PSS_SALT_SETTLE_TAUS;
+                    if (getenv("PSS_SALT_TRACE"))
+                        fprintf(stderr, "SALT-CONT t=%.9g %s node %d step %d dv=%.6g rate=%.3g\n", ckt->CKTtime, c->name ? c->name : "sw", c->node, c->steps, dv, rate);
+                } else if (++c->quiet >= 2) {
+                    c->active = 0;
+                }
+            }
+            if (c->active && c->steps >= PSS_SALT_CONT_STEPS) {
+                fprintf(stderr, "PSS-SALT: REFUSED -- the node of switch %s has not settled %d accepted steps after its event "
+                        "(t=%.9g): the routed jump needs the settled node voltage (card #575).\n", c->name ? c->name : "sw", c->steps, ckt->CKTtime);
+                return -1;
+            }
+        }
+    }
+
     int sw_idx = -1;
     for (model = (SWmodel *) ckt->CKThead[swtype]; model && n < max;
          model = SWnextModel(model)) {
@@ -2834,6 +2977,11 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             double dfdt_pos, dfdt_neg;
             double tau_ind_pos = 0.0, tau_ind_neg = 0.0;
             const char *why = NULL;
+            int routed_pos = 0, routed_neg = 0;   /* card #575 */
+            int n_extra = 0, extra_row[PSS_SALT_MAX_EVENTS];
+            double extra_dfdt[PSS_SALT_MAX_EVENTS];
+            double Cq_pos = 0.0, Cq_neg = 0.0;
+            double k_pos = 0.0, k_neg = 0.0, dv_pos = 0.0, dv_neg = 0.0;
 
             sw_idx++;
             if (pss_salt_is_on(now) == pss_salt_is_on(prev))
@@ -2884,6 +3032,30 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
 
             Cpos = pss_salt_local_cap(ckt, here->SWposNode);
             Cneg = pss_salt_local_cap(ckt, here->SWnegNode);
+            {   /* card #575: device-model charge only (no native capacitor) at a power node: try the inductor-routed jump first; the
+                 * charge value is kept for the charge-jump fallback when no inductor is there */
+                PSSsaltModelCapHookFn hk = PSSsaltModelCapHook;
+                if (hk && !getenv("PAC_SALT_QONLY")) {
+                    /* a model-charged node is tried as a fast node (routed jump + continuation) unless it has BOTH a native capacitor
+                     * and an RC snubber, the case the charge jump of card #559 is validated for (the charge jump needs the snubber:
+                     * without one it is 0.3-0.5 dB off even with a native capacitor at the node) */
+                    double nat_pos, nat_neg;
+                    int mq_pos = here->SWposNode > 0 && hk(ckt, here->SWposNode) > 0.0, mq_neg = here->SWnegNode > 0 && hk(ckt, here->SWnegNode) > 0.0;
+                    PSSsaltModelCapHook = NULL;
+                    nat_pos = pss_salt_local_cap(ckt, here->SWposNode); nat_neg = pss_salt_local_cap(ckt, here->SWnegNode);
+                    PSSsaltModelCapHook = hk;
+                    /* the charge jump (card #559) where the native capacitor dominates the node (>= 3x the smallest device-model
+                     * capacitance there on the orbit) or damps it together with a snubber; the fast-node treatment elsewhere */
+                    {
+                        double mn_pos = PSSsaltModelCapMinHook ? PSSsaltModelCapMinHook(ckt, here->SWposNode) : 0.0;
+                        double mn_neg = PSSsaltModelCapMinHook ? PSSsaltModelCapMinHook(ckt, here->SWnegNode) : 0.0;
+                        int q_pos = nat_pos > 0.0 && (nat_pos >= 3.0 * mn_pos || pss_salt_has_snubber(ckt, here->SWposNode));
+                        int q_neg = nat_neg > 0.0 && (nat_neg >= 3.0 * mn_neg || pss_salt_has_snubber(ckt, here->SWnegNode));
+                        if (mq_pos && !q_pos) { Cq_pos = Cpos; Cpos = 0.0; }
+                        if (mq_neg && !q_neg) { Cq_neg = Cneg; Cneg = 0.0; }
+                    }
+                }
+            }
 
             /* card #510: capacitor case unchanged (THIRD pass, validated);
              * otherwise try the inductor-routed forcing term; otherwise
@@ -2899,7 +3071,10 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 posRow = 0;
                 dfdt_pos = 0.0;
                 indrc = pss_salt_ind_jump(ckt, here, here->SWposNode, here->SWnegNode,
-                                           g_prev, dt_actual, &posRow, &dfdt_pos, &tau_ind_pos, &why);
+                                           g_prev, dt_actual, &posRow, &dfdt_pos, &tau_ind_pos, &why,
+                                           (sw_idx >= 0 && sw_idx < g_salt_vsw_n) ? g_salt_vnd_prev[2 * sw_idx] : ckt->CKTrhsOld[here->SWposNode]);
+                if (indrc == 1) { routed_pos = 1; k_pos = g_salt_ind_k; dv_pos = g_salt_ind_dv; }
+                else if (indrc == 0 && Cq_pos > 0.0) { Cpos = Cq_pos; posRow = here->SWposNode; dfdt_pos = -dI / Cpos; }
                 if (indrc < 0) {
                     fprintf(stderr, "PSS-SALT: REFUSING saltation correction for "
                             "switch %s at t=%.9g (posNode=%d): %s -- this .pss/.pac/"
@@ -2917,7 +3092,10 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 negRow = 0;
                 dfdt_neg = 0.0;
                 indrc = pss_salt_ind_jump(ckt, here, here->SWnegNode, here->SWposNode,
-                                           g_prev, dt_actual, &negRow, &dfdt_neg, &tau_ind_neg, &why);
+                                           g_prev, dt_actual, &negRow, &dfdt_neg, &tau_ind_neg, &why,
+                                           (sw_idx >= 0 && sw_idx < g_salt_vsw_n) ? g_salt_vnd_prev[2 * sw_idx + 1] : ckt->CKTrhsOld[here->SWnegNode]);
+                if (indrc == 1) { routed_neg = 1; k_neg = g_salt_ind_k; dv_neg = g_salt_ind_dv; }
+                else if (indrc == 0 && Cq_neg > 0.0) { Cneg = Cq_neg; negRow = here->SWnegNode; dfdt_neg = dI / Cneg; }
                 if (indrc < 0) {
                     fprintf(stderr, "PSS-SALT: REFUSING saltation correction for "
                             "switch %s at t=%.9g (negNode=%d): %s -- this .pss/.pac/"
@@ -2941,13 +3119,71 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             ev[n].dfdt_neg = dfdt_neg;
             ev[n].name = here->SWname;
             ev[n].posQ = ev[n].negQ = 0;
+            ev[n].posF = ev[n].negF = 0;
             ev[n].dqdt_pos = ev[n].dqdt_neg = 0.0;
             if (PSSsaltModelCapHook) {   /* card #559: model-charged power nodes (see PSSsaltEvent) */
+                /* card #575: model charge, no native capacitor, one inductor at the node: the routed jump with its continuation
+                 * (PSSsaltCont), not a charge jump.  PAC_SALT_QONLY=1 keeps the charge jump (unvalidated, for comparison). */
+                int qonly = getenv("PAC_SALT_QONLY") != NULL;
                 if (here->SWposNode > 0 && PSSsaltModelCapHook(ckt, here->SWposNode) > 0.0) {
-                    ev[n].posQ = 1; ev[n].posRow = here->SWposNode; ev[n].dqdt_pos = -dI;
+                    if (routed_pos && !qonly) ev[n].posF = 1;
+                    else { ev[n].posQ = 1; ev[n].posRow = here->SWposNode; ev[n].dqdt_pos = -dI; }
                 }
                 if (here->SWnegNode > 0 && PSSsaltModelCapHook(ckt, here->SWnegNode) > 0.0) {
-                    ev[n].negQ = 1; ev[n].negRow = here->SWnegNode; ev[n].dqdt_neg = dI;
+                    if (routed_neg && !qonly) ev[n].negF = 1;
+                    else { ev[n].negQ = 1; ev[n].negRow = here->SWnegNode; ev[n].dqdt_neg = dI; }
+                }
+            }
+            {   /* card #575: each routed side.  A capacitor node behind a resistor at the switch node (an RC snubber) is a slow state whose
+                 * rate (v_node - v_far) G / C_far changes with the node voltage exactly as the inductor's does: for a chargeless node
+                 * it gets its own jump G / C_far x dV at the event (the chargeless node is slaved from then on, no continuation).  A
+                 * model-charged (fast) node gets the continuation; with a snubber at such a node the two do not separate and the
+                 * result is 0.07-0.11 dB / 0.57 deg off the perturbed steady state (3 decks): refused. */
+                int side;
+                n_extra = 0;
+                for (side = 0; side < 2; side++) {
+                    int nd = side ? here->SWnegNode : here->SWposNode, ic, slot = -1, fast = side ? ev[n].negF : ev[n].posF;
+                    double dv = side ? dv_neg : dv_pos;
+                    int rt_ = CKTtypelook("Resistor");
+                    RESmodel *rm_; RESinstance *ri_;
+                    if (!(side ? routed_neg : routed_pos) || (side ? ev[n].negQ : ev[n].posQ)) continue;
+                    if (rt_ >= 0 && !getenv("PSS_SALT_NOSNUB"))
+                        for (rm_ = (RESmodel *) ckt->CKThead[rt_]; rm_; rm_ = RESnextModel(rm_))
+                            for (ri_ = RESinstances(rm_); ri_; ri_ = RESnextInstance(ri_)) {
+                                int far_;
+                                double cf_;
+                                PSSsaltModelCapHookFn hk_ = PSSsaltModelCapHook;
+                                if (ri_->RESposNode != nd && ri_->RESnegNode != nd) continue;
+                                far_ = ri_->RESposNode == nd ? ri_->RESnegNode : ri_->RESposNode;
+                                if (far_ <= 0 || far_ == nd) continue;
+                                PSSsaltModelCapHook = NULL; cf_ = pss_salt_local_cap(ckt, far_); PSSsaltModelCapHook = hk_;
+                                if (cf_ <= 0.0) continue;
+                                if (fast) {
+                                    /* negligible snubbers (G / C_far x one period moves the far node by < 1e-3 of dV per ... ) are not
+                                     * distinguished: any resistor to a capacitor node counts, except a leak (G < 1e-6 S) */
+                                    if (ri_->RESconduct < 1e-6 || getenv("PAC_SALT_FASTSNUB")) continue;
+                                    fprintf(stderr, "PSS-SALT: REFUSED -- switch %s: its node %s carries device-model charge, no native capacitor, "
+                                            "and a resistor to a capacitor node (an RC snubber): the fast-node treatment of the event is "
+                                            "0.07-0.11 dB / 0.57 deg off there (card #575; PAC_SALT_FASTSNUB=1 runs it, a capacitor at the "
+                                            "switch node itself is the validated case of card #559).\n", here->SWname, NODENAME(ckt, nd));
+                                    return -1;
+                                }
+                                if (n_extra < PSS_SALT_MAX_EVENTS) {
+                                    extra_row[n_extra] = far_; extra_dfdt[n_extra] = ri_->RESconduct / cf_ * dv; n_extra++;
+                                }
+                            }
+                    for (ic = 0; ic < PSS_SALT_CONT_MAX; ic++) {
+                        if (g_salt_cont[ic].active && g_salt_cont[ic].node == nd) g_salt_cont[ic].active = 0;   /* a new event at the node supersedes */
+                        if (!g_salt_cont[ic].active && slot < 0) slot = ic;
+                    }
+                    if (fast && slot >= 0) {
+                        PSSsaltCont *c = &g_salt_cont[slot];
+                        c->active = 1; c->node = nd; c->nrow = 1; c->row[0] = side ? negRow : posRow;
+                        c->posCntrl = here->SWposCntrlNode; c->negCntrl = here->SWnegCntrlNode;
+                        c->quiet = 0; c->steps = 0; c->fast = fast;
+                        c->k[0] = side ? k_neg : k_pos; c->v_last = ckt->CKTrhsOld[nd]; c->h_dot = h_dot; c->name = here->SWname;
+                        c->rmax = fabs(dv) / (dt_actual > 0.0 ? dt_actual : 1.0);
+                    }
                 }
             }
 
@@ -2979,6 +3215,19 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             if (tau_ind_neg > tau_max) tau_max = tau_ind_neg;
 
             n++;
+            {   /* card #575: the snubber-capacitor jumps of this event (chargeless routed node) */
+                int ix;
+                for (ix = 0; ix < n_extra && n < max; ix++) {
+                    memset(&ev[n], 0, sizeof ev[n]);
+                    ev[n].posNode = extra_row[ix];
+                    ev[n].posCntrl = here->SWposCntrlNode; ev[n].negCntrl = here->SWnegCntrlNode;
+                    ev[n].h_dot = h_dot;
+                    ev[n].posRow = extra_row[ix];
+                    ev[n].dfdt_pos = extra_dfdt[ix];
+                    ev[n].name = here->SWname;
+                    n++;
+                }
+            }
         }
     }
     if (n > 0)
@@ -2989,7 +3238,12 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
         if (taus < 0.0) { const char *e_ = getenv("PSS_SALT_TAUS"); taus = e_ ? atof(e_) : PSS_SALT_SETTLE_TAUS; }
         if (getenv("PSS_SALT_TRACE") && g_salt_win_steps > 0)
             fprintf(stderr, "SALT-WIN previous window: %d forced order-1 steps\n", g_salt_win_steps);
-        deadline = ckt->CKTtime + taus * tau_max;
+        /* card #575: with the step rule (default) the window is exactly the event step and the next PSS_SALT_SETTLE_MAXSTEPS accepted
+         * steps, whatever tau says.  The time rule could also end the window too EARLY: 30 tau below the next step (a 10 pF node
+         * capacitor: 0.45 dB off), or, for the routed jump, a window of 2 event-step widths that the next step (twice the event step
+         * after a located event) reaches exactly -- no order-1 step at all after the event, the spurious derivative history of the
+         * jump over the tiny event step propagated by the trapezoidal rule: 3.0x (9.54 dB) on an asynchronous buck with vh > 0. */
+        deadline = pss_salt_maxsteps() >= 0 ? 1e300 : ckt->CKTtime + taus * tau_max;
         if (deadline > g_salt_settle_until)
             g_salt_settle_until = deadline;
         g_salt_win_steps = 0; g_salt_win_last_t = ckt->CKTtime;

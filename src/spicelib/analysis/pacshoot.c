@@ -1729,6 +1729,7 @@ pac_gen_row_native(CKTcircuit *ckt, int r, double *pad, double *pao, double *ped
  * largest total diagonal |C| seen there.  PSSsaltModelCapHook reads them while a generic pass runs. */
 static unsigned char *g_salq = NULL;
 static double *g_salqC = NULL;
+static double *g_salqCmin = NULL;   /* card #575: smallest device-model part (loaded diag |C| - native) of the node on the orbit; -1 = not seen */
 static int g_salq_n = 0, g_salq_any = 0;
 
 static int
@@ -1737,6 +1738,14 @@ pac_salq_off(void)
     static int off = -1;
     if (off < 0) off = getenv("PAC_SALT_NOQ") != NULL || getenv("PAC_SALT_NATIVEJUMP") != NULL;   /* red proofs: refusal / old native-only jump */
     return off;
+}
+
+static double
+pac_salq_min_hook(CKTcircuit *ckt, int node)
+{
+    (void) ckt;
+    if (!g_salqCmin || node <= 0 || node > g_salq_n || g_salqCmin[node] < 0.0) return 0.0;
+    return g_salqCmin[node];
 }
 
 static double
@@ -1760,9 +1769,13 @@ pac_salq_note(CKTcircuit *ckt)
             int k, nd[2];
             nd[0] = si->SWposNode; nd[1] = si->SWnegNode;
             for (k = 0; k < 2; k++) {
-                double ad;
+                double ad, ed, mp;
+                int nat;
                 if (nd[k] <= 0 || nd[k] > g_salq_n) continue;
-                if (!pac_gen_row_native(ckt, nd[k], &ad, NULL, NULL, NULL)) {
+                nat = pac_gen_row_native(ckt, nd[k], &ad, NULL, &ed, NULL);
+                mp = ad - ed > 0.0 ? ad - ed : 0.0;
+                if (g_salqCmin && (g_salqCmin[nd[k]] < 0.0 || mp < g_salqCmin[nd[k]])) g_salqCmin[nd[k]] = mp;
+                if (!nat) {
                     g_salq[nd[k]] = 1; g_salq_any = 1;
                     if (ad > g_salqC[nd[k]]) g_salqC[nd[k]] = ad;
                 }
@@ -1786,6 +1799,8 @@ pac_gen_salt_guard(CKTcircuit *ckt, const PSSsaltEvent *ev, int n_ev)
             int r = rows[k];
             double ad, ao, ed, eo;
             if (r <= 0) continue;
+            if ((r == ev[i].posNode && ev[i].posF) || (r == ev[i].negNode && ev[i].negF))
+                continue;   /* card #575: fast node, the jump is on the inductor branch row */
             if ((r == ev[i].posNode && ev[i].posQ) || (r == ev[i].negNode && ev[i].negQ)) {
                 /* card #559 validated envelope: the model charge sits on top of a NATIVE capacitor at the same node (a switch-node
                  * capacitor, Coss modelled as a C, ...), so the node is a charge state on the whole orbit and its fast transient is
@@ -3308,10 +3323,14 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     PSSsaltModelCapHook = NULL;
     if (g_salq) { tfree(g_salq); g_salq = NULL; }
     if (g_salqC) { tfree(g_salqC); g_salqC = NULL; }
+    if (g_salqCmin) { tfree(g_salqCmin); g_salqCmin = NULL; }
+    PSSsaltModelCapMinHook = NULL;
     g_salq_n = 0; g_salq_any = 0;
     if (CKTtypelook("Switch") >= 0 && ckt->CKThead[CKTtypelook("Switch")]) {
         g_salq = TMALLOC(unsigned char, neq + 1);
         g_salqC = TMALLOC(double, neq + 1);
+        g_salqCmin = TMALLOC(double, neq + 1);
+        if (g_salqCmin) { int i_; for (i_ = 0; i_ <= neq; i_++) g_salqCmin[i_] = -1.0; }
         if (g_salq && g_salqC) g_salq_n = neq;
         else { if (g_salq) tfree(g_salq); if (g_salqC) tfree(g_salqC); g_salq = NULL; g_salqC = NULL; }
     }
@@ -3404,6 +3423,7 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         int sn, nq = 0;
         for (sn = 1; sn <= g_salq_n; sn++) if (g_salq[sn]) nq++;
         PSSsaltModelCapHook = pac_salq_hook;
+        PSSsaltModelCapMinHook = pac_salq_min_hook;
         fprintf(stderr, "%s: ideal-switch power nodes with device-model charge (card #559): %d node(s); their saltation jump is formed on the "
                 "charge vector%s\n", who, nq, pac_salq_off() ? " [DISABLED by PAC_SALT_NOQ / PAC_SALT_NATIVEJUMP: native-only jump]" : "");
     }
