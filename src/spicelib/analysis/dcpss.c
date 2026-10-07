@@ -3584,6 +3584,49 @@ DCpss(CKTcircuit *ckt,
                     "trigger= was given.\n");
             return (E_UNSUPP);
         }
+        {   /* card #586: every shooting period run starts at t = 0, so each source must satisfy v(t) = v(t + T) from t = 0 on.  A
+             * PULSE with a delay sits at V1 for t < TD; that equals its periodic continuation only if the pulse has ended
+             * PER - TD after its start (TR + PW + TF <= PER - TD).  A delayed sawtooth (the natural way to write the second
+             * ramp of an interleaved converter) does not: the engine then converged to the orbit of another circuit (one
+             * phase at zero current, td .pac 6.5 dB off) without a message.  A SIN with TD > 0 is constant before TD.
+             * PSS_ALLOW_DELAYED_SOURCE=1 runs anyway. */
+            int vt_ = CKTtypelook("Vsource"), it_ = CKTtypelook("Isource"), pass_;
+            double T_ = ckt->CKTguessedFreq > 0.0 ? 1.0 / ckt->CKTguessedFreq : 0.0;
+            for (pass_ = 0; pass_ < 2 && !getenv("PSS_ALLOW_DELAYED_SOURCE"); pass_++) {
+                GENmodel *gm_;
+                GENinstance *gi_;
+                int ty_ = pass_ ? it_ : vt_;
+                if (ty_ < 0) continue;
+                for (gm_ = ckt->CKThead[ty_]; gm_; gm_ = gm_->GENnextModel)
+                    for (gi_ = gm_->GENinstances; gi_; gi_ = gi_->GENnextInstance) {
+                        int ft_ = pass_ ? ((ISRCinstance *) gi_)->ISRCfunctionType : ((VSRCinstance *) gi_)->VSRCfunctionType;
+                        int fo_ = pass_ ? ((ISRCinstance *) gi_)->ISRCfunctionOrder : ((VSRCinstance *) gi_)->VSRCfunctionOrder;
+                        double *c_ = pass_ ? ((ISRCinstance *) gi_)->ISRCcoeffs : ((VSRCinstance *) gi_)->VSRCcoeffs;
+                        const char *why_ = NULL;
+                        double td_ = 0.0;
+                        if (!c_) continue;
+                        if (ft_ == PULSE && fo_ >= 3 && c_[2] > 0.0 && c_[0] != c_[1]) {
+                            double tr_ = fo_ > 3 ? c_[3] : 0.0, tf_ = fo_ > 4 ? c_[4] : 0.0, pw_ = fo_ > 5 ? c_[5] : 0.0;
+                            double per_ = fo_ > 6 ? c_[6] : 0.0;
+                            td_ = c_[2];
+                            if (per_ <= 0.0) per_ = T_;
+                            if (td_ >= per_ * (1.0 - 1e-9) || tr_ + pw_ + tf_ > (per_ - td_) * (1.0 + 1e-9))
+                                why_ = "PULSE with a delay TD: before TD it sits at V1, its periodic continuation does not (TR+PW+TF > PER-TD)";
+                        } else if (ft_ == SINE && fo_ >= 4 && c_[3] > 0.0 && c_[1] != 0.0) {
+                            td_ = c_[3];
+                            why_ = "SIN with a delay TD: it is constant before TD";
+                        }
+                        if (why_) {
+                            fprintf(stderr, "PSS-SHOOT: REFUSED -- source %s is not periodic from t = 0 (%s; TD = %g s). Every shooting "
+                                    "period run starts at t = 0, so the orbit found would be that of another circuit (card #586). Write "
+                                    "the source so that v(t) = v(t+T) for all t >= 0, e.g. a phase-shifted sawtooth as the unshifted "
+                                    "sawtooth plus a square source in series (docs/pss-pac.md, card #586). PSS_ALLOW_DELAYED_SOURCE=1 "
+                                    "runs anyway.\n", gi_->GENname, why_, td_);
+                            return (E_UNSUPP);
+                        }
+                    }
+            }
+        }
         return pss_shoot_klu_guard(ckt, job, 0);
     }
 
