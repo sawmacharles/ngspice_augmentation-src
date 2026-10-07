@@ -3112,7 +3112,7 @@ for (; model != NULL; model = BSIM4v5nextModel(model))
 		      VdseffCV = VdsatCV * T4;
                       dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
                       dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                      dVdseffCV_dVb = dT0_dVb * (1.0 - T5) + T5 * dT1_dVb;
+                      dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
                   }
 
                   if (Vds == 0.0)
@@ -3371,7 +3371,7 @@ for (; model != NULL; model = BSIM4v5nextModel(model))
                       VdseffCV = VdsatCV * T4;
                       dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
                       dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                      dVdseffCV_dVb = dT0_dVb * (1.0 - T5) + T5 * dT1_dVb;
+                      dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
                   }
 
                   if (Vds == 0.0)
