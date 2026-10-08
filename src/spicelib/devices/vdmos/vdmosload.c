@@ -706,6 +706,31 @@ bypass:
             *(here->VDMOSDsPtr) += (-here->VDMOSdsConductance);
             *(here->VDMOSSdPtr) += (-here->VDMOSdsConductance);
 
+            /* quasi-saturation (ngspice_augmentation card #590): the drain resistance depends on
+             * V(d)-V(s), so the resistor current I = Vrd/rd(vds) has the derivative gdq with respect
+             * to V(d)-V(s).  Upstream stamps it in the AC and PZ loads only; without it here the
+             * transient Jacobian is not the derivative of the residual, which Newton tolerates but
+             * every analysis that linearises around a transient solution (td .pac/.pstb/.pxf, the
+             * shooting monodromy) does not: 3.9 dB at DC on a stage biased in quasi-saturation.
+             * NGSPICE_VDMOS_QSJAC=0 restores the upstream load. */
+            if (here->VDMOSgdq != 0.0) {
+                static int qsjac = -1;
+                if (qsjac < 0) {
+                    const char *e = getenv("NGSPICE_VDMOS_QSJAC");
+                    qsjac = (e && e[0] == '0') ? 0 : 1;
+                }
+                if (qsjac) {
+                    double vdsold = *(ckt->CKTrhsOld + here->VDMOSdNode) -
+                                    *(ckt->CKTrhsOld + here->VDMOSsNode);
+                    *(here->VDMOSDdPtr)  += here->VDMOSgdq;
+                    *(here->VDMOSDsPtr)  -= here->VDMOSgdq;
+                    *(here->VDMOSDPdPtr) -= here->VDMOSgdq;
+                    *(here->VDMOSDPsPtr) += here->VDMOSgdq;
+                    *(ckt->CKTrhs + here->VDMOSdNode)      += here->VDMOSgdq * vdsold;
+                    *(ckt->CKTrhs + here->VDMOSdNodePrime) -= here->VDMOSgdq * vdsold;
+                }
+            }
+
             if (selfheat)
             {
                 /* Everything is computed for m parallel instances... so scale gthjc and gthja accordingly
