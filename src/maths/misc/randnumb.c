@@ -306,7 +306,18 @@ seed_generators(int seed)
 *   seed with number <n>
 */
 void
-com_sseed(wordlist *wl)
+com_sseed(wordlist* wl)
+{
+    bool previnfo = seedinfo;
+    seedinfo = TRUE;
+    set_sseed(wl);
+    initw();
+    seedinfo = previnfo;
+}
+
+
+void
+set_sseed(wordlist *wl)
 {
     int newseed;
 
@@ -316,6 +327,12 @@ com_sseed(wordlist *wl)
             cp_vset("rndseed", CP_NUM, &newseed);
         }
         seed_generators(newseed);
+    }
+    else if (cieq(wl->wl_word, "random")) {
+        newseed = getpid();
+        cp_vset("rndseed", CP_NUM, &newseed);
+        srand((unsigned int)newseed);
+        TausSeed();
     }
     else if ((sscanf(wl->wl_word, " %d ", &newseed) != 1) ||
         (newseed <= 0) || (newseed > INT_MAX))
