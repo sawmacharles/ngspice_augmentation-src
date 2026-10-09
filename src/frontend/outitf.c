@@ -196,9 +196,7 @@ static bool shouldstop = FALSE; /* Tell simulator to stop next time it asks. */
 static bool interpolated = FALSE;
 static double *valueold, *valuenew;
 
-#ifdef SHARED_MODULE
 static bool savenone = FALSE;
-#endif
 
 #ifdef WITH_PSS
 /* card #553: set (pssshoot.c) while a `.pss method=shoot` period run executes: its plot vectors are never read, so they keep one
@@ -319,6 +317,7 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
 
         an_name = spice_analysis_get_name(analysisPtr->JOBtype);
         ft_curckt->ci_last_an = an_name;
+        savenone = FALSE;
 
         /* Now let's see which of these things we need.  First toss in the
          * reference vector.  Then toss in anything that getSaves() tells
@@ -326,6 +325,15 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
          * the remaining saves into parameters.
          */
         numsaves = ft_getSaves(&saves);
+        if (numsaves && cieq(saves[0].name, "none")) {
+            /* If "none" appears, it is always alone. */
+
+            numsaves = 0;
+            savenone = TRUE;
+            tfree(saves[0].analysis);
+            tfree(saves[0].name);
+            tfree(saves);
+        }
         if (numsaves) {
             savesused = TMALLOC(bool, numsaves);
             saveall = FALSE;
@@ -341,7 +349,6 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
                 if (cieq(saves[i].name, "all") || cieq(saves[i].name, "allv")) {
                     saveall = TRUE;
                     savesused[i] = TRUE;
-                    saves[i].used = 1;
                     continue;
                 }
 
@@ -350,33 +357,20 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
                 if (cieq(saves[i].name, "alli")) {
                     savealli = TRUE;
                     savesused[i] = TRUE;
-                    saves[i].used = 1;
                     continue;
                 }
 
                 if (cieq(saves[i].name, "nosub")) {
                     savenosub = TRUE;
                     savesused[i] = TRUE;
-                    saves[i].used = 1;
                     continue;
                 }
 
                 if (cieq(saves[i].name, "nointernals")) {
                     savenointernals = TRUE;
                     savesused[i] = TRUE;
-                    saves[i].used = 1;
                     continue;
                 }
-#ifdef SHARED_MODULE
-                /* this may happen if shared ngspice*/
-                if (cieq(saves[i].name, "none")) {
-                    savenone = TRUE;
-                    saveall = TRUE;
-                    savesused[i] = TRUE;
-                    saves[i].used = 1;
-                    continue;
-                }
-#endif
             }
         }
 
@@ -388,11 +382,10 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
         /* Pass 0. */
         if (refName) {
             addDataDesc(run, refName, refType, -1, initmem);
-            for (i = 0; i < numsaves; i++)
-                if (!savesused[i] && name_eq(saves[i].name, refName)) {
+            for (i = 0; i < numsaves; i++) {
+                if (!savesused[i] && name_eq(saves[i].name, refName))
                     savesused[i] = TRUE;
-                    saves[i].used = 1;
-                }
+            }
         } else {
             run->refIndex = -1;
         }
@@ -406,26 +399,23 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
                         if (name_eq(saves[i].name, dataNames[j])) {
                             addDataDesc(run, dataNames[j], dataType, j, initmem);
                             savesused[i] = TRUE;
-                            saves[i].used = 1;
                             break;
                         }
                         /* generate a vector of real time information */
                         else if (ft_ngdebug && refName && eq(refName, "time") && eq(saves[i].name, "speedcheck")) {
                             addDataDesc(run, "speedcheck", IF_REAL, j, initmem);
                             savesused[i] = TRUE;
-                            saves[i].used = 1;
                             break;
                         }
                         else if (ft_ngdebug && refName && eq(refName, "time") && eq(saves[i].name, "deltacheck")) {
                             addDataDesc(run, "deltacheck", IF_REAL, j, initmem);
                             savesused[i] = TRUE;
-                            saves[i].used = 1;
                             break;
                         }
                     }
                 }
             }
-        } else {
+        } else if (!savenone) {
             for (i = 0; i < numNames; i++)
                 if (!refName || !name_eq(dataNames[i], refName))
                     /*  Save the node (with restrictions) */
@@ -545,7 +535,6 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
                     }
                     addDataDesc(run, dataNames[j], dataType, j, initmem);
                     savesused[i] = TRUE;
-                    saves[i].used = 1;
                     depind = j;
                 } else {
                     depind = run->data[j].outIndex;
@@ -564,6 +553,7 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
             tfree(savesused);
         }
 
+#if 0
         if (numNames &&
             ((run->numData == 1 && run->refIndex != -1) ||
              (run->numData == 0 && run->refIndex == -1)))
@@ -572,7 +562,7 @@ beginPlot(JOB *analysisPtr, CKTcircuit *circuitPtr, char *cktName, char *analNam
                     spice_analysis_get_description(analysisPtr->JOBtype));
             return E_NOTFOUND;
         }
-
+#endif
         /* Now that we have our own data structures built up, let's see what
          * nutmeg wants us to do.
          */
@@ -1313,11 +1303,9 @@ vlength2delta(int len)
 {
     if (PSS_DISCARD)
         return 1;
-#ifdef SHARED_MODULE
     if (savenone)
-        /* We need just a vector length of 1 */
-        return 1;
-#endif
+        return 1;        /* We need just a vector length of 1 */
+
     /* TSTOP / TSTEP */
     int points = ft_curckt->ci_ckt->CKTtimeListSize;
     /* transient and pss analysis (points > 0) upon start */
@@ -1358,11 +1346,8 @@ AddRealValueToVector(struct dvec *v, double value)
 {
     if (PSS_DISCARD)
         v->v_length = 0;   /* card #553 */
-#ifdef SHARED_MODULE
     if (savenone)
-        /* always save new data to same location */
-        v->v_length = 0;
-#endif
+        v->v_length = 0;        /* always save new data to same location */
 
     if (v->v_length >= v->v_alloc_length)
         dvec_extend(v, v->v_length + vlength2delta(v->v_length));
@@ -1392,10 +1377,8 @@ plotAddComplexValue(dataDesc *desc, IFcomplex value)
 
     if (PSS_DISCARD)
         v->v_length = 0;   /* card #553 */
-#ifdef SHARED_MODULE
     if (savenone)
         v->v_length = 0;
-#endif
 
     if (v->v_length >= v->v_alloc_length)
         dvec_extend(v, v->v_length + vlength2delta(v->v_length));
