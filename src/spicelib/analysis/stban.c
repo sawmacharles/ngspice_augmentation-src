@@ -452,6 +452,146 @@ stb_sens_dot(const double *lam_re, const double *lam_im,
     return r;
 }
 
+/* card #595: the bias-point term of dT/dp.
+ *
+ * Card #475 held the DC operating point fixed: dY/dp was only the
+ * device's own stamp derivative at constant node voltages. For a
+ * parameter that moves the bias (a MOSFET's w, a bias resistor, a
+ * model parameter) the small-signal matrix also changes through the
+ * operating point, dY/dp|total = dY/dp|x + (dY/dx)(dx_op/dp), and the
+ * second term was missing (test_sens.py's M2_w case was labelled
+ * EXPECT-DIVERGE for that reason).
+ *
+ * dx_op/dp: one DC Newton step from the converged x_op with the
+ * parameter at p+delta and at p-delta (central difference). At the
+ * converged point the Newton map N(p) = J(x_op,p)^-1 rhs(x_op,p) has
+ * dN/dp = -J^-1 dF/dp = dx_op/dp (the residual is zero to Newton's own
+ * accuracy, and its contribution cancels in the central difference).
+ * Two real factorisations per parameter, once, before the sweep.
+ *
+ * (dY/dx)(dx_op/dp) x, per frequency: the circuit is re-linearised at
+ * x_op + h*dx_op/dp and at x_op - h*dx_op/dp (CKTload MODEINITFLOAT to
+ * put the shifted voltages into the device states, MODEINITSMSIG to
+ * recompute the small-signal quantities from them, CKTacLoad), the
+ * matrix multiplied by the forward solutions, and the two products
+ * differenced. h is chosen so the largest node-voltage shift is
+ * STB_SENS_BIAS_DV (default 1e-5 V). Afterwards CKTstate0 is restored
+ * from a copy and MODEINITSMSIG re-run, so the next frequency's
+ * linearisation (and T itself) is the same as without sens=.
+ *
+ * The same pass also fixes the fixed-op term of nonlinear devices: the
+ * card #475 stamp difference re-ran only DEVacLoad at p+delta, but a
+ * nonlinear device computes gm, gds and its charges in DEVload, so their
+ * dependence on p (a MOSFET's gm on w, a diode's capacitance on cjo) was
+ * missing as well. For every parameter of a device that is not one of the
+ * linear elements (R, C, L, K, E, F, G, H, V, I) the whole derivative is
+ * therefore taken jointly, Y(p + h, x_op + h*dx_op/dp) against
+ * Y(p - h, x_op - h*dx_op/dp), and replaces the stamp difference; linear
+ * elements keep the exact stamp difference and add the bias term only if
+ * dx_op/dp is not zero.
+ *
+ * Parameters for which dx_op/dp is exactly zero on a linear element (a
+ * capacitor, an AC-only resistor) skip the per-frequency work.
+ *
+ * A MODEL parameter of a model with more than one instance keeps card
+ * #475's stamp difference (one warning lists them; the result is
+ * incomplete): that term is per instance (cktsgen.c isolates one
+ * instance), but a model parameter set outside that isolation, as a full
+ * CKTload needs, moves every instance.
+ * Instant mode (no DC solve) keeps the fixed-op term with a warning.
+ * STB_SENS_FIXED_OP=1 restores card #475's behaviour (red proof). */
+typedef struct {
+    int dev, param, is_instparam;
+    GENmodel *model;
+    GENinstance *instance;
+    double value;
+} STBsensRec;
+
+/* the linear elements, whose AC stamp is their whole small-signal
+ * dependence on their own parameters (see the block comment above) */
+static int
+stb_sens_linear_dev(int dev)
+{
+    static const char *lin[] = { "Resistor", "Capacitor", "Inductor", "mutual", "VCVS", "VCCS",
+                                 "CCCS", "CCVS", "Vsource", "Isource", NULL };
+    const char *n = DEVices[dev] ? DEVices[dev]->DEVpublic.name : NULL;
+    int i;
+    if (!n) return 0;
+    for (i = 0; lin[i]; i++)
+        if (strcmp(n, lin[i]) == 0) return 1;
+    return 0;
+}
+
+static int
+stb_rec_setp(STBsensRec *r, double v, CKTcircuit *ckt)
+{
+    IFvalue val;
+    int pid, error;
+    val.rValue = v;
+    if (r->is_instparam) {
+        int (*fn)(int, IFvalue *, GENinstance *, IFvalue *) = DEVices[r->dev]->DEVparam;
+        if (!fn) return 1;
+        pid = DEVices[r->dev]->DEVpublic.instanceParms[r->param].id;
+        error = fn(pid, &val, r->instance, NULL);
+    } else {
+        int (*fn)(int, IFvalue *, GENmodel *) = DEVices[r->dev]->DEVmodParam;
+        if (!fn) return 1;
+        pid = DEVices[r->dev]->DEVpublic.modelParms[r->param].id;
+        error = fn(pid, &val, r->model);
+    }
+    if (DEVices[r->dev]->DEVtemperature)
+        DEVices[r->dev]->DEVtemperature(r->model, ckt);
+    return error;
+}
+
+/* one DC Newton step from xop: out = J(xop)^-1 rhs(xop) at the current
+ * parameter values. The caller saves and restores CKTrhs/CKTrhsOld/
+ * CKTmode and the device states. */
+static int
+stb_sens_newton_step(CKTcircuit *ckt, const double *xop, double *bufOld, double *out, int size)
+{
+    int error;
+    memcpy(bufOld, xop, (size_t) (size + 1) * sizeof(double));
+    ckt->CKTrhsOld = bufOld;
+    ckt->CKTrhs = out;
+    ckt->CKTmode = (ckt->CKTmode & MODEUIC) | MODEDCOP | MODEINITFLOAT;
+    error = CKTload(ckt);
+    if (error) return error;
+    error = SMPluFac(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTdiagGmin);
+    if (error == E_SINGULAR)
+        error = SMPreorder(ckt->CKTmatrix, ckt->CKTpivotAbsTol, ckt->CKTpivotRelTol, ckt->CKTdiagGmin);
+    if (error) return error;
+    SMPsolve(ckt->CKTmatrix, out, ckt->CKTrhsSpare);
+    out[0] = 0.0;
+    return OK;
+}
+
+/* the complex matrix linearised at xop + h*dx (see the block comment
+ * above); leaves it in ckt->CKTmatrix, unfactored */
+static int
+stb_sens_shift_load(CKTcircuit *ckt, const double *xop, const double *dx, double h,
+                    double *bufOld, double *scr_re, double *scr_im, int size)
+{
+    int j, error;
+    long savemode = ckt->CKTmode;
+    for (j = 0; j <= size; j++)
+        bufOld[j] = dx ? xop[j] + h * dx[j] : xop[j];
+    bufOld[0] = 0.0;
+    ckt->CKTrhsOld = bufOld;
+    ckt->CKTrhs = scr_re;
+    ckt->CKTirhs = scr_im;
+    ckt->CKTmode = (savemode & MODEUIC) | MODEDCOP | MODEINITFLOAT;
+    error = CKTload(ckt);
+    if (error) return error;
+    ckt->CKTmode = (savemode & MODEUIC) | MODEDCOP | MODEINITSMSIG;
+    error = CKTload(ckt);
+    if (error) return error;
+    ckt->CKTmode = (savemode & MODEUIC) | MODEAC;
+    error = CKTacLoad(ckt);
+    ckt->CKTmode = savemode;
+    return error;
+}
+
 int
 STBan(CKTcircuit *ckt, int restart)
 {
@@ -513,6 +653,14 @@ STBan(CKTcircuit *ckt, int restart)
     double *sens_dI = NULL, *sens_dII = NULL;
     double *sens_mv_re = NULL, *sens_mv_im = NULL;
     runDesc *sensPlot = NULL;
+    /* card #595: bias-point term state (see stb_rec_setp() above) */
+    STBsensRec *sensRec = NULL;
+    double **sensDxdp = NULL, *sensH = NULL;
+    double *sens_xop = NULL, *sens_bufOld = NULL, *sens_state0 = NULL;
+    double *sens_yp1_re = NULL, *sens_yp1_im = NULL, *sens_yp2_re = NULL, *sens_yp2_im = NULL;
+    STBcplx *sensD = NULL;      /* nsens x 4: dv1, di1, dv2, di2 at this frequency */
+    int *sensNoAc = NULL, *sensJoint = NULL;
+    int sens_nbias = 0;
 
     /* ---- resolve the probe device ---- */
     inst = CKTfndDev(ckt, job->STBprobeName);
@@ -874,7 +1022,14 @@ STBan(CKTcircuit *ckt, int restart)
                     sensVecUids = TREALLOC(IFuid, sensVecUids, senscap);
                     dTdp_re = TREALLOC(double *, dTdp_re, senscap);
                     dTdp_im = TREALLOC(double *, dTdp_im, senscap);
+                    sensRec = TREALLOC(STBsensRec, sensRec, senscap);
                 }
+                sensRec[nsens].dev = sg->dev;
+                sensRec[nsens].param = sg->param;
+                sensRec[nsens].is_instparam = sg->is_instparam;
+                sensRec[nsens].model = sg->model;
+                sensRec[nsens].instance = sg->instance;
+                sensRec[nsens].value = sg->value;
                 sensNames[nsens] = copy(namebuf);
                 dTdp_re[nsens] = NULL;
                 dTdp_im[nsens] = NULL;
@@ -920,6 +1075,133 @@ STBan(CKTcircuit *ckt, int restart)
                     sens_x2_re = TMALLOC(double, vsize); sens_x2_im = TMALLOC(double, vsize);
                     sens_dI = TMALLOC(double, vsize); sens_dII = TMALLOC(double, vsize);
                     sens_mv_re = TMALLOC(double, vsize); sens_mv_im = TMALLOC(double, vsize);
+                    sensD = TMALLOC(STBcplx, 4 * nsens);
+                    sensNoAc = TMALLOC(int, nsens);
+                    sensJoint = TMALLOC(int, nsens);
+                    { int kk; for (kk = 0; kk < nsens; kk++) sensJoint[kk] = 0; }
+                }
+
+                /* card #595: dx_op/dp for every selected parameter */
+                if (getenv("STB_SENS_FIXED_OP") && atoi(getenv("STB_SENS_FIXED_OP")) != 0) {
+                    fprintf(stdout, "stb sens=: STB_SENS_FIXED_OP set -- the operating point is held "
+                            "fixed (bias-point term omitted, card #475 behaviour)\n");
+                } else if (job->STBinstant) {
+                    SPfrontEnd->IFerrorf(ERR_WARNING,
+                        "stb sens= with instant: no DC operating point, so the bias-point term of "
+                        "dT/dp is omitted (the operating point is held fixed)");
+                } else {
+                    int vsize = SMPmatSize(ckt->CKTmatrix) + 1;
+                    double *save_rhs = ckt->CKTrhs, *save_rhsOld = ckt->CKTrhsOld;
+                    long save_mode = ckt->CKTmode;
+                    int save_bypass = ckt->CKTbypass;
+                    double *np = TMALLOC(double, vsize), *nm = TMALLOC(double, vsize);
+                    int k, j;
+                    const char *e = getenv("STB_SENS_BIAS_DV");
+                    char shared_names[512] = "";
+                    int nshared = 0;
+                    double dvt = (e && atof(e) > 0.0) ? atof(e) : 1e-5;
+
+                    sens_xop = TMALLOC(double, vsize);
+                    sens_bufOld = TMALLOC(double, vsize);
+                    memcpy(sens_xop, ckt->CKTrhsOld, (size_t) vsize * sizeof(double));
+                    sens_xop[0] = 0.0;
+                    sens_state0 = TMALLOC(double, ckt->CKTnumStates + 1);
+                    memcpy(sens_state0, ckt->CKTstate0, (size_t) ckt->CKTnumStates * sizeof(double));
+                    sensDxdp = TMALLOC(double *, nsens);
+                    sensH = TMALLOC(double, nsens);
+                    ckt->CKTbypass = 0;
+
+                    for (k = 0; k < nsens && !error; k++) {
+                        STBsensRec *r = &sensRec[k];
+                        double delta_var = (r->value != 0.0) ? r->value * STBsens_Delta : STBsens_AbsDelta;
+                        double vmax = 0.0, amax = 0.0;
+                        CKTnode *nd;
+
+                        sensDxdp[k] = NULL;
+                        sensH[k] = 0.0;
+                        sensJoint[k] = 0;
+                        if (!r->is_instparam) {
+                            int ninst = 0;
+                            GENinstance *gi;
+                            for (gi = r->model->GENinstances; gi; gi = gi->GENnextInstance)
+                                ninst++;
+                            if (ninst > 1) {
+                                /* collected into one warning after the loop */
+                                size_t l = strlen(shared_names);
+                                if (nshared < 8 && l + strlen(sensNames[k]) + 3 < sizeof shared_names)
+                                    snprintf(shared_names + l, sizeof shared_names - l, "%s%s",
+                                             l ? ", " : "", sensNames[k]);
+                                nshared++;
+                                continue;
+                            }
+                        }
+                        if (stb_rec_setp(r, r->value + delta_var, ckt)) continue;
+                        error = stb_sens_newton_step(ckt, sens_xop, sens_bufOld, np, vsize - 1);
+                        if (!error) {
+                            stb_rec_setp(r, r->value - delta_var, ckt);
+                            error = stb_sens_newton_step(ckt, sens_xop, sens_bufOld, nm, vsize - 1);
+                        }
+                        stb_rec_setp(r, r->value, ckt);
+                        if (error) break;
+                        for (j = 1; j < vsize; j++) {
+                            np[j] = (np[j] - nm[j]) / (2.0 * delta_var);
+                            if (fabs(np[j]) > amax) amax = fabs(np[j]);
+                        }
+                        if (amax == 0.0) {
+                            /* does not move the bias */
+                            if (!stb_sens_linear_dev(r->dev)) {
+                                sensJoint[k] = 1;
+                                sensH[k] = (r->value != 0.0) ? fabs(r->value) * 1e-5 : STBsens_AbsDelta;
+                                sens_nbias++;
+                            }
+                            continue;
+                        }
+                        for (nd = ckt->CKTnodes; nd; nd = nd->next)
+                            if (nd->type == SP_VOLTAGE && nd->number > 0 && nd->number < vsize
+                                    && fabs(np[nd->number]) > vmax)
+                                vmax = fabs(np[nd->number]);
+                        if (vmax == 0.0) vmax = amax;
+                        sensDxdp[k] = TMALLOC(double, vsize);
+                        memcpy(sensDxdp[k], np, (size_t) vsize * sizeof(double));
+                        sensDxdp[k][0] = 0.0;
+                        sensH[k] = dvt / vmax;
+                        if (r->value != 0.0 && sensH[k] > fabs(r->value) * 1e-4)
+                            sensH[k] = fabs(r->value) * 1e-4;
+                        sensJoint[k] = !stb_sens_linear_dev(r->dev);
+                        sens_nbias++;
+                        if (getenv("STB_SENS_DEBUG")) {
+                            for (nd = ckt->CKTnodes; nd; nd = nd->next)
+                                if (nd->number > 0 && nd->number < vsize)
+                                    fprintf(stderr, "STB_SENS_DEBUG %s dx/dp %s = %.9g (x_op %.9g)\n",
+                                            sensNames[k], nd->name, np[nd->number], sens_xop[nd->number]);
+                        }
+                    }
+
+                    if (nshared > 0)
+                        SPfrontEnd->IFerrorf(ERR_WARNING,
+                            "stb sens=: %d model parameter(s) of a model with several instances keep the "
+                            "fixed operating point and the AC-stamp-only derivative (INCOMPLETE: the bias "
+                            "shift and the device's DC-load quantities such as gm are not included; give the "
+                            "device a model of its own for the full derivative): %s%s",
+                            nshared, shared_names, nshared > 8 ? ", ..." : "");
+
+                    /* back to the original linearisation, bit for bit */
+                    memcpy(ckt->CKTstate0, sens_state0, (size_t) ckt->CKTnumStates * sizeof(double));
+                    ckt->CKTrhsOld = save_rhsOld;
+                    ckt->CKTrhs = np;
+                    ckt->CKTmode = (save_mode & MODEUIC) | MODEDCOP | MODEINITSMSIG;
+                    if (!error)
+                        error = CKTload(ckt);
+                    ckt->CKTrhs = save_rhs;
+                    ckt->CKTmode = save_mode;
+                    ckt->CKTbypass = save_bypass;
+                    tfree(np);
+                    tfree(nm);
+                    if (error) return error;
+                    if (sens_nbias > 0) {
+                        sens_yp1_re = TMALLOC(double, vsize); sens_yp1_im = TMALLOC(double, vsize);
+                        sens_yp2_re = TMALLOC(double, vsize); sens_yp2_im = TMALLOC(double, vsize);
+                    }
                 }
             }
         }
@@ -1262,8 +1544,9 @@ STBan(CKTcircuit *ckt, int restart)
                 if (setupfn)
                     setupfn(sensDeltaY, sg->model, ckt, &ckt->CKTnumStates);
 
+                sensNoAc[k] = 0;
                 if (stb_sens_load_ac(sg, ckt)) {
-                    dTdp_re[k][npts] = 0.0; dTdp_im[k][npts] = 0.0;
+                    sensNoAc[k] = 1;
                     k++; continue;  /* no AC load fn on this device -- dT/dp undefined, report 0 rather than garbage */
                 }
 
@@ -1324,10 +1607,17 @@ STBan(CKTcircuit *ckt, int restart)
                  * temporary instance-unlinking keeps DEVsetup/DEVacLoad
                  * from touching any sibling instance -- cktsgen.c). */
 
+                /* card #595: spMultiply writes only the rows present in
+                 * sensDeltaY's structure; clear the rest first */
+                for (i = 0; i <= size; i++) { sens_mv_re[i] = 0.0; sens_mv_im[i] = 0.0; }
                 SMPmultiply(sensDeltaY, sens_mv_re, sens_x1_re, sens_mv_im, sens_x1_im);
+                /* card #595: db/dp is zero -- .stb drops every AC source's own
+                 * stimulus (the probe injection is the only excitation), so the
+                 * device's AC-stimulus stamp in sens_dI/sens_dII is not used
+                 * (it gave Vin_acmag and the like a nonzero dT/dp before) */
                 for (i = 0; i <= size; i++) {
-                    sens_mv_re[i] = sens_dI[i] - sens_mv_re[i];
-                    sens_mv_im[i] = sens_dII[i] - sens_mv_im[i];
+                    sens_mv_re[i] = -sens_mv_re[i];
+                    sens_mv_im[i] = -sens_mv_im[i];
                 }
                 {
                     STBcplx dvv = stb_sens_dot(sens_lamv_re, sens_lamv_im, sens_mv_re, sens_mv_im, size);
@@ -1336,10 +1626,15 @@ STBan(CKTcircuit *ckt, int restart)
                     di1.re = dii.re / delta_var; di1.im = dii.im / delta_var;
                 }
 
+                for (i = 0; i <= size; i++) { sens_mv_re[i] = 0.0; sens_mv_im[i] = 0.0; }
                 SMPmultiply(sensDeltaY, sens_mv_re, sens_x2_re, sens_mv_im, sens_x2_im);
+                /* card #595: db/dp is zero -- .stb drops every AC source's own
+                 * stimulus (the probe injection is the only excitation), so the
+                 * device's AC-stimulus stamp in sens_dI/sens_dII is not used
+                 * (it gave Vin_acmag and the like a nonzero dT/dp before) */
                 for (i = 0; i <= size; i++) {
-                    sens_mv_re[i] = sens_dI[i] - sens_mv_re[i];
-                    sens_mv_im[i] = sens_dII[i] - sens_mv_im[i];
+                    sens_mv_re[i] = -sens_mv_re[i];
+                    sens_mv_im[i] = -sens_mv_im[i];
                 }
                 {
                     STBcplx dvv = stb_sens_dot(sens_lamv_re, sens_lamv_im, sens_mv_re, sens_mv_im, size);
@@ -1348,6 +1643,94 @@ STBan(CKTcircuit *ckt, int restart)
                     di2.re = dii.re / delta_var; di2.im = dii.im / delta_var;
                 }
 
+                sensD[4 * k + 0] = dv1;
+                sensD[4 * k + 1] = di1;
+                sensD[4 * k + 2] = dv2;
+                sensD[4 * k + 3] = di2;
+                k++;
+            }
+
+            ckt->CKTrhs = save_rhs; ckt->CKTirhs = save_irhs; ckt->CKTmatrix = save_matrix;
+
+            /* card #595: the bias-point term, (dY/dx)(dx_op/dp) x, by a
+             * central difference of the re-linearised matrix (see
+             * stb_rec_setp()'s block comment) */
+            if (sens_nbias > 0) {
+                double *save_rhsOld = ckt->CKTrhsOld;
+                int save_bypass = ckt->CKTbypass;
+                ckt->CKTbypass = 0;
+                for (k = 0; k < nsens; k++) {
+                    int sgn;
+                    double h = sensH[k];
+                    if ((!sensDxdp[k] && !sensJoint[k]) || sensNoAc[k]) continue;
+                    if (sensJoint[k]) {
+                        /* the joint derivative replaces the stamp difference */
+                        int q;
+                        for (q = 0; q < 4; q++) { sensD[4 * k + q].re = 0.0; sensD[4 * k + q].im = 0.0; }
+                    }
+                    for (sgn = 0; sgn < 2; sgn++) {
+                        if (sensJoint[k])
+                            stb_rec_setp(&sensRec[k], sensRec[k].value + (sgn ? -h : h), ckt);
+                        error = stb_sens_shift_load(ckt, sens_xop, sensDxdp[k], sgn ? -h : h,
+                                                    sens_bufOld, sens_dI, sens_dII, size);
+                        if (sensJoint[k])
+                            stb_rec_setp(&sensRec[k], sensRec[k].value, ckt);
+                        if (error) break;
+                        if (!sgn)
+                            for (i = 0; i <= size; i++)
+                                sens_yp1_re[i] = sens_yp1_im[i] = sens_yp2_re[i] = sens_yp2_im[i] = 0.0;
+                        if (!sgn) {
+                            SMPmultiply(ckt->CKTmatrix, sens_yp1_re, sens_x1_re, sens_yp1_im, sens_x1_im);
+                            SMPmultiply(ckt->CKTmatrix, sens_yp2_re, sens_x2_re, sens_yp2_im, sens_x2_im);
+                        } else {
+                            int pass;
+                            for (pass = 0; pass < 2; pass++) {
+                                double *yr = pass ? sens_yp2_re : sens_yp1_re;
+                                double *yi = pass ? sens_yp2_im : sens_yp1_im;
+                                STBcplx dvv, dii;
+                                for (i = 0; i <= size; i++) { sens_mv_re[i] = 0.0; sens_mv_im[i] = 0.0; }
+                                if (pass)
+                                    SMPmultiply(ckt->CKTmatrix, sens_mv_re, sens_x2_re, sens_mv_im, sens_x2_im);
+                                else
+                                    SMPmultiply(ckt->CKTmatrix, sens_mv_re, sens_x1_re, sens_mv_im, sens_x1_im);
+                                /* -(Y+ x - Y- x) / 2h */
+                                for (i = 0; i <= size; i++) {
+                                    sens_mv_re[i] = (sens_mv_re[i] - yr[i]) / (2.0 * h);
+                                    sens_mv_im[i] = (sens_mv_im[i] - yi[i]) / (2.0 * h);
+                                }
+                                dvv = stb_sens_dot(sens_lamv_re, sens_lamv_im, sens_mv_re, sens_mv_im, size);
+                                dii = stb_sens_dot(sens_lami_re, sens_lami_im, sens_mv_re, sens_mv_im, size);
+                                sensD[4 * k + 2 * pass + 0] = stb_cadd(sensD[4 * k + 2 * pass + 0], dvv);
+                                sensD[4 * k + 2 * pass + 1] = stb_cadd(sensD[4 * k + 2 * pass + 1], dii);
+                            }
+                        }
+                    }
+                    if (error) break;
+                }
+                /* back to the operating-point linearisation */
+                memcpy(ckt->CKTstate0, sens_state0, (size_t) ckt->CKTnumStates * sizeof(double));
+                ckt->CKTrhsOld = save_rhsOld;
+                ckt->CKTrhs = sens_dI; ckt->CKTirhs = sens_dII;
+                {
+                    long save_mode = ckt->CKTmode;
+                    ckt->CKTmode = (save_mode & MODEUIC) | MODEDCOP | MODEINITSMSIG;
+                    if (!error)
+                        error = CKTload(ckt);
+                    ckt->CKTmode = save_mode;
+                }
+                ckt->CKTrhs = save_rhs; ckt->CKTirhs = save_irhs;
+                ckt->CKTbypass = save_bypass;
+                if (error) { ckt->CKTcurrentAnalysis = 0; return error; }
+            }
+
+            for (k = 0; k < nsens; k++) {
+                STBcplx dv1, di1, dv2, di2, dT;
+                if (sensNoAc[k]) {
+                    dTdp_re[k][npts] = 0.0; dTdp_im[k][npts] = 0.0;
+                    continue;
+                }
+                dv1 = sensD[4 * k + 0]; di1 = sensD[4 * k + 1];
+                dv2 = sensD[4 * k + 2]; di2 = sensD[4 * k + 3];
                 /* s = 2*(i1*v2 - v1*i2) + v1 + i2
                  * ds/dp = 2*(di1*v2 + i1*dv2 - dv1*i2 - v1*di2) + dv1 + di2
                  * T = s/(1-s)  =>  dT/dp = ds/dp / (1-s)^2 */
@@ -1363,13 +1746,9 @@ STBan(CKTcircuit *ckt, int restart)
                     STBcplx denom = stb_cmul(one_minus_s, one_minus_s);
                     dT = stb_cdiv(dsdp, denom);
                 }
-
                 dTdp_re[k][npts] = dT.re;
                 dTdp_im[k][npts] = dT.im;
-                k++;
             }
-
-            ckt->CKTrhs = save_rhs; ckt->CKTirhs = save_irhs; ckt->CKTmatrix = save_matrix;
         }
 
         npts++;
@@ -1753,6 +2132,24 @@ endsweep:
     if (sens_dII) tfree(sens_dII);
     if (sens_mv_re) tfree(sens_mv_re);
     if (sens_mv_im) tfree(sens_mv_im);
+    if (sensDxdp) {
+        int kk;
+        for (kk = 0; kk < nsens; kk++)
+            if (sensDxdp[kk]) tfree(sensDxdp[kk]);
+        tfree(sensDxdp);
+    }
+    if (sensH) tfree(sensH);
+    if (sensRec) tfree(sensRec);
+    if (sensD) tfree(sensD);
+    if (sensNoAc) tfree(sensNoAc);
+    if (sensJoint) tfree(sensJoint);
+    if (sens_xop) tfree(sens_xop);
+    if (sens_bufOld) tfree(sens_bufOld);
+    if (sens_state0) tfree(sens_state0);
+    if (sens_yp1_re) tfree(sens_yp1_re);
+    if (sens_yp1_im) tfree(sens_yp1_im);
+    if (sens_yp2_re) tfree(sens_yp2_re);
+    if (sens_yp2_im) tfree(sens_yp2_im);
 
     return OK;
 }
