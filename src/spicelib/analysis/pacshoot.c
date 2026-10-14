@@ -415,6 +415,45 @@ pac_find_trig_idx(const PACstateMap *map, int trig_node_num)
 static double *g_pac_xinit = NULL;
 static int g_pac_xinit_n = 0;
 
+/* card #625: the recording passes used to inherit the PSS reltol (1e-5). Their LTE step grid then moves
+ * discretely with any parameter (measured on rd_pstb_r3d: a 1e-10 relative change of a capacitor gave a new grid
+ * every time, |T| scattered by 4e-3 rms and up to 0.15 dB, PM by 0.056 deg rms; the PSS orbit and the Newton
+ * residual were not the cause: with the orbit fixed, the recording reltol alone moved |T(fc)| by 0.7 dB at 1e-4).
+ * Rms of |T| against the recording reltol: 1e-5 4.0e-3, 1e-6 1.7e-4, 1e-7 3.8e-5, 1e-8 5.2e-7. With no pacreltol=
+ * and no PAC_RECORD_RELTOL, the recording reltol is now min(inherited, rung), the rungs 1e-8, 1e-7, 1e-6 and
+ * then the inherited value: a rung whose run stops with "timestep too small" (rd_pstb_r4d's dead-time edge at
+ * <= 1e-7) is retried at the next one, with a note. PAC_RECORD_RELTOL_AUTO=0 restores the inherited value. */
+static double g_pac_auto_reltol = 0.0;
+static int g_pac_rec_tstep = 0;   /* card #625: a recording run of this attempt stopped with E_TIMESTEP */
+/* card #625: the tighter recording reltol is for circuits without switch events. On ideal-switch decks the event
+ * corrections (#559-#586: saltation, charge jumps, fast nodes, routed jumps) were derived and validated against the
+ * perturbed-PSS references on the grid of the inherited reltol; on the 1e-8 grid two of them moved from 0.018 to
+ * 0.12 dB and three red proofs stopped failing (s134 portfolio, 2026-10-14), so those decks keep the inherited
+ * value: an ideal switch (SW, CSW) or any XSPICE code model in the circuit. */
+static int
+pac_ckt_has_events(CKTcircuit *ckt)
+{
+    int i;
+    for (i = 0; i < DEVmaxnum; i++) {
+        GENmodel *m;
+        const char *dn;
+        int ev;
+        if (!DEVices[i] || !ckt->CKThead[i])
+            continue;
+        dn = DEVices[i]->DEVpublic.name;
+        ev = dn && (!strcmp(dn, "Switch") || !strcmp(dn, "CSwitch"));
+#ifdef XSPICE
+        ev = ev || DEVices[i]->DEVpublic.cm_func != NULL;   /* a code model (DEVload is the .cm library's MIFload wrapper, not MIFload) */
+#endif
+        if (!ev)
+            continue;
+        for (m = ckt->CKThead[i]; m; m = m->GENnextModel)
+            if (m->GENinstances)
+                return 1;
+    }
+    return 0;
+}
+
 static int g_hid_nc, g_hid_nhy;   /* card #557, defined below with the hidden-state machinery */
 static int pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname);
 static int
@@ -504,6 +543,8 @@ pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
             ckt->CKTreltol = job->PACrecordReltol;
         else if (getenv("PAC_RECORD_RELTOL") && atof(getenv("PAC_RECORD_RELTOL")) > 0.0)
             ckt->CKTreltol = atof(getenv("PAC_RECORD_RELTOL"));   /* card #546: env form, tests */
+        else if (g_pac_auto_reltol > 0.0 && g_pac_auto_reltol < ckt->CKTreltol)
+            ckt->CKTreltol = g_pac_auto_reltol;                   /* card #625: default rung of the ladder */
 #ifdef XSPICE
         /* card #551/#557: stateless models: no state to carry, model time 0.  With stateful analog models the carried hidden state
          * of the converged orbit (analog CKTstate values, model time) is put back, as for a restarted shooting run. */
@@ -512,6 +553,7 @@ pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
         /* card #553: the recording pass's plot is never read; keep one point per vector (PSS_KEEP_RUN_DATA=1: old behaviour) */
         PSSdiscardRunData = !(getenv("PSS_KEEP_RUN_DATA") && atoi(getenv("PSS_KEEP_RUN_DATA")) != 0);
         err = DCtran(ckt, 1);
+        if (err == E_TIMESTEP) g_pac_rec_tstep = 1;
         PSSdiscardRunData = 0;
         ckt->CKTreltol = save_reltol;
 #ifdef XSPICE
@@ -6412,22 +6454,40 @@ int
 pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
                  const double *fT, int trig_node_num)
 {
-    int err = OK;
+    int err = OK, a;
+    static const double rungs[] = { 1e-8, 1e-7, 1e-6, 0.0 };
+    const char *ae = getenv("PAC_RECORD_RELTOL_AUTO");
+    int nr = (job->PACrecordReltol > 0.0 || (getenv("PAC_RECORD_RELTOL") && atof(getenv("PAC_RECORD_RELTOL")) > 0.0)
+              || (ae && atoi(ae) == 0) || pac_ckt_has_events(ckt)) ? 1 : (int) (sizeof rungs / sizeof rungs[0]);
 
-    if (job->PSSdoPAC && job->PACsolver == PAC_SOLVER_TD) {
-        int e = pac_td_pac(ckt, job, x0, n, T, fT, trig_node_num);
-        if (e) err = e;
-    }
-    if (job->PSSdoPSTB) {
-        int e = pac_td_pstb(ckt, job, x0, n, T, fT, trig_node_num);
-        if (e) err = e;
-    }
-    if (job->PSSdoPXF && job->PACsolver == PAC_SOLVER_TD) {
-        int e = pac_td_pxf(ckt, job, x0, n, T, fT, trig_node_num);
-        if (e) err = e;
-    }
-    if (job->PSSdoPnoise && job->PACsolver == PAC_SOLVER_TD) {
-        int e = pac_td_pnoise(ckt, job, x0, n, T, fT, trig_node_num);
+    /* card #625: each analysis runs at the first rung that completes; plots are only begun after its engine
+     * runs succeed, so a retry leaves no partial plot. The prepass state is redone at the new rung. */
+    for (a = 0; a < 4; a++) {
+        int on = (a == 0) ? (job->PSSdoPAC && job->PACsolver == PAC_SOLVER_TD)
+               : (a == 1) ? job->PSSdoPSTB
+               : (a == 2) ? (job->PSSdoPXF && job->PACsolver == PAC_SOLVER_TD)
+               : (job->PSSdoPnoise && job->PACsolver == PAC_SOLVER_TD);
+        static const char *nm[] = { "pac", "pstb", "pxf", "pnoise" };
+        int r, e = OK;
+        if (!on) continue;
+        for (r = 0; r < nr; r++) {
+            g_pac_auto_reltol = (nr > 1) ? rungs[r] : 0.0;
+            g_pac_rec_tstep = 0;
+            if (a == 0)      e = pac_td_pac(ckt, job, x0, n, T, fT, trig_node_num);
+            else if (a == 1) e = pac_td_pstb(ckt, job, x0, n, T, fT, trig_node_num);
+            else if (a == 2) e = pac_td_pxf(ckt, job, x0, n, T, fT, trig_node_num);
+            else             e = pac_td_pnoise(ckt, job, x0, n, T, fT, trig_node_num);
+            if (!e || !g_pac_rec_tstep || r + 1 >= nr || (rungs[r + 1] == 0.0 && ckt->CKTreltol <= rungs[r]))
+                break;
+            fprintf(stdout, "Note: %s: the recording pass at reltol %g stopped (timestep too small); "
+                    "retrying at %s (card #625; set pacreltol= to choose).\n", nm[a], rungs[r],
+                    rungs[r + 1] > 0.0 ? (rungs[r + 1] == 1e-7 ? "1e-7" : "1e-6") : "the simulator reltol");
+            pac_init_free();
+#ifdef XSPICE
+            pac_hid_free();
+#endif
+        }
+        g_pac_auto_reltol = 0.0;
         if (e) err = e;
     }
     pac_init_free();   /* card #542 */
