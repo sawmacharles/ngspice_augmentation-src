@@ -11,6 +11,7 @@ Modified: 2005 Paolo Nenzi - Restructured
 #include "ngspice/sperror.h"
 #include "ngspice/cpextern.h"
 #include "ngspice/fteext.h"
+#include "../devices/vsrc/vsrcdefs.h"   /* card #642 */
 
 #ifdef XSPICE
 #include "ngspice/enh.h"
@@ -22,10 +23,89 @@ static int new_gmin(CKTcircuit*, long int, long int, int);
 static int gillespie_src(CKTcircuit *, long int, long int, int);
 static int spice3_src(CKTcircuit *, long int, long int, int);
 
+/* card #642: a stage that 'converges' to node voltages far outside anything the circuit's sources can produce (or not
+ * finite) is set aside and the ladder goes on; when no later stage converges, that first result is restored, so the
+ * outcome is never worse than before.  Bound: 1e6 x max(1 V, largest |V source dc value|).  OP_ABSURD_GUARD=0 turns
+ * the guard off. */
+typedef struct { double *x, *s; long mode; int have; double vmax; } OPabsurd;
+
+static int
+op_absurd(CKTcircuit *ckt, OPabsurd *a)
+{
+    CKTnode *nd;
+    double bound;
+    if (a->vmax < 0.0) {
+        int i = CKTtypelook("Vsource");
+        GENmodel *m;
+        a->vmax = 1.0;
+        if (i >= 0)
+            for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+                GENinstance *g;
+                for (g = m->GENinstances; g; g = g->GENnextInstance)
+                    a->vmax = MAX(a->vmax, fabs(((VSRCinstance *) g)->VSRCdcValue));
+            }
+    }
+    bound = 1e6 * a->vmax;
+    for (nd = ckt->CKTnodes->next; nd; nd = nd->next)
+        if (nd->type == SP_VOLTAGE) {
+            double v = ckt->CKTrhsOld[nd->number];
+            if (!(fabs(v) <= bound))
+                return 1;
+        }
+    return 0;
+}
+
+/* returns 1 when the converged result has to be set aside (the caller then carries on down the ladder) */
+static int
+op_absurd_check(CKTcircuit *ckt, OPabsurd *a, const char *stage)
+{
+    static int off = -1;
+    int n;
+    if (off < 0) {
+        const char *e = getenv("OP_ABSURD_GUARD");
+        off = (e && !strcmp(e, "0"));
+    }
+    if (off || !op_absurd(ckt, a))
+        return 0;
+    fprintf(cp_err, "Warning: the operating point from %s has node voltages beyond %g V; trying the next step\n", stage, 1e6 * a->vmax);
+    if (!a->have) {
+        n = SMPmatSize(ckt->CKTmatrix);
+        a->x = TMALLOC(double, n + 1);
+        a->s = TMALLOC(double, ckt->CKTnumStates + 1);
+        memcpy(a->x, ckt->CKTrhsOld, (size_t) (n + 1) * sizeof(double));
+        memcpy(a->s, ckt->CKTstate0, (size_t) ckt->CKTnumStates * sizeof(double));
+        a->mode = ckt->CKTmode;
+        a->have = 1;
+    }
+    return 1;
+}
+
+static int CKTop_ladder(CKTcircuit *, long int, long int, int, OPabsurd *);
 
 int
 CKTop (CKTcircuit *ckt, long int firstmode, long int continuemode,
        int iterlim)
+{
+    OPabsurd a = { NULL, NULL, 0, 0, -1.0 };
+    int converged = CKTop_ladder(ckt, firstmode, continuemode, iterlim, &a);
+    if (converged != 0 && a.have) {
+        memcpy(ckt->CKTrhsOld, a.x, (size_t) (SMPmatSize(ckt->CKTmatrix) + 1) * sizeof(double));
+        memcpy(ckt->CKTstate0, a.s, (size_t) ckt->CKTnumStates * sizeof(double));
+        ckt->CKTmode = a.mode;
+        fprintf(cp_err, "Warning: no other step converged; keeping the operating point with node voltages beyond %g V\n",
+                1e6 * a.vmax);
+        converged = 0;
+    }
+    if (a.have) {
+        FREE(a.x);
+        FREE(a.s);
+    }
+    return converged;
+}
+
+static int
+CKTop_ladder (CKTcircuit *ckt, long int firstmode, long int continuemode,
+       int iterlim, OPabsurd *ab)
 {
     int converged;
 
@@ -44,6 +124,8 @@ CKTop (CKTcircuit *ckt, long int firstmode, long int continuemode,
             (ckt->CKTnumGminSteps <= 0) && (ckt->CKTnumSrcSteps <= 0);
 #endif
         converged = NIiter (ckt, iterlim);
+        if (converged == 0 && op_absurd_check(ckt, ab, "Newton"))
+            converged = 1;
         if (converged == 0)
             return converged;   /* successfull */
     } else {
@@ -72,6 +154,8 @@ CKTop (CKTcircuit *ckt, long int firstmode, long int continuemode,
         else {
             converged = spice3_gmin(ckt, firstmode, continuemode, iterlim);
         }
+        if (converged == 0 && op_absurd_check(ckt, ab, "gmin stepping"))
+            converged = 1;
         if (converged == 0) /* If gmin-stepping worked... move out */
             return converged;
     }
@@ -87,6 +171,8 @@ CKTop (CKTcircuit *ckt, long int firstmode, long int continuemode,
             converged = gillespie_src(ckt, firstmode, continuemode, iterlim);
         else
             converged = spice3_src(ckt, firstmode, continuemode, iterlim);
+        if (converged == 0 && op_absurd_check(ckt, ab, "source stepping"))
+            converged = 1;
         if (converged == 0) /* If gmin-stepping worked... move out */
             return converged;
     }
@@ -99,14 +185,18 @@ CKTop (CKTcircuit *ckt, long int firstmode, long int continuemode,
         fprintf(cp_err, "Error: Transient op failed, timestep too small\n\n");
     else if (converged != 0 && converged != prevconverged)
         fprintf(cp_err, "Error: Transient op failed, cause unrecorded\n\n");
-    else if (converged == 0)
+    else if (converged == 0 && !(ab->have && op_absurd_check(ckt, ab, "optran")))
             return converged;
+    else if (converged == 0)
+        converged = 1;
 
 #ifdef XSPICE
     /* gtri - wbk - add convergence problem reporting flags */
     ckt->enh->conv_debug.last_NIiter_call = MIF_FALSE;
 #endif
 
+    if (ab->have)
+        return converged;   /* card #642: CKTop restores the set-aside result */
     fprintf(cp_err, "\nError: The operating point could not be simulated successfully.\n");
     if (ft_stricterror)
         controlled_exit(1);
