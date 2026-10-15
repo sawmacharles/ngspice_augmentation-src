@@ -98,3 +98,9 @@ examples/rf/**/*.png
 
 build*/
 prof/
+
+# Visual Studio "Open Folder" (CMake)
+/out/
+.vs/
+CMakeSettings.json
+CMakeUserPresets.json
