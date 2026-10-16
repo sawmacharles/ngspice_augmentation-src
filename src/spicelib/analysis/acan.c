@@ -101,7 +101,7 @@ ACan(CKTcircuit* ckt, int restart)
                 exp(log(2.0) / job->ACnumberSteps);
             break;
         case LINEAR:
-            if (job->ACnumberSteps - 1 > 1)
+            if (job->ACnumberSteps > 1)
                 job->ACfreqDelta =
                 (job->ACstopFreq -
                     job->ACstartFreq) /

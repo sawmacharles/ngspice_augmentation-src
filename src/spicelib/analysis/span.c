@@ -425,7 +425,7 @@ SPan(CKTcircuit* ckt, int restart)
                 exp(log(2.0) / job->SPnumberSteps);
             break;
         case LINEAR:
-            if (job->SPnumberSteps - 1 > 1)
+            if (job->SPnumberSteps > 1)
                 job->SPfreqDelta =
                 (job->SPstopFreq -
                     job->SPstartFreq) /

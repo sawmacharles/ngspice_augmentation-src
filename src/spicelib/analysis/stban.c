@@ -853,7 +853,7 @@ STBan(CKTcircuit *ckt, int restart)
             job->STBfreqDelta = exp(log(2.0) / job->STBnumberSteps);
             break;
         case LINEAR:
-            if (job->STBnumberSteps - 1 > 1)
+            if (job->STBnumberSteps > 1)
                 job->STBfreqDelta = (job->STBstopFreq - job->STBstartFreq) / (job->STBnumberSteps - 1);
             else
                 job->STBfreqDelta = 0;
