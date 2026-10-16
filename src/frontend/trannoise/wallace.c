@@ -72,26 +72,39 @@ destroy_wallace(void)
 }
 
 
+static void wallace_fill(void);
+
 void
 initw(void)
 {
-    unsigned i;
-    double totsqr, nomsqr;
-    unsigned int coa;
 
     /* initialize the uniform generator */
     srand((unsigned int) getpid());
     // srand(17);
     TausSeed();
 
-    ScaleGauss = 1.;
-    newpools = 1;
-
     /* set up the two pools */
     pool1 = TMALLOC(double, n);
     pool2 = TMALLOC(double, n);
     addrif = TMALLOC(unsigned int, (n + NOTRANS));
     addrib = TMALLOC(unsigned int, (n + NOTRANS));
+
+    wallace_fill();
+}
+
+
+/* #668: refill the pools and reading addresses from the uniform generator's current state. Called by initw() and,
+   through reseedw(), whenever a seed is set (setseed, .option seed), so the Gaussian variates of transient noise
+   follow the seed instead of the process id. */
+static void
+wallace_fill(void)
+{
+    unsigned i;
+    double totsqr, nomsqr;
+    unsigned int coa;
+
+    ScaleGauss = 1.;
+    newpools = 1;
 
     /* fill the first pool with normally distributed values */
     PolarGauss(&pool1[0], &pool1[1]);
@@ -148,6 +161,15 @@ initw(void)
 
     // printf("norm for orig. Gauss: %e, chi^2 scale: %e\n", nomsqr, ScaleGauss);
     // NewWa();
+}
+
+
+/* #668: after the uniform generator has been seeded, start the Wallace pools again from it */
+void
+reseedw(void)
+{
+    if (pool1 && pool2 && addrif && addrib)
+        wallace_fill();
 }
 
 

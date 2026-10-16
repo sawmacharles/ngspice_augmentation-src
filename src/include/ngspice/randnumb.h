@@ -7,6 +7,7 @@ extern void setseedinfo(void);
 
 /* initialize random number generators */
 extern void initw(void);
+extern void reseedw(void);   /* #668 */
 
 extern void checkseed(void);    /* seed random or set by 'set rndseed=value'*/
 extern double drand(void);

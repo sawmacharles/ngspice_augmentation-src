@@ -283,6 +283,22 @@ double exprand(double mean)
 }
 
 
+/* #668: seed the uniform generator with <seed>. The transient-noise Gaussian pools (Wallace) are refilled from a
+   stream derived from the seed, and the uniform generator is then seeded again, so it is left exactly as plain seeding
+   leaves it: every other seeded draw (agauss, gauss, unif, ...) gives the same values as before this fix. */
+static void
+seed_generators(int seed)
+{
+#ifdef WaGauss
+    srand((unsigned int)seed ^ 0x5bd1e995u);
+    TausSeed();
+    reseedw();
+#endif
+    srand((unsigned int)seed);
+    TausSeed();
+}
+
+
 /* seed random number generators immediately
 * command "setseed"
 *   take value of variable rndseed as seed
@@ -299,8 +315,7 @@ com_sseed(wordlist *wl)
             newseed = getpid();
             cp_vset("rndseed", CP_NUM, &newseed);
         }
-        srand((unsigned int)newseed);
-        TausSeed();
+        seed_generators(newseed);
     }
     else if ((sscanf(wl->wl_word, " %d ", &newseed) != 1) ||
         (newseed <= 0) || (newseed > INT_MAX))
@@ -312,8 +327,7 @@ com_sseed(wordlist *wl)
         return;
     }
     else {
-        srand((unsigned int)newseed);
-        TausSeed();
+        seed_generators(newseed);
         cp_vset("rndseed", CP_NUM, &newseed);
     }
 
