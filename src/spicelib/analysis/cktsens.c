@@ -119,6 +119,9 @@ int sens_sens(CKTcircuit* ckt, int restart)
     double* output_values;
     IFcomplex* output_cvalues;
     double delta_var;
+    char *snap = NULL;          /* #672: copy of the perturbed instance or model */
+    size_t snap_size = 0, snap_cap = 0;
+    void *snap_obj = NULL;
     int    (*fn) (SMPmatrix*, GENmodel*, CKTcircuit*, int*);
     static int	is_dc;
     int k, j, n;
@@ -581,6 +584,22 @@ int sens_sens(CKTcircuit* ckt, int restart)
 
             nvalue.rValue = sg->value + delta_var;
 
+            /* #672: keep the whole instance (or model) as it is, flags included: setting a parameter also marks it
+             * given, and restoring only the value left it so (a resistor's `ac` stayed given after its perturbation,
+             * so at every later frequency its `resistance` had no effect and gave 0) */
+            if (sg->is_instparam) {
+                snap_obj = sg->instance;
+                snap_size = (size_t) *DEVices[sg->dev]->DEVinstSize;
+            } else {
+                snap_obj = sg->model;
+                snap_size = (size_t) *DEVices[sg->dev]->DEVmodSize;
+            }
+            if (snap_size > snap_cap) {
+                snap = TREALLOC(char, snap, snap_size);
+                snap_cap = snap_size;
+            }
+            memcpy(snap, snap_obj, snap_size);
+
 #ifdef ASDEBUG
             DEBUG(1)
                 printf("New value: %g\n", nvalue.rValue);
@@ -636,8 +655,7 @@ int sens_sens(CKTcircuit* ckt, int restart)
              * original value
              */
 
-            value.rValue = sg->value;
-            sens_setp(sg, ckt, &value);
+            memcpy(snap_obj, snap, snap_size);   /* #672: value and given flags as they were */
             (void)sens_temp(sg, ckt); /* XXX is this necessary? */
 
             /* Back to business . . . */
@@ -791,6 +809,7 @@ int sens_sens(CKTcircuit* ckt, int restart)
 
     }
     FREE(output_names);
+    FREE(snap);
 
     SPfrontEnd->OUTendPlot(sen_data);
 
@@ -835,7 +854,8 @@ int sens_sens(CKTcircuit* ckt, int restart)
 double
 inc_freq(double freq, int type, double step_size)
 {
-    if (type != LINEAR)
+    /* #672: the sweep type is a SENS_* value; LINEAR (3, noisedef.h) never matched it, so a lin sweep multiplied */
+    if (type != SENS_LINEAR)
         freq *= step_size;
     else
         freq += step_size;
@@ -882,8 +902,9 @@ count_steps(int type, double low, double high, int steps, double* stepsize)
         break;
 
     case SENS_LINEAR:
+        /* #672: N points from fstart to fstop, as .ac lin (the step was (fstop - fstart) / N, ending short of fstop) */
         n = steps;
-        s = (high - low) / steps;
+        s = (steps > 1) ? (high - low) / (steps - 1) : 0.0;
         break;
 
     case SENS_DECADE:
