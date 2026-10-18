@@ -154,15 +154,58 @@ Each of these gives a wrong result in stock ngspice 45.2 without an error messag
 
 ## Measured results
 
-Measured on 2026-10-08 on one 32-thread Linux workstation. The fork build was `s125`, compared
-with stock ngspice 45.2. Two threads per run, median of 5 runs (3 for the periodic part).
+Summary measured on 2026-10-08 on one 32-thread Linux workstation. The fork build was `s125`, compared
+with stock ngspice 45.2; the transient table below was re-measured on `s140`. Two threads per run, median of 5 runs (3 for the periodic part).
 
 | Task | Stock ngspice | Fork | Gain |
 |---|---|---|---|
-| Plain transient, 11 decks (PEX RC trees, switching converters, BSIM blocks) | — | same deck, same settings | 1.06x – 1.71x faster |
+| Plain transient, 11 decks (see the table below, re-measured on s140) | — | same deck, same settings | 1.06x – 1.71x faster (s140: 1.02x – 1.80x) |
 | Steady state of a switching converter (versus a transient long enough to settle) | 1.1 – 109 s | 0.3 – 37 s | 3x – 62x |
 | Control-to-output transfer function, 8 frequencies (stock: injected-tone transient sweep) | 31 – 838 s | 0.1 – 28 s | 30x – 275x |
 | Loop gain of a closed-loop buck, 14 frequencies | 144 s | 0.32 s | 450x. Same crossover (33.5 kHz) and phase margin (38.4° vs 38.45°) |
+
+### Transient speed: stock ngspice vs this fork
+
+Measured 2026-10-18 with the latest release `s140`. The same deck text was run on three
+builds: **stock** ngspice 45.2 (the current release), **base** (the unpatched upstream commit
+this fork starts from, which separates upstream changes from ours), and the **fork**. Runs
+were interleaved and rotated between builds, 5 runs per deck per build, 2 threads, one
+simulation at a time, on a 32-thread Linux workstation that had other jobs running (load 2–6).
+Wall time in seconds: median, with [min – max] below it.
+
+| Deck | What it stresses | Stock 45.2 | Base | Fork s140 | Fork vs stock | Fork vs base |
+|---|---|---|---|---|---|---|
+| e_pex_tree | 11 111-node RC tree + 60 BSIM4, KLU, 25 µs | 5.69<br>[4.17 – 14.01] | 5.69<br>[4.20 – 12.43] | **3.17**<br>[2.70 – 6.16] | **1.80x** | 1.80x |
+| c_pvt_loop | 50 temperature/corner points in one session | 3.96<br>[3.86 – 4.03] | 4.05<br>[3.91 – 4.15] | **2.29**<br>[2.23 – 2.36] | **1.73x** | 1.77x |
+| h_pex_tree_sparse | smaller RC tree + BSIM4, KLU, 20 µs | 0.70<br>[0.69 – 0.73] | 0.71<br>[0.68 – 0.76] | **0.47**<br>[0.45 – 0.49] | **1.49x** | 1.51x |
+| b_long_switch | peak-current-mode buck, behavioural switches, 20 ms (10 000 periods) | 15.87<br>[15.52 – 16.49] | 17.09<br>[16.71 – 17.46] | **11.35**<br>[11.08 – 11.99] | **1.40x** | 1.51x |
+| r3_vm_buck | voltage-mode buck, 1.5 ms | 1.45<br>[1.40 – 1.50] | 1.48<br>[1.44 – 1.52] | **1.17**<br>[1.13 – 1.22] | **1.24x** | 1.27x |
+| r4_pcm_buck | peak-current-mode buck, 6 ms | 7.73<br>[7.38 – 7.78] | 8.15<br>[7.92 – 8.26] | **6.36**<br>[6.09 – 6.43] | **1.22x** | 1.28x |
+| r3d_vm_buck_deadtime | buck with dead time, 1.5 ms, 2 ns max step | 8.55<br>[8.28 – 8.74] | 8.74<br>[8.37 – 8.92] | **7.35**<br>[7.02 – 7.51] | **1.16x** | 1.19x |
+| a_pex_buck | 12 100-node RC grid + 60 BSIM4, KLU, 25 µs | 59.04<br>[52.36 – 69.89] | 55.77<br>[46.89 – 66.72] | **53.32**<br>[52.40 – 61.40] | **1.11x** | 1.05x |
+| r7_bsim_buck | BSIM4 transistor-level buck, 400 µs | 14.59<br>[14.42 – 14.63] | 15.01<br>[14.90 – 15.22] | **13.18**<br>[12.96 – 13.54] | **1.11x** | 1.14x |
+| f_analog_block_bsim3_long | 600 BSIM3 transistors, 50 µs | 31.49<br>[30.69 – 31.99] | 31.38<br>[30.59 – 32.21] | **29.69**<br>[29.10 – 30.33] | **1.06x** | 1.06x |
+| d_analog_block_long | 300 BSIM4 transistors, 50 µs | 20.79<br>[20.31 – 21.32] | 21.89<br>[21.72 – 22.04] | **20.38**<br>[20.00 – 20.62] | **1.02x** | 1.07x |
+
+**Same answers?**
+- **Fork vs base: yes.** Every printed measurement is identical on all 11 decks (300 values),
+  and the waveforms are identical or differ by at most 1.2e-8 of their range. The speedups
+  do not change results.
+- **Fork vs fork, run to run:** identical.
+- **Fork vs stock 45.2:** printed values differ by 1.7e-6 to 1.2 % (the largest is output ripple
+  on the switching bucks). That difference comes from upstream ngspice changing between 45.2
+  and its development branch, not from this fork: base and fork are equal. Switching edges
+  land on different time steps. This table does not say which of the two is closer to the truth.
+- **c_pvt_loop is the exception.** Stock 45.2 ran all 50 points at 0 °C because of its `reset`
+  bug, while 25 points should be at 85 °C (up to 31 % difference in one ripple value). The fork
+  runs them at the right temperatures.
+
+**Reading:** the gain is largest where time goes into resistor/capacitor loading, behavioural
+sources and per-point overhead (RC trees from layout extraction, switching converters, many
+short runs): 1.2x to 1.8x. It is smallest where the time goes into the transistor model itself
+(large BSIM blocks): 2–7 %. Memory use is the same on all three builds (within 2 %). On the two
+large extracted-RC decks the min–max spread is wide because of the other jobs on the machine;
+compare their medians with that in mind.
 
 **Accuracy** was checked against an independent reference: a perturbed periodic steady state,
 which uses no small-signal code. At the frequencies checked (10, 21.4 and 100 kHz on three bucks), the fork's `.pac` is within 0.044 dB and 0.18° of it. The
