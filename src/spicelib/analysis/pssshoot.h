@@ -189,6 +189,12 @@ typedef struct {
      * of that flip (PSSsaltCont).  pacshoot.c gives such a jump the event coefficient of the flip itself (the small-signal control at the
      * event), not the one of the step it is given in. */
     int serial, cont;
+    /* card #728: a diode-fed capacitor jump of a continuation given as one lump after the diode current's own transient: the area
+     * sum_j dfdt_j (t_given - t_j) of its parts' delays (V s per unit coefficient), added to the posRow output by pacshoot.c */
+    double area_pos;
+    /* card #728: set on a flip whose node is continued as a capacitor node (#580): pacshoot.c gives its output impulse without the
+     * rows' drift (validated there only; the charge-only fast nodes of #575 keep the old impulse) */
+    int contcap;
 } PSSsaltEvent;
 
 /* card #559: set by pacshoot.c while a generic-charge td-PAC pass runs: returns the total diagonal |C| (Farads) of the node when its

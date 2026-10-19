@@ -2293,6 +2293,14 @@ typedef struct {
     int row[PSS_SALT_CONT_ROWS];        /* [0] the inductor branch; [1..] capacitor nodes behind a resistor at the node (snubber) */
     double k[PSS_SALT_CONT_ROWS];       /* d(state rate) / d(node voltage): sign / L; G / C_far */
     double il_last;                              /* inductor current at the last accepted point */
+    double il_emit;                              /* card #728: inductor current up to which the node correction has been given */
+    double far_st[PSS_SALT_CONT_ROWS];          /* card #728: sum of the pending far-current increments x their times */
+    double far_tlast;                            /* card #728: time of the last accepted point seen */
+    /* card #728: the rows the conducting diode holds together with its far node (the switch node and the diode's internal node),
+     * moved with the far node when the far capacitor's lump is given (see there) */
+    int nh, h_row[PSS_SALT_CONT_ROWS];
+    double cn_nat;                               /* card #728: native capacitance at the node */
+    double t_emit;                               /* card #728: time up to which the continuation has been given */
     double v_last, v_emit, rmax, imax, h_dot;   /* v_last: node voltage at the last accepted point; v_emit: up to where the jump has been
                                                  * given; rmax / imax: largest |dV/dt| of the node / far-capacitor rate since the event */
     double i_last[PSS_SALT_CONT_ROWS], i_emit[PSS_SALT_CONT_ROWS];   /* the same two marks for the diode currents into far capacitors */
@@ -2604,6 +2612,92 @@ pss_salt_has_snubber(CKTcircuit *ckt, int node)
     return found;
 }
 
+/* card #728: PSS_SALT_NO728=1 turns every part of card #728 off (red proof: s144 again); PSS_728_OFF=<bits> turns single parts
+ * off (diagnostics): 1 far-capacitor share, 2 node correction, 4 output impulse without drift (pacshoot.c), 8 the clamped rows
+ * moved with the far lump, 16 far-capacitor lump, 32 pre-event voltage of a capacitor node, 128 node correction always into the
+ * node, 256 the delay terms of the given parts */
+static int
+pss728_off(int bit)
+{
+    static int mask = -1;
+    if (mask < 0) mask = getenv("PSS_SALT_NO728") ? 0x7fffffff : (getenv("PSS_728_OFF") ? atoi(getenv("PSS_728_OFF")) : 0);
+    return (mask & bit) != 0;
+}
+
+/* card #728: the share of a charge impulse injected at node `far` that its capacitors take.  A diode-fed capacitor's jump (card
+ * #579) is a charge impulse dQ = dI x dt_e into the far node (the diode current switches dt_e earlier or later).  At the instant
+ * of the impulse every capacitor is a short (its voltage cannot jump by an impulse), so the impulse current divides between
+ * the capacitor branches, each with its series resistance (the output capacitor's ESR: resistors from the capacitor's other
+ * node), and the resistive paths from `far` that end without a capacitor (the load).  Only the capacitor branches' part is
+ * charge; the rest is the output impulse of card #579 (already given by pac_imp_* in pacshoot.c from the large-signal step of
+ * the output, ESR || R_load x dI).  Before card #728 the whole dQ went into the capacitor: R_load / (R_load + ESR) = 0.999
+ * on the boost / buck-boost decks, i.e. the output capacitor's jump 0.1 % too large, which at 100 kHz (above the boost's
+ * right-half-plane zero, where the inductor and capacitor paths nearly cancel) was -0.10 deg.  Returns 1 when a capacitor
+ * branch has no series resistance (grounded capacitor, or its other node held by a source or another capacitor) or when
+ * anything at the node is not R / C (not modelled: the old rule).  PSS_SALT_NO728=1 returns 1 always (red proof). */
+static const char *pss_salt_unmodelled_at(CKTcircuit *ckt, int node);
+static double
+pss_salt_far_share(CKTcircuit *ckt, int far)
+{
+    int captype = CKTtypelook("Capacitor"), restype = CKTtypelook("Resistor");
+    CAPmodel *cm; CAPinstance *ci;
+    RESmodel *rm; RESinstance *ri;
+    double gcap = 0.0, gres = 0.0;
+    int xs[8], nx = 0, k;
+    if (far <= 0 || captype < 0 || restype < 0 || pss728_off(1)) return 1.0;
+    for (cm = (CAPmodel *) ckt->CKThead[captype]; cm; cm = CAPnextModel(cm))
+        for (ci = CAPinstances(cm); ci; ci = CAPnextInstance(ci)) {
+            int x;
+            double gx = 0.0;
+            CAPmodel *cm2; CAPinstance *ci2;
+            VSRCmodel *vm; VSRCinstance *vi;
+            int vt = CKTtypelook("Vsource");
+            if (ci->CAPposNode != far && ci->CAPnegNode != far) continue;
+            x = ci->CAPposNode == far ? ci->CAPnegNode : ci->CAPposNode;
+            if (x <= 0 || x == far || nx >= 8) return 1.0;
+            for (cm2 = (CAPmodel *) ckt->CKThead[captype]; cm2; cm2 = CAPnextModel(cm2))   /* another capacitor at x: x holds */
+                for (ci2 = CAPinstances(cm2); ci2; ci2 = CAPnextInstance(ci2))
+                    if (ci2 != ci && (ci2->CAPposNode == x || ci2->CAPnegNode == x)) return 1.0;
+            if (vt >= 0)
+                for (vm = (VSRCmodel *) ckt->CKThead[vt]; vm; vm = VSRCnextModel(vm))
+                    for (vi = VSRCinstances(vm); vi; vi = VSRCnextInstance(vi))
+                        if (vi->VSRCposNode == x || vi->VSRCnegNode == x) return 1.0;
+            for (rm = (RESmodel *) ckt->CKThead[restype]; rm; rm = RESnextModel(rm))
+                for (ri = RESinstances(rm); ri; ri = RESnextInstance(ri)) {
+                    int o;
+                    if (ri->RESposNode != x && ri->RESnegNode != x) continue;
+                    o = ri->RESposNode == x ? ri->RESnegNode : ri->RESposNode;
+                    if (o == far || o == x) continue;
+                    gx += ri->RESconduct;
+                }
+            if (gx <= 0.0) return 1.0;
+            gcap += gx; xs[nx++] = x;
+        }
+    if (gcap <= 0.0) return 1.0;
+    /* every device at far other than capacitors, resistors and the diodes / switches (they carry the injected current or are
+     * open) is outside this rule */
+    if (pss_salt_unmodelled_at(ckt, far)) return 1.0;
+    {   /* a source at far holds it: the old rule */
+        int vt = CKTtypelook("Vsource");
+        VSRCmodel *vm; VSRCinstance *vi;
+        if (vt >= 0)
+            for (vm = (VSRCmodel *) ckt->CKThead[vt]; vm; vm = VSRCnextModel(vm))
+                for (vi = VSRCinstances(vm); vi; vi = VSRCnextInstance(vi))
+                    if (vi->VSRCposNode == far || vi->VSRCnegNode == far) return 1.0;
+    }
+    for (rm = (RESmodel *) ckt->CKThead[restype]; rm; rm = RESnextModel(rm))
+        for (ri = RESinstances(rm); ri; ri = RESnextInstance(ri)) {
+            int o, isx = 0;
+            if (ri->RESposNode != far && ri->RESnegNode != far) continue;
+            o = ri->RESposNode == far ? ri->RESnegNode : ri->RESposNode;
+            if (o == far) continue;
+            for (k = 0; k < nx; k++) if (xs[k] == o) isx = 1;
+            if (isx) continue;
+            gres += ri->RESconduct;
+        }
+    return gcap / (gcap + gres);
+}
+
 /* card #579: the capacitor nodes a diode at `node` feeds (boost: the output capacitor behind the output diode).  The diode current
  * into such a node changes by a finite amount at the event, so that capacitor's rate jumps by (i_D now - i_D before) / C_far.  Fills
  * rows[] / dfdt[] (rate jumps, to be scaled by the event coefficient like every other jump); returns the count. */
@@ -2625,7 +2719,7 @@ pss_salt_diode_far(CKTcircuit *ckt, int node, int *rows, double *i_now, double *
             if (far <= 0 || far == node || n >= maxn) continue;
             cf = pss_salt_local_cap(ckt, far);
             if (cf <= 0.0) continue;
-            rows[n] = far; cfar[n] = cf;
+            rows[n] = far; cfar[n] = cf / pss_salt_far_share(ckt, far);   /* card #728: only the capacitors' share of the impulse */
             i_now[n] = sg * ckt->CKTstate0[di->DIOcurrent]; i_prev[n] = sg * ckt->CKTstate1[di->DIOcurrent];
             n++;
         }
@@ -2855,11 +2949,21 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
                 for (di = DIOinstances(dm); di; di = DIOnextInstance(di))
                     if (di->DIOposNode == node && di->DIOposPrimeNode != di->DIOposNode) dio_rs = 1;
         if (getenv("PSS_SALT_NO579")) handover = dio_rs = 0;   /* red proof: the s118 choice */
+        {   /* card #728: a node with a native capacitor cannot jump: its voltage at the previous accepted point is the pre-event
+             * voltage (up to the drift over the located event step, ps).  The node equation was 0.23 V off there on the inverting
+             * buck-boost with a charged diode (cathode at the node, cj 100 pF + tt 2 ns, 1 nF): the turn-on jump 1.15 % short. */
+            PSSsaltModelCapHookFn hk3_ = PSSsaltModelCapHook;
+            int nat3_;
+            PSSsaltModelCapHook = NULL; nat3_ = pss_salt_local_cap(ckt, node) > 0.0; PSSsaltModelCapHook = hk3_;
+            if (nat3_ && !pss728_off(32)) dio_rs = 1;
+        }
         if (other || handover || dio_rs || g_salt_use_vbefore || getenv("PSS_SALT_VBEFORE"))
             V_prev = v_before;
     }
 
     dV = V_now - V_prev;
+    if (getenv("PSS_SALT_TRACE"))   /* card #728 diagnostics */
+        fprintf(stderr, "SALT-IND t=%.12g node %d V_prev %.9g V_now %.9g v_before %.9g I_L %.9g\n", ckt->CKTtime, node, V_prev, V_now, v_before, I_L);
     *out_djump = (double) found_sign * dV / found->INDinduct;
     g_salt_ind_k = (double) found_sign / found->INDinduct; g_salt_ind_dv = dV;   /* card #575 */
     *out_row = found->INDbrEq;
@@ -3076,6 +3180,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             int fr_[PSS_SALT_CONT_ROWS], nf_, k_, flips = 0, emit, final = 0;
             double i0_[PSS_SALT_CONT_ROWS], i1_[PSS_SALT_CONT_ROWS], cf_[PSS_SALT_CONT_ROWS];
             double v, v_to, rate = 0.0, irate = 0.0;
+            int far_act = 0;   /* card #728: the diode current into the far capacitor is still in its own transient */
             if (!c->active) continue;
             if (cont_off) { c->active = 0; continue; }
             {   /* does a switch at this node flip in this step? */
@@ -3099,6 +3204,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 for (k_ = 0; k_ < nf_; k_++) {
                     double r_ = fabs(i0_[k_] - c->i_last[k_]) / (dt_actual > 0.0 ? dt_actual : 1.0);
                     if (r_ > irate) irate = r_;
+                    c->far_st[k_] += (i0_[k_] - c->i_last[k_]) * ckt->CKTtime;   /* card #728 */
                     c->i_last[k_] = i0_[k_];
                 }
                 {   /* the diode current into a far capacitor is still in its own transient (turn-on, reverse recovery) while it moves
@@ -3106,17 +3212,31 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                     double il = ckt->CKTrhsOld[c->row[0]];
                     double ilrate = fabs(il - c->il_last) / (dt_actual > 0.0 ? dt_actual : 1.0);
                     c->il_last = il;
+                    far_act = nf_ > 0 && irate > 10.0 * ilrate && irate > 0.0;
                     emit = (rate > (c->natcap ? frac_cap : frac) * c->rmax && fabs(v - c->v_last) > 1e-9) || (nf_ > 0 && irate > 10.0 * ilrate && irate > 0.0);
                 }
                 c->v_last = v; v_to = v;
                 for (k_ = 0; k_ < c->nsn; k_++) c->sn_far_last[k_] = ckt->CKTrhsOld[c->sn_row[k_]];
+                c->far_tlast = ckt->CKTtime;   /* card #728 */
                 c->steps++;
                 if (emit) c->quiet = 0;
                 else if (++c->quiet >= 2) { emit = 1; final = 1; }
+                if (!emit && c->natcap && !pss728_off(16))   /* card #728: a lump of far-current increments waits: give it now */
+                    for (k_ = 0; k_ < nf_; k_++) if (i0_[k_] != c->i_emit[k_]) emit = 1;
             }
             if (emit) {
                 double dv = v_to - c->v_emit;
                 int any = 0;
+                int clamp_ = 0;   /* card #728: the node is 0 free, 1 held by its diode (conducting), 2 held by a switch that is on */
+                double tg_ = flips ? c->far_tlast : ckt->CKTtime, hw_ = tg_ - c->t_emit;   /* card #728: the span of what is given now */
+                if (c->natcap && !pss728_off(128)) {
+                    SWmodel *m3_; SWinstance *h3_;
+                    for (m3_ = (SWmodel *) ckt->CKThead[swtype]; m3_; m3_ = SWnextModel(m3_))
+                        for (h3_ = SWinstances(m3_); h3_; h3_ = SWnextInstance(h3_))
+                            if ((h3_->SWposNode == c->node || h3_->SWnegNode == c->node) && pss_salt_is_on(ckt->CKTstate0[h3_->SWswitchstate]))
+                                clamp_ = 2;
+                    if (!clamp_ && nf_ > 0 && fabs(i0_[0]) > 0.1 * fabs(c->il_last)) clamp_ = 1;
+                }
                 if (dv != 0.0 && n < max) {
                     memset(&ev[n], 0, sizeof ev[n]);
                     ev[n].posNode = c->node;
@@ -3125,18 +3245,110 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                     ev[n].name = c->name; ev[n].posF = 1; ev[n].serial = c->serial; ev[n].cont = 1;
                     n++; any = 1;
                     c->v_emit = v_to;
+                    if (c->natcap && !pss728_off(256) && hw_ > 0.0 && clamp_ != 2 && n < max) {
+                        /* card #728: the inductor's part accrued over the span hw_ (the node voltage moved through it) but is given at
+                         * its end: for hw_ / 2 on average the inductor's deviation did not flow into the node.  Its charge,
+                         * -dv hw_ / (2 L) (both signs of the inductor), is given to the node (free) or to the far capacitor (node held
+                         * by the conducting diode).  At 200 points the slew of the buck-boost takes 3.3 ns steps: without it the
+                         * output capacitor's charge was 0.2 % off.  PSS_728_OFF=256 leaves out both delay terms. */
+                        double dq_ = -dv * hw_ * fabs(c->k[0]) / 2.0;
+                        memset(&ev[n], 0, sizeof ev[n]);
+                        ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                        ev[n].name = c->name; ev[n].posF = 1; ev[n].serial = c->serial; ev[n].cont = 1;
+                        if (clamp_ == 0) { ev[n].posNode = ev[n].posRow = c->node; ev[n].posQ = 1; ev[n].dqdt_pos = dq_; n++; }
+                        else if (nf_ > 0) { ev[n].posNode = ev[n].posRow = fr_[0]; ev[n].dfdt_pos = dq_ / cf_[0]; n++; }
+                    }
                 }
                 for (k_ = 0; k_ < nf_ && n < max; k_++) {
                     double di_ = i0_[k_] - c->i_emit[k_];
                     if (di_ == 0.0) continue;
-                    memset(&ev[n], 0, sizeof ev[n]);
-                    ev[n].posNode = fr_[k_];
-                    ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
-                    ev[n].posRow = fr_[k_]; ev[n].dfdt_pos = di_ / cf_[k_];
+                    /* card #728: while the diode current into the far capacitor is in its own fast transient (turn-on, reverse
+                     * recovery) the far capacitor's jump is held back and given as one lump when the transient is over.  Given step
+                     * by step, its large intermediate parts (up to 100 x the final one in a reverse recovery: the current swings to
+                     * -106 A and back) moved the far node while the junction and the switch node, which the continuation does not
+                     * shift, stayed: the linearised diode then carried a spurious current between them (boost, cj 100 pF + tt 2 ns,
+                     * 1 nF: the output capacitor's jump at the turn-on 30 % too large).  The delay of the parts is given to the
+                     * output as the area sum_j dI_j / C (t_lump - t_j) (pacshoot.c).  PSS_728_OFF=16: step by step again. */
+                    if (far_act && !final && c->natcap && !pss728_off(16)) continue;
+                    {   /* card #728: a lump given while the diode conducts moves the rows the diode holds with the far node (the switch
+                         * node, the diode's internal node) by the same amount: given at the far node alone it set the stiff diode-clamped
+                         * node against it and the trapezoidal rule rang (buck-boost at 200 points: +-1.3 % of the output's deviation, step
+                         * to step, for the rest of the period).  The node's own capacitor takes its share of the charge.  PSS_728_OFF=8:
+                         * the far node alone. */
+                        double dff_ = di_ / cf_[k_];
+                        if (k_ == 0 && c->natcap && c->nh > 0 && !pss728_off(8) && fabs(i0_[0]) > 0.1 * fabs(c->il_last) && n + c->nh < max) {
+                            int j_;
+                            dff_ = di_ / (cf_[k_] + c->cn_nat);
+                            for (j_ = 0; j_ < c->nh; j_++) {
+                                memset(&ev[n], 0, sizeof ev[n]);
+                                ev[n].posNode = c->h_row[j_];
+                                ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                                ev[n].posRow = c->h_row[j_]; ev[n].dfdt_pos = dff_;
+                                ev[n].name = c->name; ev[n].posF = 1; ev[n].serial = c->serial; ev[n].cont = 1;
+                                n++;
+                            }
+                        }
+                        memset(&ev[n], 0, sizeof ev[n]);
+                        ev[n].posNode = fr_[k_];
+                        ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                        ev[n].posRow = fr_[k_]; ev[n].dfdt_pos = dff_;
+                    }
                     ev[n].name = c->name; ev[n].posF = 1; ev[n].serial = c->serial; ev[n].cont = 1;   /* the diode's own charge at its far node is no obstacle to a jump of the native capacitor there */
+                    {   /* card #728: area of the lump's delays (0 for a part given in its own step) */
+                        double tg_ = flips ? c->far_tlast : ckt->CKTtime;
+                        ev[n].area_pos = (c->natcap && !pss728_off(16)) ? (di_ * tg_ - c->far_st[k_]) / di_ * ev[n].dfdt_pos : 0.0;
+                        if (fabs(ev[n].area_pos) < 1e-12 * fabs(ev[n].dfdt_pos) * (dt_actual > 0.0 ? dt_actual : 1.0)) ev[n].area_pos = 0.0;
+                    }
                     n++; any = 1;
                     c->i_emit[k_] = i0_[k_];
+                    c->far_st[k_] = 0.0;
                 }
+                if (c->natcap && n < max && !pss728_off(2)) {
+                    /* card #728: a capacitor node treated as fast (#580).  The continuation gives the inductor and the fed capacitor
+                     * the node's own large-signal transition, i.e. it takes the perturbed node to be the nominal one shifted by dt_e:
+                     * dv = -v'(t) dt_e.  That is a solution of the linearised node equation C dv' = di_L - G dv only while the current
+                     * that drives the node is constant; with the inductor current I(t) changing during the slew the exact deviation is
+                     * -v'(t) dt_e + dt_e (I(t) - I(t_e)) / C (at the event both are the capacitor jump -I(t_e) dt_e / C of the bump; the
+                     * bump then stays at its event value while the shifted slew follows I(t)).  The difference is given here as a jump of
+                     * the node's own capacitor, dt_e x dI / C, with dI the inductor current's change since the last one given; the
+                     * recursion carries it to the inductor and, through the diode, to the output capacitor (whose charge then totals
+                     * I(t_e) dt_e, the bump's, instead of the diode's end current).  Given as a charge jump (card #559's machinery:
+                     * dy = C^-1 dQ over the charge-coupled rows), since a charged diode's junction at the node is part of its
+                     * capacitance.  Boost with 1 nF at the node: the inductor jump
+                     * 4e-4 too large without it.  PSS_SALT_NO728=1 leaves it out (red proof). */
+                    double din_ = (c->k[0] > 0.0 ? -1.0 : 1.0) * (c->il_last - c->il_emit);
+                    /* a node held by its conducting diode passes the charge straight on to the far capacitor: given there (as a
+                     * charge into the node it excited the stiff diode-clamped node, which rang under the trapezoidal rule, +-2.5 % of
+                     * the output's deviation step to step on the buck-boost at 200 points); a node held by a switch passes it to
+                     * the switch's other terminal: nothing is given.  PSS_728_OFF=128: always into the node. */
+                    if (din_ != 0.0 && clamp_ == 1 && n < max) {
+                        memset(&ev[n], 0, sizeof ev[n]);
+                        ev[n].posNode = fr_[0];
+                        ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                        ev[n].posRow = fr_[0]; ev[n].dfdt_pos = -din_ / cf_[0];
+                        ev[n].name = c->name; ev[n].posF = 1; ev[n].serial = c->serial; ev[n].cont = 1;
+                        n++; any = 1;
+                    } else if (din_ != 0.0 && clamp_ == 0) {   /* a free node: as a charge (its capacitance includes a diode's junction there: cj, tt x gd) */
+                        if (!pss728_off(256) && hw_ > 0.0 && c->cn_nat > 0.0 && n + 1 < max) {
+                            /* card #728: the correction accrued over hw_ but is given at its end: the inductor misses its voltage for
+                             * hw_ / 2 on average, -k dI hw_ / (2 C) as a routed jump of the inductor */
+                            memset(&ev[n], 0, sizeof ev[n]);
+                            ev[n].posNode = c->node;
+                            ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                            ev[n].posRow = c->row[0]; ev[n].dfdt_pos = -c->k[0] * din_ * hw_ / (2.0 * c->cn_nat);
+                            ev[n].name = c->name; ev[n].posF = 1; ev[n].serial = c->serial; ev[n].cont = 1;
+                            n++;
+                        }
+                        memset(&ev[n], 0, sizeof ev[n]);
+                        ev[n].posNode = c->node;
+                        ev[n].posCntrl = c->posCntrl; ev[n].negCntrl = c->negCntrl; ev[n].h_dot = c->h_dot;
+                        ev[n].posRow = c->node; ev[n].posQ = 1; ev[n].dqdt_pos = -din_;
+                        ev[n].name = c->name; ev[n].posF = 1; ev[n].serial = c->serial; ev[n].cont = 1;
+                        n++; any = 1;
+                    }
+                    c->il_emit = c->il_last;
+                }
+                c->t_emit = tg_;   /* card #728 */
                 for (k_ = 0; final && k_ < c->nsn && n < max; k_++) {   /* card #713: the snubber capacitors, once */
                     double vf_ = flips ? c->sn_far_last[k_] : ckt->CKTrhsOld[c->sn_row[k_]];
                     double dd_ = (v_to - vf_) - c->sn_d0[k_];
@@ -3369,6 +3581,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
             ev[n].dfdt_neg = dfdt_neg;
             ev[n].name = here->SWname;
             ev[n].serial = ++g_salt_serial; ev[n].cont = 0;   /* card #713 */
+            ev[n].area_pos = 0.0; ev[n].contcap = 0;   /* card #728 */
             ev[n].posQ = ev[n].negQ = 0;
             ev[n].posF = ev[n].negF = 0;
             ev[n].dqdt_pos = ev[n].dqdt_neg = 0.0;
@@ -3402,6 +3615,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                     int rt_ = CKTtypelook("Resistor");
                     RESmodel *rm_; RESinstance *ri_;
                     int nfar = 0, far_row[PSS_SALT_CONT_ROWS];
+                    int far_lumped = 0;   /* card #728: the event step's far-capacitor jump goes into the continuation's lump */
                     double far_i0[PSS_SALT_CONT_ROWS], far_i1[PSS_SALT_CONT_ROWS], far_cf[PSS_SALT_CONT_ROWS];
                     if (!(side ? routed_neg : routed_pos) || (side ? ev[n].negQ : ev[n].posQ)) continue;
                     if (rt_ >= 0 && !getenv("PSS_SALT_NOSNUB"))
@@ -3444,9 +3658,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                                 }
                             }
                     nfar = pss_salt_diode_far(ckt, nd, far_row, far_i0, far_i1, far_cf, PSS_SALT_CONT_ROWS - 1);
-                    for (ic = 0; ic < nfar && n_extra < PSS_SALT_MAX_EVENTS; ic++) {
-                        extra_row[n_extra] = far_row[ic]; extra_dfdt[n_extra] = (far_i0[ic] - far_i1[ic]) / far_cf[ic]; n_extra++;
-                    }
+                    far_lumped = 0;   /* card #728 */
                     for (ic = 0; ic < PSS_SALT_CONT_MAX; ic++) {
                         if (g_salt_cont[ic].active && g_salt_cont[ic].node == nd) g_salt_cont[ic].active = 0;   /* a new event at the node supersedes */
                         if (!g_salt_cont[ic].active && slot < 0) slot = ic;
@@ -3474,7 +3686,30 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                         c->k[0] = side ? k_neg : k_pos; c->h_dot = h_dot; c->name = here->SWname; c->serial = ev[n].serial;
                         c->v_last = c->v_emit = ckt->CKTrhsOld[nd];
                         c->il_last = ckt->CKTrhsOld[c->row[0]];
+                        c->il_emit = c->il_last;   /* card #728 */
+                        c->nh = 0; c->cn_nat = 0.0; c->t_emit = ckt->CKTtime;
+                        if (c->natcap) ev[n].contcap = 1;   /* card #728: the flip's impulse window (pacshoot.c) */
+                        if (c->natcap) {   /* card #728: the rows held with the far node by the conducting diode */
+                            int dt_ = CKTtypelook("Diode");
+                            DIOmodel *dm_; DIOinstance *di_;
+                            PSSsaltModelCapHookFn hk4_ = PSSsaltModelCapHook;
+                            PSSsaltModelCapHook = NULL; c->cn_nat = pss_salt_local_cap(ckt, nd); PSSsaltModelCapHook = hk4_;
+                            c->h_row[c->nh++] = nd;
+                            if (dt_ >= 0)
+                                for (dm_ = (DIOmodel *) ckt->CKThead[dt_]; dm_; dm_ = DIOnextModel(dm_))
+                                    for (di_ = DIOinstances(dm_); di_; di_ = DIOnextInstance(di_)) {
+                                        if (di_->DIOposNode != nd && di_->DIOnegNode != nd) continue;
+                                        if (di_->DIOposPrimeNode > 0 && di_->DIOposPrimeNode != di_->DIOposNode && c->nh < PSS_SALT_CONT_ROWS)
+                                            c->h_row[c->nh++] = di_->DIOposPrimeNode;
+                                    }
+                        }
+                        for (ic = 0; ic < PSS_SALT_CONT_ROWS; ic++) c->far_st[ic] = 0.0;
+                        c->far_tlast = ckt->CKTtime;
                         for (ic = 0; ic < nfar; ic++) { c->row[1 + ic] = far_row[ic]; c->i_last[ic] = c->i_emit[ic] = far_i0[ic]; }
+                        if (c->natcap && !pss728_off(16)) {   /* card #728: the event step's part of the far current joins the lump */
+                            for (ic = 0; ic < nfar; ic++) { c->i_emit[ic] = far_i1[ic]; c->far_st[ic] = (far_i0[ic] - far_i1[ic]) * ckt->CKTtime; }
+                            far_lumped = 1;
+                        }
                         c->rmax = fabs(dv) / (dt_actual > 0.0 ? dt_actual : 1.0);
                         c->imax = 0.0;
                         c->nsn = nsn;   /* card #713 */
@@ -3488,6 +3723,9 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                                     "the snubber capacitor's jump is given when the node's transition has ended (card #713).\n", NODENAME(ckt, nd));
                         }
                         nsn = 0;
+                    }
+                    for (ic = 0; !far_lumped && ic < nfar && n_extra < PSS_SALT_MAX_EVENTS; ic++) {
+                        extra_row[n_extra] = far_row[ic]; extra_dfdt[n_extra] = (far_i0[ic] - far_i1[ic]) / far_cf[ic]; n_extra++;
                     }
                     for (ic = 0; ic < nsn && n_extra < PSS_SALT_MAX_EVENTS; ic++) {   /* card #713: no continuation slot: the chargeless jump */
                         extra_row[n_extra] = sn_row[ic]; extra_dfdt[n_extra] = sn_k[ic] * dv; n_extra++;

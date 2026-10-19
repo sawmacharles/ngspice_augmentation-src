@@ -702,6 +702,8 @@ static PACc *g_pac_first_y = NULL;
 static double g_pac_first_t = 0.0;
 static int g_pac_have_first = 0;
 static int g_pac_xls_have;   /* card #579, defined with pac_imp_roll() */
+static int g_iw_on; static double g_pt1, g_pt2;   /* card #728, defined with pac_imp_step() */
+static void pac_iw_flush(int neq, int M);
 
 /* ------------------------------------------------------------------ */
 /* card #504: TRAJECTORY RECORDER for the true-adjoint `.pxf ... adjoint=1`
@@ -978,6 +980,7 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
         memset(g_pac_first_y, 0, (size_t) (neq + 1) * M * sizeof(PACc));
     }
     g_pac_xls_have = 0;
+    g_iw_on = 0; g_pt1 = g_pt2 = -1.0;   /* card #728 */
     g_pac_have_first = 0;
     g_pac_first_t = 0.0;
     for (m = 0; m < M; m++) {
@@ -2096,8 +2099,9 @@ pac_salt_qjump_prepare(const PSSsaltEvent *ev, int n_ev, int neq, int M, PACc **
     for (m = 0; m < M; m++)
         for (i = 0; i < n_ev; i++) {
             const PSSsaltEvent *e = &ev[i];
-            PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m), Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
-            PACc coeff = pc_scale(pc_sub(Sp, Sn), 1.0 / e->h_dot);
+            PACc coeff;
+            if (!e->posQ && !e->negQ) continue;
+            coeff = pac_salt_coeff(e, m, M);   /* card #728: a continuation's charge jump takes its flip's coefficient (#713) */
             if (e->posQ && e->posRow > 0)
                 dq[(size_t) e->posRow * M + m] = pc_add(dq[(size_t) e->posRow * M + m], pc_scale(coeff, e->dqdt_pos));
             if (e->negQ && e->negRow > 0)
@@ -2368,6 +2372,9 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                 PACc coeff = pac_salt_coeff(e, m, M);   /* card #713 */
                 djump[i_salt][0] = pc_scale(coeff, e->dfdt_pos);
                 djump[i_salt][1] = pc_scale(coeff, e->dfdt_neg);
+                if (e->area_pos != 0.0 && e->posRow > 0 && g_pac_demod_active && g_pac_demod)   /* card #728: the lump's delays */
+                    g_pac_demod[(size_t) (e->posRow - 1) * M + m] = pc_add(g_pac_demod[(size_t) (e->posRow - 1) * M + m],
+                                                                          pc_scale(pc_mul(coeff, pc_conjexp(g_pac_omega[m] * ckt->CKTtime)), e->area_pos));
             }
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 const PSSsaltEvent *e = &salt_ev[i_salt];
@@ -2459,6 +2466,7 @@ static int g_pac_xls_n = 0, g_pac_xls_have = 0;
 static int g_imp_on = 0, g_imp_pc = 0, g_imp_nc = 0, g_imp_nx = 0, g_imp_x[4 * PSS_SALT_MAX_EVENTS];
 static double g_imp_hdot = 0.0;
 static int g_imp_serial = 0, g_imp_cont = 0;   /* card #713: the flip the impulse belongs to (a continuation step takes its coefficient) */
+static int g_imp_contcap = 0;   /* card #728: the flip's node is continued as a capacitor node */
 
 /* card #581, #711: discontinuous conduction.  When an inductor's current runs out, the diode that carried it stops conducting somewhere
  * inside an accepted step; no switch flips and the step control does not treat it as an event.  Until card #711 the result of a DCM buck
@@ -2527,7 +2535,8 @@ pac_imp_note(const PSSsaltEvent *ev, int n_ev)
             return;
         }
         g_imp_pc = ev[i].posCntrl; g_imp_nc = ev[i].negCntrl; g_imp_hdot = ev[i].h_dot; g_imp_on = 1;
-        if (i == 0) { g_imp_serial = ev[i].serial; g_imp_cont = ev[i].cont; }
+        if (i == 0) { g_imp_serial = ev[i].serial; g_imp_cont = ev[i].cont; g_imp_contcap = 0; }
+        if (ev[i].contcap) g_imp_contcap = 1;   /* card #728 */
         /* capacitor-node jump rows at the switch's own power nodes (native capacitor or charge jump): excluded */
         if (ev[i].dG == 0.0) continue;   /* a continuation or a far-capacitor row of the same flip, not the switch itself */
         if (ev[i].posRow > 0 && ev[i].posRow == ev[i].posNode && !ev[i].posF) g_imp_x[g_imp_nx++] = ev[i].posRow;
@@ -2570,6 +2579,124 @@ pac_imp_roll(CKTcircuit *ckt, int neq)
      * of the same event: their change is given with the next continuation event or its final flush) */
     if (g_pac_xls_prev && (!g_pac_xls_have || g_imp_on || !PSSsaltContActive())) {
         memcpy(g_pac_xls_prev, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double)); g_pac_xls_have = 1;
+    }
+}
+
+/* card #728: the output impulse of a continued (fast-node) event, without the outputs' smooth drift.  pac_imp_apply() gives
+ * J x coeff x exp(-j w t) with J the large-signal change of each row across the event step and across each continuation step (and
+ * across the quiet steps lumped into the final flush).  Over a continuation (5-15 ns on a boost with 1-3 nF at the node) J holds,
+ * besides the discontinuity, the row's smooth drift: the output capacitor discharging into the load during the slew (-3.5e4 V/s),
+ * charging after the diode's turn-on (+4.5e4 V/s) -- 2-3 % of the 15 mV ESR step on the boost with 1 nF.  That drift is no impulse:
+ * the perturbed solution has the same drift (the output does not see the switch node while the diode is off), and after the
+ * transition the changed drift is carried by the state jumps.  In the shifted-solution picture the impulse of a row is
+ * -dt_e x (J - drift), drift = the row's pre-event rate before the row's discontinuity and its post-transition rate after it.  The
+ * records of a continuation window (one per accepted step, with its time) are kept until the window closes; then each row's
+ * discontinuity step is located (largest change beyond the pre-event drift), the drift is removed and the impulse given at the
+ * records' own times with the event's coefficient.  Only for a flip whose node is continued as a capacitor node (#580, validated
+ * against tools/pac_exact.py); on the charge-only fast nodes of the bucks (#575) it moved the result away from the perturbed-PSS
+ * references (R6od 100 kHz: -0.014 dB / +0.06 deg, DCM with a snubber 1.8 deg), so they keep every J as before.  PSS_SALT_NO728=1 gives
+ * every J as before. */
+#define PAC_IW_REC 512
+static int g_iw_on = 0, g_iw_n = 0, g_iw_neq = 0, g_iw_M = 0, g_iw_nx = 0, g_iw_x[4 * PSS_SALT_MAX_EVENTS];
+static double *g_iw_J = NULL, *g_iw_pre = NULL, *g_iw_xlast = NULL, g_iw_t[PAC_IW_REC], g_iw_h[PAC_IW_REC], g_iw_tlast = 0.0;
+static PACc *g_iw_coeff = NULL;
+static double *g_px1 = NULL, *g_px2 = NULL, g_pt1 = -1.0, g_pt2 = -1.0;   /* the two previous accepted points */
+static int g_px_n = 0;
+
+static void
+pac_iw_flush(int neq, int M)
+{
+    int r, j, m, k, js;
+    if (!g_iw_on) return;
+    g_iw_on = 0;
+    if (g_iw_n <= 0 || neq != g_iw_neq || M != g_iw_M) return;
+    for (r = 1; r <= neq; r++) {
+        double pre = g_iw_pre[r], post = g_iw_h[g_iw_n - 1] > 0.0 ? g_iw_J[(size_t) (g_iw_n - 1) * (neq + 1) + r] / g_iw_h[g_iw_n - 1] : 0.0;
+        double best = -1.0;
+        int skip = 0;
+        for (k = 0; k < g_iw_nx; k++) if (g_iw_x[k] == r) skip = 1;
+        if (skip) continue;
+        if (g_iw_n == 1) post = pre;
+        js = 0;
+        for (j = 0; j < g_iw_n; j++) {
+            double d = fabs(g_iw_J[(size_t) j * (neq + 1) + r] - pre * g_iw_h[j]);
+            if (d > best) { best = d; js = j; }
+        }
+        for (j = 0; j < g_iw_n; j++) {
+            double drift = j < js ? pre * g_iw_h[j] : (j > js ? post * g_iw_h[j] : 0.5 * (pre + post) * g_iw_h[j]);
+            double Jr = g_iw_J[(size_t) j * (neq + 1) + r] - drift;
+            size_t idx = (size_t) (r - 1) * M;
+            if (Jr == 0.0) continue;
+            for (m = 0; m < M; m++)
+                g_pac_demod[idx + m] = pc_add(g_pac_demod[idx + m], pc_scale(pc_mul(g_iw_coeff[m], pc_conjexp(g_pac_omega[m] * g_iw_t[j])), Jr));
+        }
+    }
+}
+
+static void
+pac_iw_record(CKTcircuit *ckt, int neq, double t)
+{
+    int r;
+    if (g_iw_n >= PAC_IW_REC) {   /* a very long window: give what there is and go on with a new chunk (same event) */
+        pac_iw_flush(neq, g_iw_M);
+        g_iw_on = 1; g_iw_n = 0;
+    }
+    for (r = 0; r <= neq; r++) g_iw_J[(size_t) g_iw_n * (neq + 1) + r] = r ? ckt->CKTrhsOld[r] - g_iw_xlast[r] : 0.0;
+    g_iw_t[g_iw_n] = t; g_iw_h[g_iw_n] = t - g_iw_tlast; g_iw_n++;
+    memcpy(g_iw_xlast, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double)); g_iw_tlast = t;
+}
+
+/* one accepted step of the impulse bookkeeping (replaces pac_imp_apply + pac_imp_roll when card #728 is on) */
+static void
+pac_imp_step(CKTcircuit *ckt, int neq, int M, double t_new, int demod)
+{
+    static int off = -1;
+    int r, m;
+    if (off < 0) off = getenv("PSS_SALT_NO728") != NULL || getenv("PAC_NO_IMPULSE") != NULL || (getenv("PSS_728_OFF") && (atoi(getenv("PSS_728_OFF")) & 4));
+    if (g_px_n != neq) {
+        g_px1 = TREALLOC(double, g_px1, neq + 1); g_px2 = TREALLOC(double, g_px2, neq + 1);
+        g_iw_pre = TREALLOC(double, g_iw_pre, neq + 1); g_iw_xlast = TREALLOC(double, g_iw_xlast, neq + 1);
+        g_iw_J = TREALLOC(double, g_iw_J, (size_t) PAC_IW_REC * (neq + 1));
+        g_px_n = (g_px1 && g_px2 && g_iw_pre && g_iw_xlast && g_iw_J) ? neq : 0;
+        g_pt1 = g_pt2 = -1.0; g_iw_on = 0;
+    }
+    if (g_iw_M != M || !g_iw_coeff) { g_iw_coeff = TREALLOC(PACc, g_iw_coeff, M > 0 ? M : 1); g_iw_M = M; g_iw_on = 0; }
+    if (off || g_px_n != neq || !g_iw_coeff || !demod) {
+        if (demod) pac_imp_apply(ckt, neq, M, t_new);
+        pac_imp_roll(ckt, neq);
+        g_iw_on = 0;
+        goto roll;
+    }
+    if (g_iw_on && g_imp_on && !g_imp_cont) {   /* a new flip while a window is open (hand-over): close it first */
+        pac_iw_flush(neq, M);
+        memcpy(g_pac_xls_prev, g_iw_xlast, (size_t) (neq + 1) * sizeof(double));   /* the previous accepted point */
+    }
+    if (g_iw_on) {
+        pac_iw_record(ckt, neq, t_new);
+        if (!PSSsaltContActive()) pac_iw_flush(neq, M);
+        if (!g_iw_on) memcpy(g_pac_xls_prev, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+    } else if (g_imp_on && !g_imp_cont && g_imp_contcap && PSSsaltContActive() && g_pac_xls_have && g_pac_xls_n == neq && fabs(g_imp_hdot) > 1e-30
+               && g_pt1 >= 0.0) {
+        /* a flip whose node is continued: open a window; its first record is the event step */
+        PSSsaltEvent e_;
+        memset(&e_, 0, sizeof e_);
+        e_.posCntrl = g_imp_pc; e_.negCntrl = g_imp_nc; e_.h_dot = g_imp_hdot; e_.serial = g_imp_serial; e_.cont = 0;
+        for (m = 0; m < M; m++) g_iw_coeff[m] = pac_salt_coeff(&e_, m, M);
+        for (r = 0; r <= neq; r++)
+            g_iw_pre[r] = (r && g_pt2 >= 0.0 && g_pt1 > g_pt2) ? (g_px1[r] - g_px2[r]) / (g_pt1 - g_pt2) : 0.0;
+        g_iw_nx = g_imp_nx; memcpy(g_iw_x, g_imp_x, sizeof g_iw_x);
+        memcpy(g_iw_xlast, g_pac_xls_prev, (size_t) (neq + 1) * sizeof(double)); g_iw_tlast = g_pt1;
+        g_iw_n = 0; g_iw_neq = neq; g_iw_on = 1;
+        pac_iw_record(ckt, neq, t_new);
+    } else {
+        pac_imp_apply(ckt, neq, M, t_new);
+        pac_imp_roll(ckt, neq);
+    }
+roll:
+    if (g_px_n == neq) {
+        double *tmp = g_px2; g_px2 = g_px1; g_px1 = tmp;
+        memcpy(g_px1, ckt->CKTrhsOld, (size_t) (neq + 1) * sizeof(double));
+        g_pt2 = g_pt1; g_pt1 = t_new;
     }
 }
 
@@ -2868,9 +2995,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
         }
     }
 
-    if (g_pac_demod_active && !is_first_call)
-        pac_imp_apply(ckt, neq, M, t_new);   /* card #579: before Cprev is swapped (the event coefficient reads it) */
-    pac_imp_roll(ckt, neq);
+    pac_imp_step(ckt, neq, M, t_new, g_pac_demod_active && !is_first_call);   /* card #579, #728: before Cprev is swapped (the event coefficient reads it) */
 
     if (g_pac_demod_active) {
         if (is_first_call) {
@@ -2900,6 +3025,16 @@ PSSpacRecordStep(CKTcircuit *ckt)
         }
     }
 
+    if (g_pac_demod_active && getenv("PAC_SS_DUMP")) {   /* card #728 diagnostic: the small-signal trajectory of the last pass,
+                                                          * column 0: t, then Re/Im of every row (compared with tools/pac_exact.py) */
+        static FILE *df = NULL;
+        if (!df) df = fopen(getenv("PAC_SS_DUMP"), "w");
+        if (df) {
+            fprintf(df, "%.17g", t_new);
+            for (row = 1; row <= neq; row++) { PACc v = pac_get(g_pac_Cnew, row, M, 0); fprintf(df, " %.12g %.12g", v.re, v.im); }
+            fprintf(df, "\n"); fflush(df);
+        }
+    }
     { PACc *tmp = g_pac_Cprev; g_pac_Cprev = g_pac_Cnew; g_pac_Cnew = tmp; }
     { PACc *tmp = g_pac_Tprev; g_pac_Tprev = g_pac_Tnew; g_pac_Tnew = tmp; }
     g_pac_tprev = t_new;
@@ -2969,6 +3104,7 @@ pac_finish_demod_wraparound(void)
 {
     int m, row;
 
+    if (g_pac_demod_active && g_pac_demod && g_iw_on) pac_iw_flush(g_pac_neq, g_pac_M);   /* card #728: a window open at t = T */
     if (!g_pac_demod_active || !g_pac_demod || !g_pac_have_first || !g_pac_first_y)
         return;
 
