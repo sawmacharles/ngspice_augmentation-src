@@ -2315,6 +2315,10 @@ static int g_salt_ind_warned = 0;           /* card #510 step 1: see pss_salt_in
 static double *g_salt_vsw_prev = NULL, *g_salt_vsw_cur = NULL;
 static double *g_salt_vnd_prev = NULL, *g_salt_vnd_cur = NULL;   /* card #575: [2*i] pos node, [2*i+1] neg node voltage of switch i */
 static int g_salt_vsw_n = 0, g_salt_vsw_have_prev = 0;
+/* Branch currents of every inductor at the previous accepted point (rolled with the switch-terminal voltages): the pre-event node equation of
+ * pss_salt_ind_jump() needs the inductor current BEFORE the flip, not the one of the event step (which already holds the response to the flip). */
+static double *g_salt_il_prev = NULL, *g_salt_il_cur = NULL;
+static int g_salt_il_n = 0, g_salt_il_have = 0;
 
 void
 PSSsaltReset(void)
@@ -2692,6 +2696,7 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
     DIOmodel *dm; DIOinstance *di;
     double Gsum, Ksum, Vfar;
     double V_now, V_other, I_L, V_prev, dV;
+    int il_idx = 0, found_idx = -1;
 
     if (node <= 0)
         return 0;
@@ -2701,11 +2706,11 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
         return 0;
 
     for (im = (INDmodel *) ckt->CKThead[indtype]; im; im = INDnextModel(im))
-        for (ii = INDinstances(im); ii; ii = INDnextInstance(ii)) {
+        for (ii = INDinstances(im); ii; ii = INDnextInstance(ii), il_idx++) {
             if (ii->INDposNode == node) {
-                found = ii; found_sign = +1; n_found++;
+                found = ii; found_sign = +1; n_found++; found_idx = il_idx;
             } else if (ii->INDnegNode == node) {
-                found = ii; found_sign = -1; n_found++;
+                found = ii; found_sign = -1; n_found++; found_idx = il_idx;
             }
         }
 
@@ -2803,6 +2808,13 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
     V_now = ckt->CKTrhsOld[node];
     V_other = (otherNode <= 0) ? 0.0 : ckt->CKTrhsOld[otherNode];
     I_L = ckt->CKTrhsOld[found->INDbrEq];
+    /* The inductor current of the pre-event node equation is the one BEFORE the flip.  CKTrhsOld is the event step's, which already
+     * holds the response to the flip over the (short) event step: delta I = V dt / L.  Where the node is high-impedance before the
+     * flip (an ideal switch off, the diode off: discontinuous conduction, g_prev + G of a few uS) the equation divides by that
+     * conductance and the error becomes dV = delta I / G -- first order in the event step, so first order in the points per period
+     * (0.40 dB at 200 points on a DCM buck).  PSS_SALT_NO711=1 reads the event step's current again (red proof). */
+    if (found_idx >= 0 && found_idx < g_salt_il_n && g_salt_il_have && !getenv("PSS_SALT_NO711"))
+        I_L = g_salt_il_prev[found_idx];
 
     V_prev = (g_prev * V_other + Ksum - (double) found_sign * I_L) / (g_prev + Gsum);
     {
@@ -2969,6 +2981,30 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                     cnt++;
                 }
             g_salt_vsw_have_prev = 1;
+        }
+        {   /* inductor branch currents, same roll */
+            int it_ = CKTtypelook("Inductor"), ci_ = 0;
+            INDmodel *im_; INDinstance *ii_;
+            if (it_ >= 0) {
+                for (im_ = (INDmodel *) ckt->CKThead[it_]; im_; im_ = INDnextModel(im_))
+                    for (ii_ = INDinstances(im_); ii_; ii_ = INDnextInstance(ii_)) ci_++;
+                if (ci_ != g_salt_il_n) {
+                    g_salt_il_prev = TREALLOC(double, g_salt_il_prev, ci_ > 0 ? ci_ : 1);
+                    g_salt_il_cur  = TREALLOC(double, g_salt_il_cur,  ci_ > 0 ? ci_ : 1);
+                    g_salt_il_n = ci_;
+                    memset(g_salt_il_cur, 0, (size_t) (ci_ > 0 ? ci_ : 1) * sizeof(double));
+                    g_salt_il_have = 0;
+                }
+                if (g_salt_il_have) memcpy(g_salt_il_prev, g_salt_il_cur, (size_t) ci_ * sizeof(double));
+                ci_ = 0;
+                for (im_ = (INDmodel *) ckt->CKThead[it_]; im_; im_ = INDnextModel(im_))
+                    for (ii_ = INDinstances(im_); ii_; ii_ = INDnextInstance(ii_)) {
+                        g_salt_il_cur[ci_] = ckt->CKTrhsOld[ii_->INDbrEq];
+                        if (!g_salt_il_have) g_salt_il_prev[ci_] = g_salt_il_cur[ci_];
+                        ci_++;
+                    }
+                g_salt_il_have = 1;
+            }
         }
     }
 

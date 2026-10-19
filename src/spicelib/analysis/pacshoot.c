@@ -2424,11 +2424,12 @@ static int g_pac_xls_n = 0, g_pac_xls_have = 0;
 static int g_imp_on = 0, g_imp_pc = 0, g_imp_nc = 0, g_imp_nx = 0, g_imp_x[4 * PSS_SALT_MAX_EVENTS];
 static double g_imp_hdot = 0.0;
 
-/* card #581: discontinuous conduction.  When an inductor's current runs out, the diode that carried it stops conducting somewhere
- * inside an accepted step; no switch flips, the step control does not see it, and the orbit and the small-signal result are first
- * order in the step.  Measured on a DCM buck (pac_r6od, chargeless diode, 60 ohm load) against tools/pac_perturbed.py: 0.40 dB / 0.40 deg
- * at 200 points per period, 0.06 dB at 2000, 0.03 dB at 20000, whatever reltol.  Detected as an inductor whose current stays below
- * 1e-3 of its largest value for more than 1 % of the period; said once, with the remedy.  PAC_NO_DCM_NOTE=1 silences it. */
+/* card #581, #711: discontinuous conduction.  When an inductor's current runs out, the diode that carried it stops conducting somewhere
+ * inside an accepted step; no switch flips and the step control does not treat it as an event.  Until card #711 the result of a DCM buck
+ * was first order in the step (0.40 dB at 200 points per period): the cause was the pre-event node equation of the switch that turns on
+ * (pss_salt_ind_jump()), which used the inductor current of the event step instead of the one before the flip.  It is fixed there; the
+ * note stays as a pointer for decks with this behaviour, which were validated on a buck only.  Detected as an inductor whose current
+ * stays below 1e-3 of its largest value for more than 1 % of the period; said once.  PAC_NO_DCM_NOTE=1 silences it. */
 #define PAC_DCM_NIND 64
 static double g_dcm_imax[PAC_DCM_NIND], g_dcm_tzero[PAC_DCM_NIND], g_dcm_tprev = -1.0;
 static int g_dcm_said = 0;
@@ -2450,9 +2451,9 @@ pac_dcm_note(CKTcircuit *ckt, int n_salt)
             if (g_dcm_imax[k] > 1e-9 && a < 1e-3 * g_dcm_imax[k]) g_dcm_tzero[k] += h;
             if (g_dcm_tzero[k] > 0.01 * g_pac_T && !getenv("PAC_NO_DCM_NOTE")) {
                 fprintf(stderr, "PAC-TD: note -- the current of inductor %s is zero for part of the period (discontinuous conduction): the "
-                        "instant its diode stops conducting is not located by the step control, so the result is first order in the "
-                        "step. On a DCM buck: 0.40 dB off at 200 points per period, 0.06 dB at 2000, 0.03 dB at 20000 (card #581). "
-                        "Raise the points of the .pss/.pac line.\n", ii->INDname);
+                        "instant its diode stops conducting is not located as an event; validated on a DCM buck "
+                        "(0.02 dB at 200 points per period, card #711), not on other topologies. Raise the points of the .pss/.pac "
+                        "line to check convergence.\n", ii->INDname);
                 g_dcm_said = 1;
                 return;
             }
