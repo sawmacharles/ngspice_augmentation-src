@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 138 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s140`; `s140` is the latest.
-- **Size of the change:** 89 files, about 22 000 lines added, 143 removed.
+- **This fork:** 140 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s141`; `s141` is the latest.
+- **Size of the change:** 89 files, about 22 300 lines added, 143 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -103,7 +103,9 @@ gain and margins, and noise of a circuit that never sits at a DC point.
 ```
 
 - **`.pac`**: periodic AC (transfer function through the switching circuit).
-- **`.pstb`**: periodic loop gain and margins (Tian's method on the periodic orbit).
+- **`.pstb`**: periodic loop gain and margins (Tian's method on the periodic orbit). The probe
+  takes the same forms as `.stb`: a 0 V source, `probe="<inst>:<terminal>"` (the source is
+  inserted for you), or an instance of the `lgprobe` subcircuit; all three give the same loop gain.
 - **`.pxf`**: periodic transfer function from every source to one output. `adjoint=1`
   computes all of them in one transposed solve.
 - **`.pnoise`**: cyclostationary noise. The noise of each device is evaluated at the bias it
@@ -222,10 +224,14 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
   results on several ideal-switch converters without a message. They were found by checking
   52 decks against the perturbed reference and fixed in `s123`. Since then all 47 open-loop
   decks agree within 0.067 dB and 0.32°, except three documented cases (up to 0.40 dB).
+  Builds before `s141` could report a stable converter as `UNSTABLE(period-doubling)`
+  (Floquet multiplier −1.27 instead of 0.994) when the same circuit was written with
+  subcircuits; the stability check now uses the same finite-difference step rule as the
+  Newton iteration, and both forms read 0.994.
 
 ## How it is tested
 
-Each release was run through 46 test suites (stability, periodic analyses, noise,
+Each release was run through the full set of test suites (48 at `s141`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -268,3 +274,4 @@ change on its own. The tags are:
 | s138 | 2-point linear sweeps |
 | s139 | `trnoise` follows the seed |
 | s140 | `.sens ac` over a sweep |
+| s141 | `.pss` Floquet verdict on subcircuit netlists; `.pstb` probe forms of `.stb` |

@@ -181,3 +181,10 @@ For an overview, see [README.md](README.md).
 1 commits.
 
 - `eef49b3d9` sens (#672): .sens ac over a sweep of more than one point is right at every point; lin steps linearly
+
+## s141 — .pss Floquet verdict on subcircuit netlists, .pstb probe forms
+
+2 commits.
+
+- `e6961c5f6` pss (#682): the Floquet re-evaluation uses the Newton columns' step rule
+- `6b6923052` pstb (#717): probe=<inst>:<terminal> auto-insert and the lgprobe subcircuit
