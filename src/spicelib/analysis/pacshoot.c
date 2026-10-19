@@ -3461,6 +3461,44 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
     return has;
 }
 
+/* One NQS flag found on a model or (card #730) a device line: returns the refusal text (static) or NULL and sets *note. */
+static const char *
+pac_nqs_judge(const char *dn, const char *kw, int is_tr, int val, const char *inst, const char **note, int strict)
+{
+    static char buf[160], mbuf[320], ibuf[320];
+    char *nbuf = inst ? ibuf : mbuf;   /* separate texts: an instance call must not overwrite a model note it does not replace */
+    char where[80];
+    if (inst)
+        snprintf(where, sizeof where, " on instance %s", inst);
+    else
+        where[0] = '\0';
+    if (getenv("PAC_NQS_REFUSE") || (is_tr && ((strict && getenv("PAC_NQS_PNOISE_REFUSE"))
+                                            || (strcmp(dn, "BSIM4") && strcmp(dn, "BSIM3"))))) {
+        snprintf(buf, sizeof buf, "%s (%s=%d%s)", dn, kw, val, where);
+        return buf;
+    }
+    if (is_tr) {
+        snprintf(nbuf, sizeof mbuf, "%s %s=%d%s: the channel-charge relaxation node is an ordinary state of the generic charge recursion (card #559%s)",
+                 dn, kw, val, where, strict ? "; .pnoise: no noise source on it, card #715" : "");
+        *note = nbuf;
+    } else if (!*note) {
+        snprintf(nbuf, sizeof mbuf, "%s %s=%d%s affects .ac only: this td analysis linearises the transient model (quasi-static unless trnqsmod/nqsmod is on; card #559)",
+                 dn, kw, val, where);
+        *note = nbuf;
+    }
+    return NULL;
+}
+
+/* 1 if kw is an NQS flag (trnqsmod / nqsmod: *is_tr = 1; acnqsmod: *is_tr = 0). */
+static int
+pac_nqs_kw(const char *kw, int *is_tr)
+{
+    if (!kw)
+        return 0;
+    *is_tr = !strcasecmp(kw, "trnqsmod") || !strcasecmp(kw, "nqsmod");
+    return *is_tr || !strcasecmp(kw, "acnqsmod");
+}
+
 /* Non-quasi-static MOS models.  BSIM4 (trnqsmod=1) and BSIM3v3.3 (nqsmod=1) carry the channel-charge relaxation in an extra circuit
  * node (qNode, "charge deficit"), stamped with charge terms proportional to ag0 (the affine-in-ag0 guard of the generic path passes) and
  * conductive terms, so its relaxation is an ordinary state of the generic charge recursion; since card #559 it is accepted:
@@ -3478,49 +3516,60 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
  * at 4..43 MHz: resistor noise worst band 0.15 dB, mean +0.002 dB, channel noise 0.14 / +0.057 dB (band 1-sigma 0.11 / 0.08 dB; the
  * trnqsmod=0 deck is 3.9 dB off; docs/pss-pac.md, card #715).  PAC_NQS_PNOISE_REFUSE=1 restores the .pnoise refusal (red proof).
  * PAC_NQS_REFUSE=1 restores the pre-#559 refusal of every NQS model in every td analysis (red proof).
+ * Card #730: the flags are asked on every device line too (bsim3v0/v1/v32 and bsim4/v5/v6/v7 take nqsmod / trnqsmod / acnqsmod as
+ * instance parameters; the value asked is the one the device uses, the model's unless given on the line).  Up to s147 only the model was
+ * asked, so an instance-level flag on a refused family ran unvalidated without a message.  PAC_NQS_INSTANCE_OFF=1 restores that (red proof).
  * Returns the refusal text (static) or NULL; *note is set to a text to print once when an NQS model is accepted. */
 static const char *
 pac_find_nqs_device(CKTcircuit *ckt, const char **note, int strict)
 {
     int i, k;
-    static char buf[96], nbuf[256];
+    const char *r;
     *note = NULL;
     for (i = 0; i < DEVmaxnum; i++) {
         SPICEdev *d = DEVices[i];
         GENmodel *m;
         const char *dn;
-        if (!d || !ckt->CKThead[i] || !d->DEVmodAsk || !d->DEVpublic.modelParms || !d->DEVpublic.numModelParms)
+        if (!d || !ckt->CKThead[i])
             continue;
         dn = d->DEVpublic.name ? d->DEVpublic.name : "?";
-        for (k = 0; k < *d->DEVpublic.numModelParms; k++) {
-            const char *kw = d->DEVpublic.modelParms[k].keyword;
-            int is_tr, is_ac;
-            if (!kw)
-                continue;
-            is_tr = !strcasecmp(kw, "trnqsmod") || !strcasecmp(kw, "nqsmod");
-            is_ac = !strcasecmp(kw, "acnqsmod");
-            if (!is_tr && !is_ac)
-                continue;
-            for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
-                IFvalue v;
-                memset(&v, 0, sizeof v);
-                if (d->DEVmodAsk(ckt, m, d->DEVpublic.modelParms[k].id, &v) != OK || v.iValue == 0)
+        if (d->DEVmodAsk && d->DEVpublic.modelParms && d->DEVpublic.numModelParms)
+            for (k = 0; k < *d->DEVpublic.numModelParms; k++) {
+                int is_tr;
+                if (!pac_nqs_kw(d->DEVpublic.modelParms[k].keyword, &is_tr))
                     continue;
-                if (getenv("PAC_NQS_REFUSE") || (is_tr && ((strict && getenv("PAC_NQS_PNOISE_REFUSE"))
-                                                        || (strcmp(dn, "BSIM4") && strcmp(dn, "BSIM3"))))) {
-                    snprintf(buf, sizeof buf, "%s (%s=%d)", dn, kw, v.iValue);
-                    return buf;
-                }
-                if (is_tr) {
-                    snprintf(nbuf, sizeof nbuf, "%s %s=%d: the channel-charge relaxation node is an ordinary state of the generic charge recursion (card #559%s)",
-                             dn, kw, v.iValue, strict ? "; .pnoise: no noise source on it, card #715" : "");
-                    *note = nbuf;
-                } else if (!*note) {
-                    snprintf(nbuf, sizeof nbuf, "%s %s=%d affects .ac only: this td analysis linearises the transient model (quasi-static unless trnqsmod/nqsmod is on; card #559)", dn, kw, v.iValue);
-                    *note = nbuf;
+                for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+                    IFvalue v;
+                    memset(&v, 0, sizeof v);
+                    if (d->DEVmodAsk(ckt, m, d->DEVpublic.modelParms[k].id, &v) != OK || v.iValue == 0)
+                        continue;
+                    if ((r = pac_nqs_judge(dn, d->DEVpublic.modelParms[k].keyword, is_tr, v.iValue, NULL, note, strict)) != NULL)
+                        return r;
                 }
             }
-        }
+        if (getenv("PAC_NQS_INSTANCE_OFF"))   /* red proof of card #730: the model-only detection of s147 */
+            continue;
+        if (d->DEVask && d->DEVpublic.instanceParms && d->DEVpublic.numInstanceParms)
+            for (k = 0; k < *d->DEVpublic.numInstanceParms; k++) {
+                int is_tr;
+                if (!pac_nqs_kw(d->DEVpublic.instanceParms[k].keyword, &is_tr))
+                    continue;
+                for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+                    GENinstance *g;
+                    for (g = m->GENinstances; g; g = g->GENnextInstance) {
+                        IFvalue v;
+                        memset(&v, 0, sizeof v);
+                        if (d->DEVask(ckt, g, d->DEVpublic.instanceParms[k].id, &v, NULL) != OK || v.iValue == 0)
+                            continue;
+                        /* a value inherited from the model was judged above: its (model-level) note is kept */
+                        const char *n2 = *note;
+                        if ((r = pac_nqs_judge(dn, d->DEVpublic.instanceParms[k].keyword, is_tr, v.iValue, g->GENname, &n2, strict)) != NULL)
+                            return r;
+                        if (!*note)
+                            *note = n2;
+                    }
+                }
+            }
     }
     return NULL;
 }
