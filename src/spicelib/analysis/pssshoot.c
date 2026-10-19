@@ -2289,6 +2289,7 @@ static double g_salt_win_last_t = -1.0;
 #define PSS_SALT_CONT_ROWS 4
 typedef struct {
     int active, node, posCntrl, negCntrl, quiet, steps, fast, nrow;
+    int natcap;                         /* card #727: a native capacitor at the node (a capacitor node treated as fast, card #580) */
     int row[PSS_SALT_CONT_ROWS];        /* [0] the inductor branch; [1..] capacitor nodes behind a resistor at the node (snubber) */
     double k[PSS_SALT_CONT_ROWS];       /* d(state rate) / d(node voltage): sign / L; G / C_far */
     double il_last;                              /* inductor current at the last accepted point */
@@ -2788,6 +2789,17 @@ pss_salt_ind_jump(CKTcircuit *ckt, SWinstance *sw, int node, int otherNode,
                 Gd = ckt->CKTstate1[di->DIOconduct];
                 Vd = ckt->CKTstate1[di->DIOvoltage];   /* anode-cathode, PREV point */
                 Id = ckt->CKTstate1[di->DIOcurrent];   /* anode->cathode current, PREV point */
+                /* card #727: the cathode at the node, the series resistance on the anode side (between DIOposNode and the internal
+                 * node): Vd and Gd above are the JUNCTION's; the branch from the far terminal to the node also drops Id x RS.
+                 * Linearise the whole branch at the previous point: G = Gd / (1 + Gd RS), branch voltage Vd + Id RS.  Without it the
+                 * pre-event voltage of a conducting diode is short by Id x RS (65 mV at 1.3 A, RS 50 mohm): the event after a dead
+                 * time (low side on, high side on) was 0.47 % too small and the control gain of a half bridge 0.04 dB high.
+                 * PSS_SALT_NO727=1 restores the junction-only equation (red proof). */
+                if (is_cathode && di->DIOposPrimeNode != di->DIOposNode && di->DIOtConductance > 0.0 && !getenv("PSS_SALT_NO727")) {
+                    double rs_ = 1.0 / di->DIOtConductance;
+                    Vd += Id * rs_;
+                    Gd = Gd / (1.0 + Gd * rs_);
+                }
 
                 Gsum += Gd;
                 if (is_cathode)
@@ -3038,9 +3050,19 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
          * accepted point and ended before the new event is formed (hand-over, e.g. the dead time of a half bridge). */
         int ic;
         static int cont_off = -1;
-        static double frac = -1.0;
+        static double frac = -1.0, frac_cap = -1.0;
         if (cont_off < 0) cont_off = getenv("PSS_SALT_NOCONT") != NULL;   /* red proof: the single-step routed jump */
-        if (frac < 0.0) { const char *e_ = getenv("PSS_SALT_CONT_FRAC"); frac = e_ ? atof(e_) : 1e-3; }
+        /* card #727: the continuation runs while the node moves faster than 1e-4 (was 1e-3) of the fastest rate since the event.  A
+         * charged diode keeps moving its node for some tt after the slew (the diffusion charge fills), at a rate far below the slew's;
+         * at 1e-3 that tail was cut and never reached the inductor (12 mV of the 0.62 V after the high-side turn-off of a half bridge
+         * with a cj 300 pF / tt 2 ns body diode: -0.007 dB; 0.056 dB at reltol 1e-6).  A node with a native capacitor (the boost and
+         * buck-boost nodes of card #580) keeps 1e-3: there the longer continuation made the phase worse (boost, 3 nF: 0.32 -> 0.46 deg).
+         * PSS_SALT_NO727=1: 1e-3 everywhere again; PSS_SALT_CONT_FRAC sets both. */
+        if (frac < 0.0) {
+            const char *e_ = getenv("PSS_SALT_CONT_FRAC");
+            frac = e_ ? atof(e_) : (getenv("PSS_SALT_NO727") ? 1e-3 : 1e-4);
+            frac_cap = e_ ? atof(e_) : 1e-3;
+        }
         for (ic = 0; ic < PSS_SALT_CONT_MAX && n < max; ic++) {
             PSSsaltCont *c = &g_salt_cont[ic];
             int fr_[PSS_SALT_CONT_ROWS], nf_, k_, flips = 0, emit, final = 0;
@@ -3076,7 +3098,7 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                     double il = ckt->CKTrhsOld[c->row[0]];
                     double ilrate = fabs(il - c->il_last) / (dt_actual > 0.0 ? dt_actual : 1.0);
                     c->il_last = il;
-                    emit = (rate > frac * c->rmax && fabs(v - c->v_last) > 1e-9) || (nf_ > 0 && irate > 10.0 * ilrate && irate > 0.0);
+                    emit = (rate > (c->natcap ? frac_cap : frac) * c->rmax && fabs(v - c->v_last) > 1e-9) || (nf_ > 0 && irate > 10.0 * ilrate && irate > 0.0);
                 }
                 c->v_last = v; v_to = v;
                 c->steps++;
@@ -3405,6 +3427,10 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                         c->active = 1; c->node = nd; c->nrow = 1 + nfar; c->row[0] = side ? negRow : posRow;
                         c->posCntrl = here->SWposCntrlNode; c->negCntrl = here->SWnegCntrlNode;
                         c->quiet = 0; c->steps = 0; c->fast = fast;
+                        {   /* card #727 */
+                            PSSsaltModelCapHookFn hk2_ = PSSsaltModelCapHook;
+                            PSSsaltModelCapHook = NULL; c->natcap = pss_salt_local_cap(ckt, nd) > 0.0; PSSsaltModelCapHook = hk2_;
+                        }
                         c->k[0] = side ? k_neg : k_pos; c->h_dot = h_dot; c->name = here->SWname;
                         c->v_last = c->v_emit = ckt->CKTrhsOld[nd];
                         c->il_last = ckt->CKTrhsOld[c->row[0]];
