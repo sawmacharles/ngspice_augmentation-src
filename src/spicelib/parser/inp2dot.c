@@ -296,7 +296,7 @@ dot_ac(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
  * parse-error path, which refuses to run the circuit -- never a silent
  * default probe. */
 static int
-stb_probe_splice(CKTcircuit *ckt, struct card *current, char *spec, IFuid *out_probe_uid)
+stb_probe_splice(CKTcircuit *ckt, struct card *current, char *spec, IFuid *out_probe_uid, const char *an)
 {
     char *colon, *instname, *termname;
     GENinstance *inst;
@@ -322,16 +322,17 @@ stb_probe_splice(CKTcircuit *ckt, struct card *current, char *spec, IFuid *out_p
     termname = colon + 1;
 
     if (!*instname || !*termname) {
+        snprintf(msg, sizeof msg, "'.%s' probe=inst:terminal needs both an instance name and a terminal name\n", an);
         current->error = INPerrCat(current->error,
-            INPmkTemp("'.stb' probe=inst:terminal needs both an instance name and a terminal name\n"));
+            INPmkTemp(msg));
         return 2;
     }
 
     inst = CKTfndDev(ckt, (IFuid) instname);
     if (!inst || inst->GENmodPtr->GENmodType < 0) {
-        snprintf(msg, sizeof msg, "stb probe: instance '%s' not in circuit (forward references "
+        snprintf(msg, sizeof msg, "%s probe: instance '%s' not in circuit (forward references "
                  "to a probe=inst:terminal are not supported -- the instance must appear "
-                 "before the .stb card)\n", instname);
+                 "before the .%s card)\n", an, instname, an);
         current->error = INPerrCat(current->error, INPmkTemp(msg));
         return 2;
     }
@@ -342,7 +343,7 @@ stb_probe_splice(CKTcircuit *ckt, struct card *current, char *spec, IFuid *out_p
         if (strcasecmp(termname, dev->termNames[termidx]) == 0)
             break;
     if (termidx >= ntermnames) {
-        snprintf(msg, sizeof msg, "stb probe: instance '%s' has no terminal '%s'\n", instname, termname);
+        snprintf(msg, sizeof msg, "%s probe: instance '%s' has no terminal '%s'\n", an, instname, termname);
         current->error = INPerrCat(current->error, INPmkTemp(msg));
         return 2;
     }
@@ -351,7 +352,7 @@ stb_probe_splice(CKTcircuit *ckt, struct card *current, char *spec, IFuid *out_p
     snprintf(sbuf, sizeof sbuf, "stbprobe_%s", termname);
     error = SPfrontEnd->IFnewUid(ckt, &eltUid, inst->GENname, sbuf, UID_INSTANCE, NULL);
     if (error) {
-        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not allocate probe instance name\n"));
+        current->error = INPerrCat(current->error, INPmkTemp("probe=inst:terminal: could not allocate probe instance name\n"));
         return 2;
     }
     probesrc = CKTfndDev(ckt, eltUid);
@@ -365,44 +366,44 @@ stb_probe_splice(CKTcircuit *ckt, struct card *current, char *spec, IFuid *out_p
 
     error = CKTmkVolt(ckt, &nodeinj, inst->GENname, sbuf);
     if (error) {
-        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not create the internal node\n"));
+        current->error = INPerrCat(current->error, INPmkTemp("probe=inst:terminal: could not create the internal node\n"));
         return 2;
     }
 
     error = SPfrontEnd->IFnewUid(ckt, &modUid, inst->GENname, "stbprobemod", UID_MODEL, NULL);
     if (error) {
-        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not allocate probe model name\n"));
+        current->error = INPerrCat(current->error, INPmkTemp("probe=inst:terminal: could not allocate probe model name\n"));
         return 2;
     }
     vtype = CKTtypelook("Vsource");
     modvsrc = NULL;
     error = CKTmodCrt(ckt, vtype, &modvsrc, modUid);
     if (error) {
-        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not create the probe's model\n"));
+        current->error = INPerrCat(current->error, INPmkTemp("probe=inst:terminal: could not create the probe's model\n"));
         return 2;
     }
     error = CKTcrtElt(ckt, modvsrc, &probesrc, eltUid);
     if (error) {
-        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not create the probe instance\n"));
+        current->error = INPerrCat(current->error, INPmkTemp("probe=inst:terminal: could not create the probe instance\n"));
         return 2;
     }
     ptemp.rValue = 0;
     error = CKTpName("dc", &ptemp, ckt, vtype, "probe", &probesrc);
     if (error) {
-        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not set the probe's DC value\n"));
+        current->error = INPerrCat(current->error, INPmkTemp("probe=inst:terminal: could not set the probe's DC value\n"));
         return 2;
     }
     error = CKTbindNode(ckt, probesrc, 1, nodeinj);
     if (!error) error = CKTbindNode(ckt, probesrc, 2, extnode);
     if (!error) error = CKTbindNode(ckt, inst, termidx + 1, nodeinj);
     if (error) {
-        current->error = INPerrCat(current->error, INPmkTemp("stb probe: could not wire the probe in\n"));
+        current->error = INPerrCat(current->error, INPmkTemp("probe=inst:terminal: could not wire the probe in\n"));
         return 2;
     }
 
-    printf("stb: probe=%s:%s -- auto-inserted 0V probe '%s' "
+    printf("%s: probe=%s:%s -- auto-inserted 0V probe '%s' "
            "(a=new internal node bound to %s's terminal %s, b=%s, the original net)\n",
-           instname, termname, (char *) probesrc->GENname, instname, termname,
+           an, instname, termname, (char *) probesrc->GENname, instname, termname,
            extnode->name ? (char *) extnode->name : "0");
 
     *out_probe_uid = probesrc->GENname;
@@ -621,7 +622,7 @@ dot_stb(char *line, CKTcircuit *ckt, INPtables *tab, struct card *current,
                 sawProbe2 = TRUE;
             } else if (strchr(name, ':')) {
                 IFuid spliced = NULL;
-                int serr = stb_probe_splice(ckt, current, name, &spliced);
+                int serr = stb_probe_splice(ckt, current, name, &spliced, "stb");
                 tfree(name);
                 if (serr) return (0);  /* error already attached to current->error */
                 ptemp.uValue = spliced;
@@ -1434,7 +1435,6 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
     int probe_seen = 0;
 
     NG_IGNORE(gnode);
-    NG_IGNORE(current);
 
     /* .pstb Fguess StabTime OscNode Points Harmonics SC_iter Steady_coeff
      *       <DEC|OCT|LIN> NumPts Fstart Fstop probe=<Vname> [method=shoot] */
@@ -1501,12 +1501,31 @@ dot_pstb(char *line, void *ckt, INPtables *tab, struct card *current,
             break;
         if (strncmp(line, "probe=", 6) == 0) {
             char *name;
+            char *pp;
             line += 6;
+            for (pp = line; *pp == ' ' || *pp == '\t'; pp++)
+                ;
+            for (; *pp && *pp != ' ' && *pp != '\t' && *pp != '\r'; pp++)
+                if (*pp == ',') {
+                    LITERR("'.pstb' probe=<Vp>,<Vn> (differential/common-mode) is not supported\n");
+                    return (0);
+                }
             INPgetNetTok(&line, &name, 1);
             if (!*name) {
                 LITERR("'.pstb' probe=<Vname> needs a non-empty probe name\n");
                 tfree(name);
                 return (0);
+            }
+            if (strchr(name, ':')) {
+                /* probe=<inst>:<terminal>: auto-insert, same parse-time splice as .stb */
+                IFuid spliced = NULL;
+                int serr = stb_probe_splice((CKTcircuit *) ckt, current, name, &spliced, "pstb");
+                tfree(name);
+                if (serr) return (0);
+                ptemp.uValue = spliced;
+                GCA(INPapName, (ckt, which, foo, "pstb_probe", &ptemp));
+                probe_seen = 1;
+                continue;
             }
             INPinsert(&name, tab);
             ptemp.uValue = name;

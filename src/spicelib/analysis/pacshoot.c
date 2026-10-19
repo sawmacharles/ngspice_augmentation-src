@@ -135,8 +135,9 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
     NOT the from-scratch backward-adjoint engine that name might suggest;
     see pac_td_pxf()'s own "SHIPPED DESIGN" comment for the alternative
     considered and why.
-  - No device-based (gain-nulling) PSTB probe, no probe=inst:terminal
-    auto-insert for PSTB (probe=<Vname>, an existing 0V V-source, only).
+  - No device-based (gain-nulling) PSTB probe. PSTB's probe= is an
+    existing 0V V-source, <inst>:<terminal> (auto-inserted at parse time
+    by the same splice as .stb), or an instance of the lgprobe subcircuit.
   - GEAR integration is refused (same TRAPEZOIDAL-orders-1-2-only scope as
     PSSsensRecordStep, and for the same reason -- see that function).
 **********/
@@ -5855,10 +5856,12 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     int neq = SMPmatSize(ckt->CKTmatrix);
     GENinstance *inst;
     int branch_probe, node_a, node_b;
+    int inj_node = 0;  /* node of the unit current injection / voltage read-back */
+    int lgmode = 0;    /* probe is an lgprobe subcircuit instance */
     double *br1, *bi1, *br2, *bi2;
     int nfreq, i, err, trig_idx;
     double *freqs;
-    int outrows[2];   /* node_b, branch_probe */
+    int outrows[2];   /* inj_node, branch_probe */
     PACc *Phi, *Y1, *Y2;
     PACc *Tarr, *LGarr;
     double t0, t1;
@@ -5869,19 +5872,65 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         return E_PARMVAL;
     }
     inst = CKTfndDev(ckt, probeUid);
-    if (!inst || inst->GENmodPtr->GENmodType != CKTtypelook("Vsource")) {
-        fprintf(stderr, "PSTB: probe '%s' must be an existing 0V V-source (device-based "
-                "and inst:terminal probes are not supported by this engine -- card #465 "
-                "scope cut)\n", (char *) probeUid);
+    if (inst && inst->GENmodPtr->GENmodType == CKTtypelook("Vsource")) {
+        /* plain probe=<Vname> (also what probe=<inst>:<terminal> reduces to: the 0V source
+         * the parser spliced in series with that terminal) */
+        branch_probe = CKTfndBranch(ckt, probeUid);
+        if (branch_probe == 0) {
+            fprintf(stderr, "PSTB: probe '%s' has no branch equation\n", (char *) probeUid);
+            return E_NOTFOUND;
+        }
+        node_a = GENnode(inst)[0];
+        node_b = GENnode(inst)[1];
+        inj_node = node_b;
+    } else if (!inst) {
+        /* probe=<Xname>: an instance of the lgprobe subcircuit (stb/lgprobe.lib:
+         *   Ii 0 x DC 0 AC 0 ; Vi x a DC 0 AC 1 ; Vb b x DC 0 ),
+         * flattened to v.<Xname>.vi, v.<Xname>.vb, i.<Xname>.ii. */
+        GENinstance *vi, *vb, *ii;
+        char nm[300];
+        const char *lc = (const char *) probeUid;
+        size_t len = strlen(lc), q;
+        if (len > 200) len = 200;
+        #define PSTB_LGNAME(pre, post, dst) do { \
+            snprintf(nm, sizeof nm, "%s.", pre); \
+            for (q = 0; q < len; q++) nm[2 + q] = (char) tolower((unsigned char) lc[q]); \
+            snprintf(nm + 2 + len, sizeof nm - 2 - len, ".%s", post); \
+            dst = CKTfndDev(ckt, (IFuid) nm); } while (0)
+        PSTB_LGNAME("v", "vi", vi); PSTB_LGNAME("v", "vb", vb); PSTB_LGNAME("i", "ii", ii);
+        #undef PSTB_LGNAME
+        if (!vi || !vb || !ii ||
+            vi->GENmodPtr->GENmodType != CKTtypelook("Vsource") ||
+            vb->GENmodPtr->GENmodType != CKTtypelook("Vsource") ||
+            ii->GENmodPtr->GENmodType != CKTtypelook("Isource")) {
+            fprintf(stderr, "PSTB: probe '%s' is neither an existing 0V V-source, nor an instance of the "
+                    "lgprobe subcircuit (stb/lgprobe.lib: elements v.%s.vi, v.%s.vb, i.%s.ii), nor (parsed "
+                    "earlier) an <inst>:<terminal>. Device-based (gain-nulling) probes are not supported "
+                    "by this engine\n", (char *) probeUid, (char *) probeUid, (char *) probeUid,
+                    (char *) probeUid);
+            return E_NOTFOUND;
+        }
+        /* topology check: Vi x a, Vb b x, Ii 0 x -- one shared node x, current source from ground */
+        if (GENnode(vi)[0] == 0 || GENnode(vi)[0] != GENnode(vb)[1] ||
+            GENnode(ii)[1] != GENnode(vi)[0] || GENnode(ii)[0] != 0) {
+            fprintf(stderr, "PSTB: probe '%s': v.%s.vi/vb and i.%s.ii do not have the lgprobe topology "
+                    "(Ii 0 x; Vi x a; Vb b x) -- refused\n", (char *) probeUid, (char *) probeUid, (char *) probeUid);
+            return E_UNSUPP;
+        }
+        branch_probe = CKTfndBranch(ckt, vi->GENname);
+        if (branch_probe == 0) {
+            fprintf(stderr, "PSTB: probe '%s': vi has no branch equation\n", (char *) probeUid);
+            return E_NOTFOUND;
+        }
+        node_a = GENnode(vi)[1];
+        node_b = GENnode(vb)[0];
+        inj_node = GENnode(vi)[0];
+        lgmode = 1;
+    } else {
+        fprintf(stderr, "PSTB: probe '%s' is not a V-source (supported: an existing 0V V-source, "
+                "<inst>:<terminal>, or an instance of the lgprobe subcircuit)\n", (char *) probeUid);
         return E_NOTFOUND;
     }
-    branch_probe = CKTfndBranch(ckt, probeUid);
-    if (branch_probe == 0) {
-        fprintf(stderr, "PSTB: probe '%s' has no branch equation\n", (char *) probeUid);
-        return E_NOTFOUND;
-    }
-    node_a = GENnode(inst)[0];
-    node_b = GENnode(inst)[1];
     if (node_a == 0 || node_b == 0)
         fprintf(stderr, "PSTB: WARNING -- probe '%s' has a terminal at literal ground; "
                 "the two-injection method cannot measure a loop broken there (same "
@@ -5930,7 +5979,13 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
      * ckt->CKTrhs[branch_probe] = -1.0). RHS#2: unit current injection at
      * node_b (stban.c: ckt->CKTrhs[node_b] += 1.0). */
     br1[branch_probe] = -1.0;
-    if (node_b > 0) br2[node_b] = 1.0;
+    if (lgmode) {
+        /* lgprobe's Vi runs x -> a, the opposite orientation of a plain Vprobe a b (b = x, the upstream
+         * side), so its branch row V(x)-V(a) = +1 is the same perturbation as the plain row -1, and its
+         * branch current (into x) is the plain branch current negated (see the read-back below). */
+        br1[branch_probe] = 1.0;
+    }
+    if (inj_node > 0) br2[inj_node] = 1.0;
     /* card #465 FOURTH pass, task 4 (red-proof, TEST-ONLY, default off):
      * PAC_REDPROOF_SIGNFLIP flips RHS#1's sign relative to stban.c's own
      * verbatim-matched convention (this file's header/this function's own
@@ -5941,7 +5996,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
      * tests/test_pac.py's check_redproof_signflip(). Never set in
      * production. */
     if (getenv("PAC_REDPROOF_SIGNFLIP"))
-        br1[branch_probe] = 1.0;
+        br1[branch_probe] = -br1[branch_probe];
 
     nfreq = pac_sweep_count(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop);
     if (nfreq < 1) {
@@ -5951,7 +6006,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
     freqs = TMALLOC(double, nfreq);
     pac_sweep_fill(job->PACstepType, job->PACpoints, job->PACfStart, job->PACfStop, freqs, nfreq);
 
-    outrows[0] = node_b; outrows[1] = branch_probe;
+    outrows[0] = inj_node; outrows[1] = branch_probe;
     Phi = TMALLOC(PACc, (size_t) PAC_NST(&map) * PAC_NST(&map));   /* card #555: the engine's n is PAC_NST (generic path: more rows than n) */
     Y1 = TMALLOC(PACc, (size_t) 2 * nfreq);
     Y2 = TMALLOC(PACc, (size_t) 2 * nfreq);
@@ -5990,9 +6045,9 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
              * outrows[1]=branch_probe already IS that raw unknown's
              * sideband-0 value, so negate it here the same way. */
             PACc v1 = Y1[(size_t) 0 * nfreq + i];
-            PACc i1 = pc_scale(Y1[(size_t) 1 * nfreq + i], -1.0);
+            PACc i1 = pc_scale(Y1[(size_t) 1 * nfreq + i], lgmode ? 1.0 : -1.0);
             PACc v2 = Y2[(size_t) 0 * nfreq + i];
-            PACc i2 = pc_scale(Y2[(size_t) 1 * nfreq + i], -1.0);
+            PACc i2 = pc_scale(Y2[(size_t) 1 * nfreq + i], lgmode ? 1.0 : -1.0);
             PACc one = { 1.0, 0.0 };
             PACc diff = pc_sub(pc_mul(i1, v2), pc_mul(v1, i2));
             PACc two_diff = pc_scale(diff, 2.0);
