@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 144 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s144`; `s144` is the latest.
-- **Size of the change:** 90 files, about 22 500 lines added, 143 removed.
+- **This fork:** 145 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s145`; `s145` is the latest.
+- **Size of the change:** 94 files, about 22 600 lines added, 175 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -222,12 +222,6 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 - Plain transient on device-dominated circuits gains only 6–11 %.
 - Transient accuracy is not claimed to be better than stock. The fork reproduces its upstream
   base exactly, and both differ from 45.2 by about 1 % of ripple on switching decks.
-- **Known defect (open):** with a BSIM4 model at `tnoimod=1`, `.pnoise` leaves out the
-  source/drain part of the channel noise (about 4.4 dB low on a test circuit) without a message:
-  the model creates those internal noise nodes only when the deck also has a plain `.noise`
-  analysis. Workaround: add an inert `.noise` card on a separate node (`Vdum ndum 0 DC 0 AC 1`,
-  `Rdum ndum 0 1k noisy=0`, `.noise v(ndum) Vdum lin 1 1k 1k`). With it, `.pnoise` agrees with
-  a transient-noise ensemble within 0.3 dB.
 - A closed loop in which an analog control signal sets an XSPICE `d_pwm` duty cannot run in
   `.pss` (refused); open-loop digital clocks work since `s143`.
 - **Earlier silent errors in the fork itself.** Builds before `s123` gave wrong `.pac`/`.pstb`
@@ -241,6 +235,11 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
   capacitance, no capacitor at the node) when it had an RC snubber; it runs since `s144`, within
   0.024 dB and 0.13° on nine such decks, and a slow turn-off edge no longer delays the phase
   (0.47° to 0.08° at 100 kHz in discontinuous conduction).
+  Builds before `s145` left out the source/drain part of the BSIM4 `tnoimod=1` channel noise
+  in `.pnoise` (about 4.4 dB low on a test circuit): the model created those internal noise
+  nodes only when the deck also had a plain `.noise` analysis. Since `s145` `.pnoise` (and
+  `.sp` with noise) creates them too and agrees with a transient-noise ensemble within 0.3 dB;
+  on older builds an inert `.noise` card on a separate node is a workaround.
   Builds before `s141` could report a stable converter as `UNSTABLE(period-doubling)`
   (Floquet multiplier −1.27 instead of 0.994) when the same circuit was written with
   subcircuits; the stability check now uses the same finite-difference step rule as the
@@ -248,7 +247,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (51 at `s144`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (52 at `s145`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -295,3 +294,4 @@ change on its own. The tags are:
 | s141 | `.pss` Floquet verdict on subcircuit netlists; `.pstb` probe forms of `.stb` |
 | s143 | `.pss` with a digital clock; td `.pac` in discontinuous conduction; half bridge with dead time (`s142` was not released: its test run found a regression, fixed in `s143`) |
 | s144 | td `.pac` on a switch node with only device capacitance and an RC snubber (was refused); continuation jumps at the event's coefficient |
+| s145 | BSIM4 `tnoimod=1` channel noise complete in `.pnoise` |

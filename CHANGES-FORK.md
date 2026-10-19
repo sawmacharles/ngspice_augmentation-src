@@ -204,3 +204,11 @@ For an overview, see [README.md](README.md).
 - `7da64e19c` pac td (#713): charge-only switch node with an RC snubber runs (was refused); continuation jumps take the coefficient of their event
 
 Nine open-loop asynchronous-buck decks of this kind are within 0.001-0.024 dB / 0.04-0.13 deg of the perturbed periodic steady state at 20/50/100 kHz; discontinuous conduction at 2000 points 0.033 dB / 0.08 deg (0.47 deg before the coefficient fix); closed-loop .pstb 0.002 dB / 0.045 deg. `PSS_SALT_NO713=1` restores the refusal, `PAC_NO713_COEF=1` the old coefficient timing.
+
+## s145 — BSIM4 tnoimod noise nodes under .pnoise
+
+1 commit.
+
+- `e61e2e7c4` bsim4 (#729): create the tnoimod noise nodes for .pnoise and .sp donoise too (CKTnoiseAnalGiven), not only for a job named "Noise Analysis"; PSS_SALT_NO729=1 restores the old test
+
+BSIM4 (4.5 to 4.8) created the internal source/drain nodes that carry the rs/rd part of the `tnoimod=1` channel noise (4.5/4.6: any `tnoimod != 0`) only when a plain `.noise` analysis existed. Under `.pnoise` (both engines) and `.sp donoise=1` that part was 0: a clocked BSIM4 common-source stage read 4.43 dB low against a transient-noise ensemble; now within 0.114 dB. A static stage: `.pnoise` per generator equals `.noise` to 4.7e-7. Analyses without noise are unchanged (no extra nodes).
