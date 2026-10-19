@@ -10,8 +10,8 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 148 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s147`; `s147` is the latest.
+- **This fork:** 149 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s148`; `s148` is the latest.
 - **Size of the change:** 94 files, about 23 000 lines added, 175 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
@@ -240,6 +240,10 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
   node up to 0.16° off (gain up to 0.02 dB) against an exact reference; since `s146` within
   0.007 dB and 0.005°. A switching step with more switch-event parts than the engine holds is
   now refused; before `s146` the extra parts (beyond 8) were dropped without a message.
+  Builds before `s148` looked for a non-quasi-static option (`nqsmod`, `trnqsmod`) only on the
+  `.model` line: given on the device line of a BSIM3 3.0–3.2 or BSIM4 4.5–4.7 device (versions
+  refused with the option on the model line), a td small-signal analysis ran unvalidated without
+  a message. Since `s148` the device line is checked too and such a device is refused.
   Builds before `s145` left out the source/drain part of the BSIM4 `tnoimod=1` channel noise
   in `.pnoise` (about 4.4 dB low on a test circuit): the model created those internal noise
   nodes only when the deck also had a plain `.noise` analysis. Since `s145` `.pnoise` (and
@@ -252,7 +256,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (55 at `s147`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (55 at `s148`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -262,13 +266,9 @@ that is not public yet.
 Not tested: Windows and macOS builds (Linux only); comparison with a commercial simulator;
 an analytic reference for plain transient.
 
-Known gap, not yet fixed: a non-quasi-static option (`nqsmod`, `trnqsmod`) is detected only on the
-`.model` line. Given on the device line of a BSIM3 3.0–3.2 or BSIM4 4.5–4.7 device, which are
-refused when it is on the model line, a td analysis runs unvalidated without a message.
-
 ## Building
 
-A Linux x86-64 binary of `s147` is attached to the [s147 release](../../releases/tag/s147)
+A Linux x86-64 binary of `s148` is attached to the [s148 release](../../releases/tag/s148)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -306,3 +306,4 @@ change on its own. The tags are:
 | s145 | BSIM4 `tnoimod=1` channel noise complete in `.pnoise` |
 | s146 | boost / buck-boost with a capacitor at the switch node within 0.005° of an exact reference; full event buffer refused, never dropped |
 | s147 | `.pnoise` on non-quasi-static BSIM4 / BSIM3 models (was refused), checked against transient-noise ensembles |
+| s148 | a non-quasi-static option on the device line is checked like one on the `.model` line (unvalidated versions ran without a message) |
