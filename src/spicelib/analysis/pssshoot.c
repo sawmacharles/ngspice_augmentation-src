@@ -6565,6 +6565,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         double *Phi2 = TMALLOC(double, (size_t) n_slow * n_slow);
         double *icbuf_fl = TMALLOC(double, n_full_fl);
         double *outbuf_fl = TMALLOC(double, n_full_fl);
+        double *hs_fl = NULL;
         int floquet_ok = (Phi2 != NULL && icbuf_fl != NULL && outbuf_fl != NULL);
 
         if (floquet_ok && use_analytic) {
@@ -6649,6 +6650,22 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         if (getenv("PSS_FLOQUET_BASELINE") && floquet_ok && pss_run_period_ex_safe(ckt, T, "PSS shoot (Floquet baseline)", 0, 1))
             floquet_ok = 0;
 
+        /* card #682: the Floquet columns use the Newton columns' own step rule (pss_newton_fd_h, card #505): a state whose
+         * magnitude is below its ripple (a latch node, the foot of a dead-time RC swing) is differenced with 1 % of its
+         * ripple, not the 1e-6 floor. With the floor step its column was period-map noise / h ~ O(1), and the rank-one
+         * block of the three logic states produced a spurious multiplier (-1.27 "period-doubling" on an orbit whose
+         * transient shows none; the same circuit netlisted flat read 0.014 by chance). PSS_SHOOT_NO_BIGH disables. */
+        if (floquet_ok) {
+            double *rip_fl = TMALLOC(double, n_full_fl);
+            hs_fl = TMALLOC(double, n_slow);
+            if (rip_fl && hs_fl) {
+                pss_ripple_get(&map, rip_fl);
+                for (j = 0; j < n_slow; j++)
+                    hs_fl[j] = pss_newton_fd_h(x0[slow_idx[j]], rip_fl[slow_idx[j]], eps_floquet);
+            } else
+                floquet_ok = 0;
+            if (rip_fl) tfree(rip_fl);
+        }
         {   /* card #558: the Floquet columns as forked workers (PSS_FORK_COLS; the loop below is the default and the fallback) */
             int fpar = 0, *ferr = NULL;
             double *fres = NULL;
@@ -6656,7 +6673,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 PSSpcolSweep pc;
                 memset(&pc, 0, sizeof pc);
                 pc.ckt = ckt; pc.map = &map; pc.T = T; pc.x_full = x0; pc.n_full = n_full_fl; pc.n = n_slow;
-                pc.slow_idx = slow_idx; pc.eps = eps_floquet;
+                pc.slow_idx = slow_idx; pc.eps = eps_floquet; pc.hs = hs_fl;
                 pc.lab_p = "PSS shoot (Floquet perturbation +)"; pc.lab_m = "PSS shoot (Floquet perturbation -)";
                 ferr = TMALLOC(int, n_slow);
                 fres = TMALLOC(double, (size_t) n_slow * (2 * n_slow + 2));
@@ -6678,8 +6695,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         }
         for (j = 0; floquet_ok && j < n_slow; j++) {
             int jf = slow_idx[j];
-            double h = fabs(x0[jf]) * eps_floquet;
-            if (h < 1e-6) h = 1e-6;
+            double h = hs_fl[j];
 
             for (k = 0; k < n_full_fl; k++) icbuf_fl[k] = x0[k];
             icbuf_fl[jf] = x0[jf] + h;
@@ -6728,6 +6744,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             }
         }
         if (Phi2) tfree(Phi2);
+        if (hs_fl) tfree(hs_fl);
         if (icbuf_fl) tfree(icbuf_fl);
         if (outbuf_fl) tfree(outbuf_fl);
         /* restore the baseline transient's data (x1/Phi corrupted as
