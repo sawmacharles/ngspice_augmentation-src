@@ -2024,6 +2024,43 @@ static void pac_hid_rhs(int m, int M) { (void) m; (void) M; }
 static void pac_hid_update(int m, int M) { (void) m; (void) M; }
 #endif
 
+/* card #713: the event coefficient (y(posCntrl) - y(negCntrl)) / h_dot of a jump.  A continuation (PSSsaltCont in pssshoot.c) gives the
+ * rest of a switch flip's routed jump over the following accepted steps, while the switch node completes its transition; every part of it
+ * belongs to the flip, i.e. to the event time t_e, and takes the flip's coefficient (the small-signal control at t_e).  Read at the step it
+ * is given in, it carried the phase of the control at that later time: a delay of the order of the transition (a slow snubber-governed
+ * edge at low current, 47 ns: 0.47 deg at 100 kHz).  The flip's coefficient is kept per frequency column under its serial.
+ * PAC_NO713_COEF=1 reads every coefficient at its own step again (red proof). */
+#define PAC_COEF_SLOTS 32
+static struct { int serial, M; PACc *c; } g_pac_coef[PAC_COEF_SLOTS];
+static int g_pac_coef_next = 0;
+
+static PACc
+pac_salt_coeff(const PSSsaltEvent *e, int m, int M)
+{
+    static int off = -1;
+    PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m), Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
+    PACc coeff = pc_scale(pc_sub(Sp, Sn), 1.0 / e->h_dot);
+    int i, k = -1;
+    if (off < 0) off = getenv("PAC_NO713_COEF") != NULL;
+    if (off || e->serial <= 0) return coeff;
+    for (i = 0; i < PAC_COEF_SLOTS; i++)
+        if (g_pac_coef[i].serial == e->serial && g_pac_coef[i].M == M && g_pac_coef[i].c) { k = i; break; }
+    if (e->cont)
+        return k >= 0 ? g_pac_coef[k].c[m] : coeff;
+    if (k < 0) {   /* the flip itself: keep its coefficient for its continuation */
+        k = g_pac_coef_next; g_pac_coef_next = (g_pac_coef_next + 1) % PAC_COEF_SLOTS;
+        if (g_pac_coef[k].M < M || !g_pac_coef[k].c) {
+            tfree(g_pac_coef[k].c);
+            g_pac_coef[k].c = TMALLOC(PACc, M);
+            if (!g_pac_coef[k].c) { g_pac_coef[k].serial = 0; return coeff; }
+        }
+        g_pac_coef[k].serial = e->serial; g_pac_coef[k].M = M;
+        memset(g_pac_coef[k].c, 0, (size_t) M * sizeof(PACc));
+    }
+    g_pac_coef[k].c[m] = coeff;
+    return coeff;
+}
+
 /* card #559: ideal-switch event at a power node that carries device-model charge.  Fang's jump on the charge vector:
  *     dq+ = dq- - (F+ - F-) dt_e ,   dt_e = -(grad h . dx-) / h_dot ,   F+ - F- = (-dI at pos, +dI at neg)  [charge rate: the switch current]
  * so dQ(row) = coeff * dqdt with coeff = (y(posCntrl) - y(negCntrl)) / h_dot exactly as the native branch, but nothing is divided by a
@@ -2328,9 +2365,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
             PACc djump[PSS_SALT_MAX_EVENTS][2];
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 const PSSsaltEvent *e = &salt_ev[i_salt];
-                PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m);
-                PACc Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
-                PACc coeff = pc_scale(pc_sub(Sp, Sn), 1.0 / e->h_dot);
+                PACc coeff = pac_salt_coeff(e, m, M);   /* card #713 */
                 djump[i_salt][0] = pc_scale(coeff, e->dfdt_pos);
                 djump[i_salt][1] = pc_scale(coeff, e->dfdt_neg);
             }
@@ -2423,6 +2458,7 @@ static double *g_pac_xls_prev = NULL;
 static int g_pac_xls_n = 0, g_pac_xls_have = 0;
 static int g_imp_on = 0, g_imp_pc = 0, g_imp_nc = 0, g_imp_nx = 0, g_imp_x[4 * PSS_SALT_MAX_EVENTS];
 static double g_imp_hdot = 0.0;
+static int g_imp_serial = 0, g_imp_cont = 0;   /* card #713: the flip the impulse belongs to (a continuation step takes its coefficient) */
 
 /* card #581, #711: discontinuous conduction.  When an inductor's current runs out, the diode that carried it stops conducting somewhere
  * inside an accepted step; no switch flips and the step control does not treat it as an event.  Until card #711 the result of a DCM buck
@@ -2491,6 +2527,7 @@ pac_imp_note(const PSSsaltEvent *ev, int n_ev)
             return;
         }
         g_imp_pc = ev[i].posCntrl; g_imp_nc = ev[i].negCntrl; g_imp_hdot = ev[i].h_dot; g_imp_on = 1;
+        if (i == 0) { g_imp_serial = ev[i].serial; g_imp_cont = ev[i].cont; }
         /* capacitor-node jump rows at the switch's own power nodes (native capacitor or charge jump): excluded */
         if (ev[i].dG == 0.0) continue;   /* a continuation or a far-capacitor row of the same flip, not the switch itself */
         if (ev[i].posRow > 0 && ev[i].posRow == ev[i].posNode && !ev[i].posF) g_imp_x[g_imp_nx++] = ev[i].posRow;
@@ -2506,9 +2543,11 @@ pac_imp_apply(CKTcircuit *ckt, int neq, int M, double t_e)
     int m, row, k;
     if (!g_imp_on || !g_pac_xls_have || g_pac_xls_n != neq || fabs(g_imp_hdot) < 1e-30) return;
     for (m = 0; m < M; m++) {
-        PACc Sp = pac_get(g_pac_Cprev, g_imp_pc, M, m);
-        PACc Sn = pac_get(g_pac_Cprev, g_imp_nc, M, m);
-        PACc coeff = pc_mul(pc_scale(pc_sub(Sp, Sn), 1.0 / g_imp_hdot), pc_conjexp(g_pac_omega[m] * t_e));
+        PSSsaltEvent e_;
+        PACc coeff;
+        memset(&e_, 0, sizeof e_);
+        e_.posCntrl = g_imp_pc; e_.negCntrl = g_imp_nc; e_.h_dot = g_imp_hdot; e_.serial = g_imp_serial; e_.cont = g_imp_cont;
+        coeff = pc_mul(pac_salt_coeff(&e_, m, M), pc_conjexp(g_pac_omega[m] * t_e));   /* card #713: a continuation step: the flip's */
         for (row = 1; row <= neq; row++) {
             double J = ckt->CKTrhsOld[row] - g_pac_xls_prev[row];
             size_t idx = (size_t) (row - 1) * M + m;
@@ -2782,9 +2821,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
             PACc djump[PSS_SALT_MAX_EVENTS][2];   /* [i_salt][0]=posRow, [1]=negRow */
             for (i_salt = 0; i_salt < n_salt; i_salt++) {
                 PSSsaltEvent *e = &salt_ev[i_salt];
-                PACc Sp = pac_get(g_pac_Cprev, e->posCntrl, M, m);
-                PACc Sn = pac_get(g_pac_Cprev, e->negCntrl, M, m);
-                PACc coeff = pc_scale(pc_sub(Sp, Sn), 1.0 / e->h_dot);
+                PACc coeff = pac_salt_coeff(e, m, M);   /* card #713 */
                 djump[i_salt][0] = pc_scale(coeff, e->dfdt_pos);
                 djump[i_salt][1] = pc_scale(coeff, e->dfdt_neg);
             }

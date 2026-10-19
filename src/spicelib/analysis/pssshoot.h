@@ -185,6 +185,10 @@ typedef struct {
      * the one inductor at the node (posRow/negRow = its branch row): the node is treated as a fast (slaved) variable, see
      * PSSsaltCont in pssshoot.c.  pac_gen_salt_guard() accepts the model charge at such a node. */
     int posF, negF;
+    /* card #713: serial = the switch flip this jump belongs to (> 0, unique); cont = 1 for a jump given at a later step by the continuation
+     * of that flip (PSSsaltCont).  pacshoot.c gives such a jump the event coefficient of the flip itself (the small-signal control at the
+     * event), not the one of the step it is given in. */
+    int serial, cont;
 } PSSsaltEvent;
 
 /* card #559: set by pacshoot.c while a generic-charge td-PAC pass runs: returns the total diagonal |C| (Farads) of the node when its
