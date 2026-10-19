@@ -222,6 +222,12 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 - Plain transient on device-dominated circuits gains only 6–11 %.
 - Transient accuracy is not claimed to be better than stock. The fork reproduces its upstream
   base exactly, and both differ from 45.2 by about 1 % of ripple on switching decks.
+- **Known defect (open):** with a BSIM4 model at `tnoimod=1`, `.pnoise` leaves out the
+  source/drain part of the channel noise (about 4.4 dB low on a test circuit) without a message:
+  the model creates those internal noise nodes only when the deck also has a plain `.noise`
+  analysis. Workaround: add an inert `.noise` card on a separate node (`Vdum ndum 0 DC 0 AC 1`,
+  `Rdum ndum 0 1k noisy=0`, `.noise v(ndum) Vdum lin 1 1k 1k`). With it, `.pnoise` agrees with
+  a transient-noise ensemble within 0.3 dB.
 - A closed loop in which an analog control signal sets an XSPICE `d_pwm` duty cannot run in
   `.pss` (refused); open-loop digital clocks work since `s143`.
 - **Earlier silent errors in the fork itself.** Builds before `s123` gave wrong `.pac`/`.pstb`
@@ -254,7 +260,8 @@ an analytic reference for plain transient.
 
 ## Building
 
-Linux, same as stock ngspice:
+A Linux x86-64 binary of `s144` is attached to the [s144 release](../../releases/tag/s144)
+(extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
 ./autogen.sh
