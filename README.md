@@ -10,8 +10,8 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 143 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s143`; `s143` is the latest.
+- **This fork:** 144 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s144`; `s144` is the latest.
 - **Size of the change:** 90 files, about 22 500 lines added, 143 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
@@ -231,6 +231,10 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
   since `s143` the discontinuous-conduction case is within 0.03 dB at the default 200 points.
   Builds before `s143` read the control-to-output gain of a half bridge with dead time 0.04 dB
   high (the body diode's series resistance was left out of the switch-event jump).
+  Builds before `s144` refused a switch node whose only charge is the devices' (diode or body-diode
+  capacitance, no capacitor at the node) when it had an RC snubber; it runs since `s144`, within
+  0.024 dB and 0.13° on nine such decks, and a slow turn-off edge no longer delays the phase
+  (0.47° to 0.08° at 100 kHz in discontinuous conduction).
   Builds before `s141` could report a stable converter as `UNSTABLE(period-doubling)`
   (Floquet multiplier −1.27 instead of 0.994) when the same circuit was written with
   subcircuits; the stability check now uses the same finite-difference step rule as the
@@ -238,7 +242,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (51 at `s143`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (51 at `s144`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -283,3 +287,4 @@ change on its own. The tags are:
 | s140 | `.sens ac` over a sweep |
 | s141 | `.pss` Floquet verdict on subcircuit netlists; `.pstb` probe forms of `.stb` |
 | s143 | `.pss` with a digital clock; td `.pac` in discontinuous conduction; half bridge with dead time (`s142` was not released: its test run found a regression, fixed in `s143`) |
+| s144 | td `.pac` on a switch node with only device capacitance and an RC snubber (was refused); continuation jumps at the event's coefficient |

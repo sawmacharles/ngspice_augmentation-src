@@ -196,3 +196,11 @@ For an overview, see [README.md](README.md).
 - `7aa01cacd` pss (#712): period from a digital clock (d_osc / d_pwm) without driven=1; clock edge on the period boundary
 - `8784b9570` pac td (#711): DCM buck at the default 200 points is within 0.03 dB of the perturbed reference (was 0.40 dB)
 - `e34b94b08` pac td (#727): half bridge with dead time -- body-diode series resistance in the pre-event node equation, longer fast-node continuation
+
+## s144 — Switch node with only device capacitance and an RC snubber in td .pac
+
+1 commit.
+
+- `7da64e19c` pac td (#713): charge-only switch node with an RC snubber runs (was refused); continuation jumps take the coefficient of their event
+
+Nine open-loop asynchronous-buck decks of this kind are within 0.001-0.024 dB / 0.04-0.13 deg of the perturbed periodic steady state at 20/50/100 kHz; discontinuous conduction at 2000 points 0.033 dB / 0.08 deg (0.47 deg before the coefficient fix); closed-loop .pstb 0.002 dB / 0.045 deg. `PSS_SALT_NO713=1` restores the refusal, `PAC_NO713_COEF=1` the old coefficient timing.
