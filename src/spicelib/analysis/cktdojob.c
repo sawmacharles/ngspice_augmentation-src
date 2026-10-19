@@ -12,8 +12,11 @@ Modified: 2000 AlansFixes
 #include "ngspice/fteext.h"
 
 #include "analysis.h"
-#ifdef KLU
+#if defined(KLU) || defined(WITH_PSS)
 #include "ngspice/pssdefs.h"
+#endif
+#ifdef RFSPICE
+#include "ngspice/spardefs.h"
 #endif
 
 #ifdef XSPICE
@@ -241,3 +244,45 @@ CKTdoJob(CKTcircuit* ckt, int reset, TSKtask* task)
     return(error2);
 }
 
+
+
+/* card #729: does this task hold an analysis that evaluates device noise, and so
+ * needs the noise-only internal nodes some devices create in their setup?  BSIM4
+ * (b4set.c and the v5/v6/v7 copies) creates the internal source/drain nodes that
+ * carry the tnoimod=1 (v5/v6: tnoimod != 0) source/drain-resistance part of the
+ * channel noise (the rs/rd generator) only when this is true.  Before #729 each
+ * device looked only for a job NAMED "Noise Analysis" (a plain .noise card), so a
+ * .pnoise deck (a PSS job with PSSdoPnoise, named "Periodic Noise Analysis") or an
+ * .sp donoise=1 deck evaluated rs/rd between identical nodes and silently lost that
+ * part (#708: -4.43 dB on a clocked BSIM4 stage).  A transient, .ac, .pss, .pac,
+ * ... task still answers 0, so their node count is unchanged.
+ * PSS_SALT_NO729=1 restores the name-only test (red proof). */
+int
+CKTnoiseAnalGiven(TSKtask *task)
+{
+    JOB *job;
+    int old = getenv("PSS_SALT_NO729") != NULL;
+    int nan = spice_num_analysis();
+
+    if (!task)
+        return 0;
+    for (job = task->jobs; job; job = job->JOBnextJob) {
+        const char *an;
+        if (job->JOBname && strcmp(job->JOBname, "Noise Analysis") == 0)
+            return 1;
+        if (old || job->JOBtype < 0 || job->JOBtype >= nan || !analInfo[job->JOBtype])
+            continue;
+        an = analInfo[job->JOBtype]->if_analysis.name;
+        if (strcmp(an, "NOISE") == 0)
+            return 1;
+#ifdef WITH_PSS
+        if (strcmp(an, "PSS") == 0 && ((PSSan *) job)->PSSdoPnoise)
+            return 1;
+#endif
+#ifdef RFSPICE
+        if (strcmp(an, "SP") == 0 && ((SPAN *) job)->SPdoNoise)
+            return 1;
+#endif
+    }
+    return 0;
+}

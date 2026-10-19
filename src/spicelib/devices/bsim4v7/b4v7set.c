@@ -56,20 +56,15 @@ int error;
 CKTnode *tmp;
 int    noiseAnalGiven = 0, createNode;  /* Criteria for new node creation */
 double Rtot, DMCGeff, DMCIeff, DMDGeff;
-JOB   *job;
 
 #ifdef USE_OMP
 int idx, InstCount;
 BSIM4v7instance **InstArray;
 #endif
 
-    /* Search for a noise analysis request */
-    for (job = ((TSKtask *)ft_curckt->ci_curTask)->jobs;job;job = job->JOBnextJob) {
-        if(strcmp(job->JOBname,"Noise Analysis")==0) {
-            noiseAnalGiven = 1;
-            break;
-        }
-    }
+    /* Search for a noise analysis request: .noise, and since card #729 also
+     * .pnoise (PSS job) and .sp donoise -- see CKTnoiseAnalGiven() in cktdojob.c */
+    noiseAnalGiven = CKTnoiseAnalGiven((TSKtask *)ft_curckt->ci_curTask);
 
     /*  loop through all the BSIM4v7 device models */
     for( ; model != NULL; model = BSIM4v7nextModel(model))

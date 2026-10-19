@@ -380,6 +380,7 @@ extern int CKTdltMod(CKTcircuit *, GENmodel *);
 extern int CKTdltNNum(CKTcircuit *, int);
 extern int CKTdltNod(CKTcircuit *, CKTnode *);
 extern int CKTdoJob(CKTcircuit *, int , TSKtask *);
+extern int CKTnoiseAnalGiven(TSKtask *);   /* card #729: a noise-evaluating job (.noise, .pnoise, .sp donoise) */
 extern void CKTdump(CKTcircuit *, double, runDesc *);
 extern int CKTsoaInit(void);
 extern int CKTsoaCheck(CKTcircuit *);
