@@ -52,6 +52,8 @@ NON-STANDARD FEATURES
     None.
 
 =========================================================================== */
+#include <float.h>
+#include <math.h>
 #include "ngspice/ngspice.h"
 #include "ngspice/cm.h"
 #include "ngspice/evt.h"
@@ -416,6 +418,19 @@ that of the breakpoint.
 */
 
 
+/* card #712: model time -> circuit time subtracts a large continuing offset (g_xs_toff) from a model time of the same size: the result carries
+ * a rounding error of a few units of 10^-19 s.  A clock edge that belongs on the end of the analysis run would then land a hair before the
+ * final time and the next step would be shorter than the minimum step ("Timestep too small").  Snap such a breakpoint onto the final time. */
+static double
+xs_bkpt_to_circuit(CKTcircuit *ckt, double time)
+{
+    double rel = time - g_xs_toff;
+    if (g_xs_toff != 0.0 && ckt->CKTfinalTime > 0.0 &&
+        fabs(rel - ckt->CKTfinalTime) <= 64.0 * DBL_EPSILON * (fabs(time) + fabs(g_xs_toff)))
+        rel = ckt->CKTfinalTime;
+    return rel;
+}
+
 int cm_analog_set_temp_bkpt(
     double time)              /* The time of the breakpoint to be set */
 {
@@ -424,7 +439,7 @@ int cm_analog_set_temp_bkpt(
     /* Get the address of the ckt and instance structs from g_mif_info */
     ckt  = g_mif_info.ckt;
 
-    time -= g_xs_toff;   /* card #551: model time -> circuit time */
+    time = xs_bkpt_to_circuit(ckt, time);   /* card #551: model time -> circuit time (#712: edge on the end of the run snapped to it) */
 
     /* Make sure breakpoint is not prior to last accepted timepoint */
     if(time < ((ckt->CKTtime - ckt->CKTdelta) + ckt->CKTminBreak)) {

@@ -49,6 +49,8 @@ NON-STANDARD FEATURES
 ============================================================================*/
 
 
+#include <float.h>
+#include <math.h>
 #include "ngspice/ngspice.h"
 #include "ngspice/cktdefs.h"
 //#include "util.h"
@@ -98,6 +100,12 @@ void EVTqueue_output(
 
     /* Get pointers for fast access */
     output_queue = &(ckt->evt->queue.output);
+
+    /* card #712: with a continuing model time (g_xs_toff, periodic analyses) a delay computed as a difference of two large model times carries a
+     * rounding error of a few 1e-19 s; an output due on the end of the run must not land a hair before it. */
+    if (g_xs_toff != 0.0 && ckt->CKTfinalTime > 0.0 &&
+        fabs(event_time - ckt->CKTfinalTime) <= 64.0 * DBL_EPSILON * (fabs(g_xs_toff) + fabs(event_time)))
+        event_time = ckt->CKTfinalTime;
 
     /* Put the times into the event struct */
     new_event->event_time = event_time;

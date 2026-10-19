@@ -35,6 +35,69 @@
 /* gtri - end - wbk - Add headers */
 #endif
 
+#ifdef XSPICE
+#include "ngspice/mifdefs.h"
+/* card #712: a converter whose only clock is an XSPICE digital oscillator (d_osc) or pulse-width modulator (d_pwm) has no V/I source with a
+ * time function to take the period from.  The period of a `method=shoot` run is 1/Fguess; the circuit is admitted as driven, without
+ * `driven=1`, when a clock model runs at a whole multiple of Fguess (the model completes an integer number of cycles per period, so its
+ * state can be periodic).  d_pwm: the `frequency` parameter; d_osc: the `freq_array` when all its entries are equal (a control-dependent
+ * frequency is not a fixed clock).  Returns 1 and sets *fclk when one matches; *nclk counts the fixed-frequency clock models seen and
+ * *flast is the frequency of the last one (for the message). */
+static int
+pss_xspice_clock_scan(CKTcircuit *ckt, double fguess, double *fclk, int *nclk, double *flast)
+{
+    int i, found = 0;
+    *nclk = 0;
+    *flast = 0.0;
+    if (fguess <= 0.0)
+        return 0;
+    for (i = 0; i < DEVmaxnum; i++) {
+        const char *nm;
+        GENmodel *m;
+        int isosc, ispwm;
+        if (!DEVices[i] || !DEVices[i]->DEVpublic.cm_func || !ckt->CKThead[i] || !DEVices[i]->DEVpublic.name)
+            continue;
+        nm = DEVices[i]->DEVpublic.name;
+        isosc = !strcmp(nm, "d_osc");
+        ispwm = !strcmp(nm, "d_pwm");
+        if (!isosc && !ispwm)
+            continue;
+        for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+            GENinstance *g;
+            for (g = m->GENinstances; g; g = g->GENnextInstance) {
+                MIFinstance *mi = (MIFinstance *) g;
+                double f = 0.0, n, nr;
+                int ok = 0;
+                if (ispwm && mi->num_param > 2 && mi->param[2]) {
+                    f = mi->param[2]->is_null ? 1e6 : mi->param[2]->element[0].rvalue;   /* frequency (default 1e6) */
+                    ok = f > 0.0;
+                } else if (isosc && mi->num_param > 1 && mi->param[1]) {
+                    Mif_Param_Data_t *p = mi->param[1];                                    /* freq_array (default [1e6 2e6]: not fixed) */
+                    if (!p->is_null && p->size >= 1) {
+                        int k;
+                        f = p->element[0].rvalue;
+                        ok = f > 0.0;
+                        for (k = 1; k < p->size; k++)
+                            if (p->element[k].rvalue != f) ok = 0;
+                    }
+                }
+                if (!ok)
+                    continue;
+                (*nclk)++;
+                *flast = f;
+                n = f / fguess;
+                nr = floor(n + 0.5);
+                if (!found && nr >= 1.0 && fabs(n - nr) <= 1e-6 * nr) {
+                    found = 1;
+                    *fclk = f;
+                }
+            }
+        }
+    }
+    return found;
+}
+#endif
+
 extern char* eng(double value, int digits, bool numeric, bool bytes);
 
 /* card #458: shooting-Newton driven PSS, implemented in pssshoot.c */
@@ -3532,6 +3595,21 @@ DCpss(CKTcircuit *ckt,
                     "source time function found (XSPICE-clocked deck).\n",
                     ckt->CKTguessedFreq);
         }
+#ifdef XSPICE
+        /* card #712: no V/I time function, no driven=1: a fixed-frequency XSPICE d_osc / d_pwm running at a whole multiple of Fguess is the clock. */
+        if (!pss_driven && job->PSSmethod == PSS_METHOD_SHOOT && !job->PSStrigNode) {
+            double fclk = 0.0, flast = 0.0;
+            int nclk = 0;
+            if (pss_xspice_clock_scan(ckt, ckt->CKTguessedFreq, &fclk, &nclk, &flast)) {
+                pss_driven = 1;
+                fprintf(stderr, "PSS: no V/I source with a time function; the XSPICE digital clock (d_osc / d_pwm, %g Hz = %g x Fguess) "
+                        "sets the period 1/Fguess = %g s (card #712).\n", fclk, fclk / ckt->CKTguessedFreq, 1.0 / ckt->CKTguessedFreq);
+            } else if (nclk > 0) {
+                fprintf(stderr, "PSS: XSPICE clock model(s) found (last at %g Hz) but none runs at a whole multiple of Fguess = %g Hz; "
+                        "give Fguess = the clock frequency, or driven=1 to force (card #712).\n", flast, ckt->CKTguessedFreq);
+            }
+        }
+#endif
         if (pss_driven) {
             /* Match the shooting-phase integration resolution to the sampling
              * resolution the user asked for (psspoints samples per period).

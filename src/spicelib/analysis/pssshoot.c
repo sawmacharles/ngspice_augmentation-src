@@ -93,6 +93,7 @@ What this does NOT do (see the card #458 report for the full list):
 #include "ngspice/mif.h"
 #include "ngspice/evtproto.h"
 #include "ngspice/evtudn.h"
+#include "ngspice/evt.h"   /* card #712: event-node count */
 #endif
 
 #include "cap/capdefs.h"
@@ -1412,6 +1413,8 @@ pss_xs_periodicity(CKTcircuit *ckt, PSSstateMap *map, double T, const double *x0
 {
     int i, ndig = 0, err, nrun;
     double drift = 0.0, worst_v = 0.0;
+    int worst_i = 0;
+    double drift_prev = 0.0;
     double *hx = NULL;
     (void) tol;
     /* The last latching baseline of the Newton iteration may be several iterates old (Broyden steps do not latch), so the hidden vector
@@ -1430,6 +1433,7 @@ pss_xs_periodicity(CKTcircuit *ckt, PSSstateMap *map, double T, const double *x0
             return 1;
         }
         ndig = XSsnapDigitalDiff(ckt, g_xs_snap, g_xs_prev);
+        drift_prev = drift;
         drift = 0.0; worst_v = 0.0;
         if (hx && g_hid_x && g_hid_n == SMPmatSize(ckt->CKTmatrix) + 1) {
             double vmax = 0.0;
@@ -1440,8 +1444,15 @@ pss_xs_periodicity(CKTcircuit *ckt, PSSstateMap *map, double T, const double *x0
                 double d = fabs(g_hid_x[i] - hx[i]);
                 if (sc < 1e-2 * vmax) sc = 1e-2 * vmax;
                 if (sc < 1e-9) sc = 1e-9;
-                if (d / sc > drift) { drift = d / sc; worst_v = d; }
+                if (d / sc > drift) { drift = d / sc; worst_v = d; worst_i = i; }
             }
+        }
+        if (getenv("PSS_XS_TRACE")) {
+            CKTnode *nd_;
+            for (nd_ = ckt->CKTnodes; nd_; nd_ = nd_->next)
+                if (nd_->number == worst_i) break;
+            fprintf(stderr, "XS-TRACE periodicity baseline %d: ndig=%d drift=%.3e worst node #%d '%s' old=%.9g new=%.9g\n", nrun, ndig, drift,
+                    worst_i, nd_ && nd_->name ? (const char *) nd_->name : "?", hx ? hx[worst_i] : 0.0, g_hid_x ? g_hid_x[worst_i] : 0.0);
         }
         if (ndig == 0 && drift <= 1e-4)
             break;
@@ -1465,6 +1476,21 @@ pss_xs_periodicity(CKTcircuit *ckt, PSSstateMap *map, double T, const double *x0
         fprintf(stderr, "PSS-SHOOT: FAILED -- the analog node vector (code-model / hybrid outputs, hidden state) is not periodic at the "
                 "converged native orbit: drift %.3e of its scale after one more period (> 1e-2); a hidden state with a slow time constant "
                 "has not settled (raise the stabilisation time) -- card #551.\n", drift);
+        return 1;
+    }
+    if (drift > 1e-3 && nrun >= 4 && drift_prev > 0.0 && drift >= 0.9 * drift_prev
+        && ckt->evt && ckt->evt->counts.num_nodes > 0 && !getenv("PSS_XS_SETTLE_ANY")) {
+        /* only with digital (event) nodes: a purely analog code model whose hidden node sits near 0 V (the 'capacitor' model,
+         * 8e-12 V of drift, 1.6e-3 relative on the 1e-9 floor) keeps the card #551 warning below.  PSS_XS_SETTLE_ANY=1 refuses on
+         * any circuit (the first #712 build's rule). */
+        /* card #712: repeated periods from the same native state do not bring the hidden node vector back (drift is not decaying): the
+         * digital block carries a quantity the shooting unknowns do not contain (a PWM edge time decided from the analog signal during
+         * the previous period) and the lagged hidden state does not contract; the converged 'orbit' is off (measured 140 % of the ripple). */
+        fprintf(stderr, "PSS-SHOOT: FAILED -- the hidden node vector does not settle: drift %.3e (relative) after %d further periods from the "
+                "same native state and not decaying. A digital block (d_pwm / d_osc edge times, sampled controls) holds timing decided by the "
+                "analog signal of the previous period; that state is not a shooting unknown, so the orbit is not reliable. Use a control that "
+                "is not sampled by the clock block inside the loop (open-loop / digitally quantised control), or a converged .tran / FRA "
+                "(card #712).\n", drift, nrun);
         return 1;
     }
     if (drift > 1e-3)

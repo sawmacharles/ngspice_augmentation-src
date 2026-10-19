@@ -247,6 +247,8 @@ int  cm_event_queue(
         double rel = time - g_xs_toff;
         if (fabs(rel - g_mif_info.circuit.evt_step) <= 16.0 * DBL_EPSILON * (fabs(time) + fabs(g_xs_toff)))
             rel = g_mif_info.circuit.evt_step;
+        if (ckt->CKTfinalTime > 0.0 && fabs(rel - ckt->CKTfinalTime) <= 64.0 * DBL_EPSILON * (fabs(time) + fabs(g_xs_toff)))
+            rel = ckt->CKTfinalTime;   /* card #712: an edge on the end of the run must not land a rounding error before it */
         time = rel;
     }
 

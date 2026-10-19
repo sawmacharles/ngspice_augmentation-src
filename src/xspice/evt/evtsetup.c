@@ -996,6 +996,8 @@ XSsnapTake(CKTcircuit *ckt, XSsnap *s, double L, double base_toff)
                 g_evt_udn_info[ni->udn_index]->plot_val(s->rhsold[k].nv, "state", &rv);
             fprintf(stderr, " %s=%g", ni->name, rv);
         }
+        for (k = 0; k < s->n_ie; k++) fprintf(stderr, " ie[%d]@%.6e", s->ie_inst[k], s->ie_t[k]);
+        for (k = 0; k < s->n_oe; k++) fprintf(stderr, " oe[%d]@%.6e", s->oe_out[k], s->oe_t[k]);
         fprintf(stderr, "\n");
     }
 }
@@ -1089,6 +1091,28 @@ XSsnapPut(CKTcircuit *ckt, const XSsnap *s, int values)
     }
 }
 
+/* The value a digital node has once the output events that fall due within XS_EDGE_EPS of the snapshot instant have been applied.  A clock edge
+ * that lands on the period boundary is processed at the end of one run or at the start of the next depending on rounding of the continuing model
+ * time (10^-20 s); both are the same orbit, so the periodicity comparison must not tell them apart (card #712). */
+#define XS_EDGE_EPS 1e-15
+static const void *
+xs_snap_node_effective(CKTcircuit *ckt, const XSsnap *s, int node)
+{
+    const void *v = s->rhsold[node].nv;
+    double tbest = -1e300;
+    int k;
+    for (k = 0; k < s->n_oe; k++) {
+        int out = s->oe_out[k];
+        if (ckt->evt->info.output_table[out]->node_index != node)
+            continue;
+        if (s->oe_t[k] <= XS_EDGE_EPS && s->oe_t[k] >= tbest) {
+            tbest = s->oe_t[k];
+            v = s->oe_val[k];
+        }
+    }
+    return v;
+}
+
 /* Number of digital nodes whose resolved value differs between two snapshots (hidden-state periodicity check). */
 int
 XSsnapDigitalDiff(CKTcircuit *ckt, const XSsnap *a, const XSsnap *b)
@@ -1098,7 +1122,8 @@ XSsnapDigitalDiff(CKTcircuit *ckt, const XSsnap *a, const XSsnap *b)
         return 0;
     for (i = 0; i < a->num_nodes; i++) {
         Mif_Boolean_t eq = MIF_TRUE;
-        g_evt_udn_info[ckt->evt->info.node_table[i]->udn_index]->compare(a->rhsold[i].nv, b->rhsold[i].nv, &eq);
+        const void *va = xs_snap_node_effective(ckt, a, i), *vb = xs_snap_node_effective(ckt, b, i);
+        g_evt_udn_info[ckt->evt->info.node_table[i]->udn_index]->compare((void *) va, (void *) vb, &eq);
         if (!eq)
             n++;
     }
