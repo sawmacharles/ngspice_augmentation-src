@@ -188,3 +188,11 @@ For an overview, see [README.md](README.md).
 
 - `e6961c5f6` pss (#682): the Floquet re-evaluation uses the Newton columns' step rule
 - `6b6923052` pstb (#717): probe=<inst>:<terminal> auto-insert and the lgprobe subcircuit
+
+## s143 — .pss with a digital clock, td .pac in discontinuous conduction, half bridge with dead time
+
+3 commits. (`s142` was built but not released: its test run found the `.pss` change refusing a purely analog XSPICE circuit; the fix is part of the first commit below.)
+
+- `7aa01cacd` pss (#712): period from a digital clock (d_osc / d_pwm) without driven=1; clock edge on the period boundary
+- `8784b9570` pac td (#711): DCM buck at the default 200 points is within 0.03 dB of the perturbed reference (was 0.40 dB)
+- `e34b94b08` pac td (#727): half bridge with dead time -- body-diode series resistance in the pre-event node equation, longer fast-node continuation

@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 140 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s141`; `s141` is the latest.
-- **Size of the change:** 89 files, about 22 300 lines added, 143 removed.
+- **This fork:** 143 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s143`; `s143` is the latest.
+- **Size of the change:** 90 files, about 22 500 lines added, 143 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -86,6 +86,10 @@ settled. It reports convergence, so there is no guessing.
   results of switching converters go wrong if handled naively.
 - Carries hidden state across the period restart: device charges in transistor-level
   circuits, and the state of XSPICE code models.
+- **Digital clocks:** a converter whose only clock is an XSPICE `d_pwm` or `d_osc` block
+  takes its period from that block (open loop: orbit within 0.05 % of the ripple of a settled
+  transient). A loop where the analog control sets the `d_pwm` duty is refused with a
+  message, because the edge time is state the solver does not carry.
 - Refuses a source that is not periodic from t = 0, rather than converging to the orbit of a
   different circuit.
 
@@ -218,12 +222,15 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 - Plain transient on device-dominated circuits gains only 6–11 %.
 - Transient accuracy is not claimed to be better than stock. The fork reproduces its upstream
   base exactly, and both differ from 45.2 by about 1 % of ripple on switching decks.
-- A circuit clocked only by an XSPICE digital PWM block cannot run in `.pss`: there is no
-  source to take the period from.
+- A closed loop in which an analog control signal sets an XSPICE `d_pwm` duty cannot run in
+  `.pss` (refused); open-loop digital clocks work since `s143`.
 - **Earlier silent errors in the fork itself.** Builds before `s123` gave wrong `.pac`/`.pstb`
   results on several ideal-switch converters without a message. They were found by checking
   52 decks against the perturbed reference and fixed in `s123`. Since then all 47 open-loop
-  decks agree within 0.067 dB and 0.32°, except three documented cases (up to 0.40 dB).
+  decks agree within 0.067 dB and 0.32°, except three documented cases (up to 0.40 dB);
+  since `s143` the discontinuous-conduction case is within 0.03 dB at the default 200 points.
+  Builds before `s143` read the control-to-output gain of a half bridge with dead time 0.04 dB
+  high (the body diode's series resistance was left out of the switch-event jump).
   Builds before `s141` could report a stable converter as `UNSTABLE(period-doubling)`
   (Floquet multiplier −1.27 instead of 0.994) when the same circuit was written with
   subcircuits; the stability check now uses the same finite-difference step rule as the
@@ -231,7 +238,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (48 at `s141`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (51 at `s143`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -275,3 +282,4 @@ change on its own. The tags are:
 | s139 | `trnoise` follows the seed |
 | s140 | `.sens ac` over a sweep |
 | s141 | `.pss` Floquet verdict on subcircuit netlists; `.pstb` probe forms of `.stb` |
+| s143 | `.pss` with a digital clock; td `.pac` in discontinuous conduction; half bridge with dead time (`s142` was not released: its test run found a regression, fixed in `s143`) |
