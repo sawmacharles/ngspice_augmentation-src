@@ -221,3 +221,11 @@ BSIM4 (4.5 to 4.8) created the internal source/drain nodes that carry the rs/rd 
 - `97227fc47` pss salt (#728): event buffer 8 -> 32; a step that fills it, or an event with more snubber jumps than it holds, is refused instead of dropping the rest silently
 
 Six decks (boost with 100 pF / 1 nF / 3 nF at the switch node, inverting buck-boost with 1 nF, chargeless or charged diode) were compared with an exact ODE reference (switch instants found exactly, error bar 6e-4 deg). s145 read up to 0.156 deg / 0.021 dB off; s146 0.005 deg / 0.007 dB at 20/50/100 kHz, also at 1000 and 4000 points and reltol 1e-6. The six causes, all in the parts given while the switch node is still moving, are listed in the first commit's message. `PSS_SALT_NO728=1` restores s145 exactly.
+
+## s147 — .pnoise on non-quasi-static BSIM4 / BSIM3 models
+
+1 commit.
+
+- `5f92ad383` pac td pnoise (#715): accept BSIM4 trnqsmod=1 / BSIM3 nqsmod=1 in td .pnoise; PAC_NQS_PNOISE_REFUSE=1 restores the refusal
+
+td `.pnoise` refused these models up to s146 although `.pac`, `.pstb` and `.pxf` accepted them. Neither model has a noise source on its charge-relaxation node, so the non-quasi-static model changes only the transfer to the output, which the td recursion already carries. Checked: a BSIM3 nqsmod=1 stage against its own `.noise` (which models the transient non-quasi-static behaviour) to 2.3e-6 of the total; a BSIM4 trnqsmod=1 stage per generator to 6.4e-8; a 1 MHz LO-switched BSIM4 trnqsmod=1 stage at 4-43 MHz against transient-noise ensembles, worst band 0.15 dB (resistor noise) and 0.14 dB (channel noise), where the quasi-static model is up to 3.9 dB off. Not checked: BSIM3 in a clocked circuit, flicker noise or tnoimod 1/2 together with the non-quasi-static model, and the option given on the device line instead of the model. **Known gap (all td analyses):** the non-quasi-static option is detected only on the `.model` line. Given on the device line of the other BSIM3 / BSIM4 versions (3.0, 3.1, 3.2, 4.5, 4.6, 4.7), which are refused when it is on the model line, the analysis runs unvalidated without a message. Put it on the `.model` line. Circuits without such a model run unchanged code.
