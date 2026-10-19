@@ -205,7 +205,9 @@ extern double (*PSSsaltModelCapMinHook)(CKTcircuit *ckt, int node);
 
 int PSSsaltContActive(void);   /* card #579 */
 extern int PSSsaltNoRoutedWindow;   /* card #583 */
-#define PSS_SALT_MAX_EVENTS 8
+/* card #728: 32 (was 8; a continuation step gives up to 6 parts since #728).  A step that fills the buffer is REFUSED by
+ * PSSsaltFindEvents() instead of dropping the rest silently. */
+#define PSS_SALT_MAX_EVENTS 32
 
 extern int PSSsaltActive;   /* env-var gated (PSS_SALTATION, default on); see pssshoot.c */
 

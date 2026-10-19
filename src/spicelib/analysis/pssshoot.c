@@ -3048,6 +3048,10 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
     double dt_actual, tau_max;
     static int env_checked = 0;
 
+    {   /* card #728: PSS_SALT_EVCAP=<n> lowers the buffer size (test of the overflow refusal at the end of this function) */
+        const char *e_ = getenv("PSS_SALT_EVCAP");
+        if (e_ && atoi(e_) > 0 && atoi(e_) < max) max = atoi(e_);
+    }
     if (!env_checked) {
         const char *e = getenv("PSS_SALTATION");
         if (e && strcmp(e, "0") == 0)
@@ -3762,6 +3766,11 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 if (tau_ind_neg > tau_max) tau_max = tau_ind_neg;
             }
 
+            if (n_extra >= PSS_SALT_MAX_EVENTS) {   /* card #728: never drop a jump silently */
+                fprintf(stderr, "PSS-SALT: REFUSED -- switch %s: %d or more snubber/far-capacitor jumps at one event, more than this "
+                        "build holds (PSS_SALT_MAX_EVENTS %d); the rest would be lost.\n", here->SWname, n_extra, PSS_SALT_MAX_EVENTS);
+                return -1;
+            }
             n++;
             {   /* card #575: the snubber-capacitor jumps of this event (chargeless routed node) */
                 int ix, serial_ = ev[n - 1].serial;
@@ -3811,6 +3820,11 @@ PSSsaltFindEvents(CKTcircuit *ckt, PSSsaltEvent *ev, int max)
                 "tau_max=%.4g settle_until=%.6g\n",
                 ckt->CKTtime, dt_actual, ckt->CKTdelta, n, ev[0].name, ev[0].dG, ev[0].v_switch, ev[0].h_dot,
                 ev[0].posCntrl, ev[0].negCntrl, ev[0].dfdt_pos, ev[0].dfdt_neg, tau_max, g_salt_settle_until);
+    if (n >= max) {   /* card #728: the buffer is full, so events or continuation parts may have been left out: refuse, never drop */
+        fprintf(stderr, "PSS-SALT: REFUSED -- %d or more switch events and continuation parts in one step at t=%.9g, more than this "
+                "build holds (%d); the rest would be lost.\n", n, ckt->CKTtime, max);
+        return -1;
+    }
     return n;
 }
 
