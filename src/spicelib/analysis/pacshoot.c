@@ -3468,14 +3468,22 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
  * (BSIM4 and BSIM3); on a 1 MHz LO-switched BSIM4 stage 0.003 dB / 0.01 deg vs the transient FRA (docs/pss-pac.md).  `.ac` is NOT the
  * reference: its acnqsmod is a different (single-pole) approximation, 20-40 % away from the transient model at omega*tau ~ 1.
  * acnqsmod alone (trnqsmod=0) does not change the transient model, hence not a td analysis: accepted with a note.  An NQS-capable device
- * of any OTHER family is still refused (not validated), and so is every NQS model in `.pnoise` (strict: the noise of the relaxation node is
- * not validated).  PAC_NQS_REFUSE=1 restores the pre-#559 refusal of every NQS model (red proof).
+ * of any OTHER family is still refused (not validated).
+ * `.pnoise` (strict = 1; card #715): the same two models are accepted.  No noise source sits on the relaxation node (BSIM4noise / BSIM3noise
+ * inject at the drain/source/gate pairs only, with densities from the quasi-static bias), so what NQS changes is the transfer from those
+ * pairs to the output, i.e. the relaxation node as a state of the transposed recursion, which .pxf adjoint == forward already pins (5e-13).
+ * Measured: BSIM3 nqsmod=1 static stage (whose .noise carries the transient-NQS small-signal model) td .pnoise dev=1 == .noise per generator
+ * to 2.3e-6 of the total at 0.1..10 MHz (the quasi-static deck is 0.14 off); BSIM4 trnqsmod=1 static stage (its .noise is quasi-static)
+ * every generator == .noise density x |td .pac| / |.ac| to 6.4e-8; a 1 MHz LO-driven BSIM4 trnqsmod=1 stage vs transient-noise ensembles
+ * at 4..43 MHz: resistor noise worst band 0.15 dB, mean +0.002 dB, channel noise 0.14 / +0.057 dB (band 1-sigma 0.11 / 0.08 dB; the
+ * trnqsmod=0 deck is 3.9 dB off; docs/pss-pac.md, card #715).  PAC_NQS_PNOISE_REFUSE=1 restores the .pnoise refusal (red proof).
+ * PAC_NQS_REFUSE=1 restores the pre-#559 refusal of every NQS model in every td analysis (red proof).
  * Returns the refusal text (static) or NULL; *note is set to a text to print once when an NQS model is accepted. */
 static const char *
 pac_find_nqs_device(CKTcircuit *ckt, const char **note, int strict)
 {
     int i, k;
-    static char buf[96], nbuf[160];
+    static char buf[96], nbuf[256];
     *note = NULL;
     for (i = 0; i < DEVmaxnum; i++) {
         SPICEdev *d = DEVices[i];
@@ -3498,12 +3506,14 @@ pac_find_nqs_device(CKTcircuit *ckt, const char **note, int strict)
                 memset(&v, 0, sizeof v);
                 if (d->DEVmodAsk(ckt, m, d->DEVpublic.modelParms[k].id, &v) != OK || v.iValue == 0)
                     continue;
-                if (getenv("PAC_NQS_REFUSE") || (is_tr && (strict || (strcmp(dn, "BSIM4") && strcmp(dn, "BSIM3"))))) {
+                if (getenv("PAC_NQS_REFUSE") || (is_tr && ((strict && getenv("PAC_NQS_PNOISE_REFUSE"))
+                                                        || (strcmp(dn, "BSIM4") && strcmp(dn, "BSIM3"))))) {
                     snprintf(buf, sizeof buf, "%s (%s=%d)", dn, kw, v.iValue);
                     return buf;
                 }
                 if (is_tr) {
-                    snprintf(nbuf, sizeof nbuf, "%s %s=%d: the channel-charge relaxation node is an ordinary state of the generic charge recursion (card #559)", dn, kw, v.iValue);
+                    snprintf(nbuf, sizeof nbuf, "%s %s=%d: the channel-charge relaxation node is an ordinary state of the generic charge recursion (card #559%s)",
+                             dn, kw, v.iValue, strict ? "; .pnoise: no noise source on it, card #715" : "");
                     *note = nbuf;
                 } else if (!*note) {
                     snprintf(nbuf, sizeof nbuf, "%s %s=%d affects .ac only: this td analysis linearises the transient model (quasi-static unless trnqsmod/nqsmod is on; card #559)", dn, kw, v.iValue);
@@ -3700,8 +3710,10 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         if (nqs && !getenv("PAC_ALLOW_NQS")) {
             fprintf(stderr, "%s: REFUSED -- %s: the non-quasi-static model carries an internal charge-relaxation state "
                     "that is not validated here (card #542; BSIM4 trnqsmod and BSIM3 nqsmod are accepted in .pac/.pstb/.pxf since "
-                    "card #559, not in .pnoise). Use the quasi-static model (trnqsmod=0 / nqsmod=0). PAC_ALLOW_NQS=1 overrides "
-                    "(result then unvalidated).\n", who, nqs);
+                    "card #559 and in .pnoise since card #715%s). Use the quasi-static model (trnqsmod=0 / nqsmod=0). PAC_ALLOW_NQS=1 overrides "
+                    "(result then unvalidated).\n", who, nqs,
+                    getenv("PAC_NQS_REFUSE") ? "; refused because PAC_NQS_REFUSE is set"
+                    : getenv("PAC_NQS_PNOISE_REFUSE") && !strcmp(who, "PNOISE-TD") ? "; refused because PAC_NQS_PNOISE_REFUSE is set" : "");
             return E_UNSUPP;
         }
         if (note)
