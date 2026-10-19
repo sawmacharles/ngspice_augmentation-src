@@ -212,3 +212,12 @@ Nine open-loop asynchronous-buck decks of this kind are within 0.001-0.024 dB / 
 - `e61e2e7c4` bsim4 (#729): create the tnoimod noise nodes for .pnoise and .sp donoise too (CKTnoiseAnalGiven), not only for a job named "Noise Analysis"; PSS_SALT_NO729=1 restores the old test
 
 BSIM4 (4.5 to 4.8) created the internal source/drain nodes that carry the rs/rd part of the `tnoimod=1` channel noise (4.5/4.6: any `tnoimod != 0`) only when a plain `.noise` analysis existed. Under `.pnoise` (both engines) and `.sp donoise=1` that part was 0: a clocked BSIM4 common-source stage read 4.43 dB low against a transient-noise ensemble; now within 0.114 dB. A static stage: `.pnoise` per generator equals `.noise` to 4.7e-7. Analyses without noise are unchanged (no extra nodes).
+
+## s146 — Capacitor at the switch node against an exact reference; no silent event drop
+
+2 commits.
+
+- `6d6f1e542` pac td (#728): capacitor nodes treated as fast (boost / buck-boost with a capacitor at the switch node) within 0.007 dB / 0.005 deg of an exact reference
+- `97227fc47` pss salt (#728): event buffer 8 -> 32; a step that fills it, or an event with more snubber jumps than it holds, is refused instead of dropping the rest silently
+
+Six decks (boost with 100 pF / 1 nF / 3 nF at the switch node, inverting buck-boost with 1 nF, chargeless or charged diode) were compared with an exact ODE reference (switch instants found exactly, error bar 6e-4 deg). s145 read up to 0.156 deg / 0.021 dB off; s146 0.005 deg / 0.007 dB at 20/50/100 kHz, also at 1000 and 4000 points and reltol 1e-6. The six causes, all in the parts given while the switch node is still moving, are listed in the first commit's message. `PSS_SALT_NO728=1` restores s145 exactly.

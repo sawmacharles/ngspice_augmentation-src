@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 145 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s145`; `s145` is the latest.
-- **Size of the change:** 94 files, about 22 600 lines added, 175 removed.
+- **This fork:** 147 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s146`; `s146` is the latest.
+- **Size of the change:** 94 files, about 23 000 lines added, 175 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -235,6 +235,10 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
   capacitance, no capacitor at the node) when it had an RC snubber; it runs since `s144`, within
   0.024 dB and 0.13° on nine such decks, and a slow turn-off edge no longer delays the phase
   (0.47° to 0.08° at 100 kHz in discontinuous conduction).
+  Builds before `s146` read the phase of a boost or buck-boost with a capacitor at its switch
+  node up to 0.16° off (gain up to 0.02 dB) against an exact reference; since `s146` within
+  0.007 dB and 0.005°. A switching step with more switch-event parts than the engine holds is
+  now refused; before `s146` the extra parts (beyond 8) were dropped without a message.
   Builds before `s145` left out the source/drain part of the BSIM4 `tnoimod=1` channel noise
   in `.pnoise` (about 4.4 dB low on a test circuit): the model created those internal noise
   nodes only when the deck also had a plain `.noise` analysis. Since `s145` `.pnoise` (and
@@ -247,7 +251,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (52 at `s145`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (54 at `s146`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -259,7 +263,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s144` is attached to the [s144 release](../../releases/tag/s144)
+A Linux x86-64 binary of `s146` is attached to the [s146 release](../../releases/tag/s146)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -295,3 +299,4 @@ change on its own. The tags are:
 | s143 | `.pss` with a digital clock; td `.pac` in discontinuous conduction; half bridge with dead time (`s142` was not released: its test run found a regression, fixed in `s143`) |
 | s144 | td `.pac` on a switch node with only device capacitance and an RC snubber (was refused); continuation jumps at the event's coefficient |
 | s145 | BSIM4 `tnoimod=1` channel noise complete in `.pnoise` |
+| s146 | boost / buck-boost with a capacitor at the switch node within 0.005° of an exact reference; full event buffer refused, never dropped |
