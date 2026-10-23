@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 152 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s150`; `s150` is the latest.
-- **Size of the change:** 98 files, about 25 000 lines added, 232 removed.
+- **This fork:** 153 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s151`; `s151` is the latest.
+- **Size of the change:** 101 files, about 27 000 lines added, 242 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -141,7 +141,31 @@ Every speed change was required to give the same transient results as the unpatc
 - Each speedup can be switched off at run time, for example with `NGSPICE_FLATB=0`,
   `NGSPICE_CAPBASE=0` or `NGSPICE_CAPFLAT=0`.
 
-### 5. Robustness
+### 5. Envelope following for long converter transients: `.tranenv`
+
+A soft-start or load step of a switching converter takes thousands of switching periods.
+`.tranenv` simulates a few of them and jumps over the rest along the slow envelope (an implicit
+step over M periods, solved by Newton on the one-period map), with a local error estimate.
+
+```spice
+.tranenv 500k 200 8 1e-4 4m 100 envtol=5e-4 phase=0.5 uic
+*        Fclock Points SC_iter Steady_coeff Tstop Mmax
+```
+
+- On a closed-loop voltage-mode buck soft-start (2000 periods), it simulates 171 periods in
+  1.09 s. Every simulated period's cycle average of the output voltage and inductor current, and
+  its output ripple, is within 0.014 % / 0.16 % / 0.14 % of a plain `.tran` at reltol 1e-7. The
+  deck's own plain `.tran` takes 6.8 s and is 0.57 % / 7.6 % / 13.7 % off. At matched accuracy
+  the gain is 3.8x. On a peak-current-mode buck the two draw level (1.0–1.05x at matched accuracy).
+- What makes the jumps work is that every period map runs at a tight transient tolerance
+  (`maptol=`, default reltol 1e-5). At the usual 1e-3 the step control places the switch edges
+  differently each period, and the one-period map is too rough for Newton.
+- Output: the simulated periods are written as a transient. Jumped periods are not output and not
+  interpolated, and the error bound covers simulated periods only: a disturbance that starts and
+  ends inside a jumped span is not seen (source corners are never jumped over).
+- A separate directive: plain `.tran` runs unchanged code.
+
+### 6. Robustness
 
 - **Transient checkpoint and restart:** a resumed run is bit-exact with an uninterrupted one.
 - **Absurd operating points:** a DC operating-point stage that "converges" to absurd node
@@ -268,7 +292,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (57 at `s150`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (57 at `s151`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -280,7 +304,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s150` is attached to the [s150 release](../../releases/tag/s150)
+A Linux x86-64 binary of `s151` is attached to the [s151 release](../../releases/tag/s151)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -321,3 +345,4 @@ change on its own. The tags are:
 | s148 | a non-quasi-static option on the device line is checked like one on the `.model` line (unvalidated versions ran without a message) |
 | s149 | lossless transmission lines in `.pss` shooting and td `.pac/.pstb/.pxf` (the orbit was wrong without a message); lossy lines refused |
 | s150 | td `.pac/.pstb/.pxf` through digital XSPICE blocks (was refused): edge-time shifts; exact comparator crossings in `.pss` |
+| s151 | `.tranenv`: envelope following for closed-loop converter soft-starts (6x faster than plain `.tran` on a voltage-mode buck, more accurate) |
