@@ -160,6 +160,7 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 #include "sw/swdefs.h"   /* card #559: switch power nodes with device-model charge */
 #include "dio/diodefs.h"   /* card #581: diode commutation note */
 #include "isrc/isrcdefs.h"
+#include "tra/tradefs.h"   /* card #716: line history of the td small-signal recursion */
 #ifdef XSPICE
 #include "ngspice/miftypes.h"
 #include "ngspice/mif.h"
@@ -553,7 +554,9 @@ pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
 #endif
         /* card #553: the recording pass's plot is never read; keep one point per vector (PSS_KEEP_RUN_DATA=1: old behaviour) */
         PSSdiscardRunData = !(getenv("PSS_KEEP_RUN_DATA") && atoi(getenv("PSS_KEEP_RUN_DATA")) != 0);
+        TRApssRestore = 1;   /* card #716: the recording runs start the lines from the PSS's periodic history */
         err = DCtran(ckt, 1);
+        TRApssRestore = 0;
         if (err == E_TIMESTEP) g_pac_rec_tstep = 1;
         PSSdiscardRunData = 0;
         ckt->CKTreltol = save_reltol;
@@ -596,6 +599,217 @@ static double g_pac_T = 0.0;                              /* period, for the 1/T
 static double *g_pac_rhs_re = NULL, *g_pac_rhs_im = NULL, *g_pac_scratch = NULL; /* [neq+1] */
 static int g_pac_exact_jac = 0;   /* card #465 THIRD pass, task 1: see pac_refactor_at_accepted() */
 
+
+/* ------------------------------------------------------------------ */
+/* card #716: TRANSMISSION LINES (TRA) IN THE TIME-DOMAIN SMALL-SIGNAL RECURSION.
+ * The linearised line is the line itself (it is linear): the excitation of port 1 at step k is the wave y(pos2) - y(neg2) +
+ * Z0 y(br2) of the SAME column at t_k - TD, interpolated with the three table points and Lagrange weights the large-signal step
+ * used (TRAip*, recorded by TRAinterp() at that step), and likewise for port 2; it enters the right-hand side of the branch
+ * equation exactly as TRAinput enters the transient's.  A wave at t <= 0 is a history sample of the column: the restored delay
+ * table of the recording runs is the periodic history the PSS converged (pssshoot.c: pss_tl_newton(), samples at fixed times
+ * tau_j), and its small-signal counterpart is an unknown of the boundary-value problem.  For y(t) = ytilde(t) e^{jwt} with
+ * ytilde T-periodic, y(tau) = e^{-jwT} y(tau + T), so the history samples h_j obey e^{jwT} h_j = (the column's wave at
+ * tau_j + T), read from the end of the recording run with the large-signal table's own quadratic interpolation (the same
+ * operator the PSS map applies, PSStlTableAt).  The Floquet problem is therefore solved on the augmented state (native states,
+ * history samples): pass 1 carries one homogeneous column per history sample besides the native ones, the boundary solve is
+ * (e^{jwT} I - Phi_aug) xi = z_aug, and pass 2 starts every frequency column from its own xi (native part and history part).
+ * For TD > T the readout at tau_j + T < 0 is itself a history sample (the periodic extension), handled by the same table.
+ * PAC_TL_NO_DELAY=1 drops the delayed terms (the line then absorbs every small-signal wave): red proof only. */
+static PACc pac_get(const PACc *C, int row, int M, int m);
+typedef struct {
+    TRAinstance *h;
+    int nh;           /* history entries (TRApssHistN) */
+    int off;          /* offset of this line's 2*nh history unknowns */
+} PACtl;
+static PACtl *g_tl = NULL;
+static int g_tl_nl = 0, g_tl_M = 0;           /* lines, history unknowns */
+static int g_tl_Mc = 0;                        /* columns of the current pass */
+static PACc *g_tl_H = NULL;                    /* [g_tl_M * Mc] history of every column */
+static double *g_tl_t = NULL;                  /* [cap] accepted times of the current pass */
+static PACc *g_tl_W = NULL;                    /* [(step * nl * 2 + l * 2 + q) * Mc + m] waves (q 0: port 2, 1: port 1) */
+static int g_tl_ns = 0, g_tl_cap = 0, g_tl_miss = 0;
+static int g_tl_nodelay = 0;
+
+static void
+pac_tl_free_pass(void)
+{
+    if (g_tl_H) tfree(g_tl_H);
+    if (g_tl_t) tfree(g_tl_t);
+    if (g_tl_W) tfree(g_tl_W);
+    g_tl_H = NULL; g_tl_t = NULL; g_tl_W = NULL;
+    g_tl_ns = g_tl_cap = 0; g_tl_Mc = 0;
+}
+
+static void
+pac_tl_free(void)
+{
+    pac_tl_free_pass();
+    if (g_tl) tfree(g_tl);
+    g_tl = NULL; g_tl_nl = g_tl_M = 0;
+}
+
+/* collect the lines; returns the number of history unknowns (0: no line), -1 refused (message printed) */
+static int
+pac_tl_setup(CKTcircuit *ckt, const char *who)
+{
+    int tt = CKTtypelook("Tranline"), nl = 0;
+    TRAmodel *m;
+    TRAinstance *h;
+    pac_tl_free();
+    g_tl_nodelay = getenv("PAC_TL_NO_DELAY") != NULL;
+    if (tt < 0 || !ckt->CKThead[tt])
+        return 0;
+    for (m = (TRAmodel *) ckt->CKThead[tt]; m; m = TRAnextModel(m))
+        for (h = TRAinstances(m); h; h = TRAnextInstance(h))
+            nl++;
+    if (!nl) return 0;
+    g_tl = TMALLOC(PACtl, nl);
+    if (!g_tl) return -1;
+    for (m = (TRAmodel *) ckt->CKThead[tt]; m; m = TRAnextModel(m))
+        for (h = TRAinstances(m); h; h = TRAnextInstance(h)) {
+            if (h->TRApssHistN < 3) {
+                fprintf(stderr, "%s: REFUSED -- transmission line %s has no periodic history from the PSS (PSS_TL_OFF, or the "
+                        "shooting PSS did not run): the small-signal recursion needs it -- card #716.\n", who, h->TRAname);
+                pac_tl_free();
+                return -1;
+            }
+            g_tl[g_tl_nl].h = h;
+            g_tl[g_tl_nl].nh = h->TRApssHistN;
+            g_tl[g_tl_nl].off = g_tl_M;
+            g_tl_M += 2 * h->TRApssHistN;
+            g_tl_nl++;
+        }
+    return g_tl_M;
+}
+
+/* start a pass with Mc columns; H0 [g_tl_M * Mc] (NULL: zero history) */
+static int
+pac_tl_reset(int Mc, const PACc *H0)
+{
+    pac_tl_free_pass();
+    if (!g_tl_nl) return 0;
+    g_tl_Mc = Mc;
+    g_tl_H = TMALLOC(PACc, (size_t) g_tl_M * Mc);
+    if (!g_tl_H) return 1;
+    if (H0) memcpy(g_tl_H, H0, (size_t) g_tl_M * Mc * sizeof(PACc));
+    else memset(g_tl_H, 0, (size_t) g_tl_M * Mc * sizeof(PACc));
+    g_tl_miss = 0;
+    return 0;
+}
+
+/* wave q (0: from port 2, the excitation of port 1; 1: from port 1) of line l, column m, at a table time t */
+static PACc
+pac_tl_value(int l, int q, double t, int m)
+{
+    PACtl *L = &g_tl[l];
+    const double *ht = L->h->TRApssHist;
+    int Mc = g_tl_Mc, lo, hi;
+    double eps = 1e-12 * (fabs(ht[0]) + fabs(t) + 1e-15);
+    PACc z = { 0.0, 0.0 };
+    if (t <= ht[3 * (L->nh - 1)] + eps) {   /* a history sample */
+        lo = 0; hi = L->nh - 1;
+        while (hi - lo > 1) { int mid = (lo + hi) / 2; if (ht[3 * mid] <= t) lo = mid; else hi = mid; }
+        if (fabs(ht[3 * hi] - t) <= eps) lo = hi;
+        if (fabs(ht[3 * lo] - t) > eps) g_tl_miss++;
+        return g_tl_H[(size_t) (L->off + q * L->nh + lo) * Mc + m];
+    }
+    if (g_tl_ns <= 0) { g_tl_miss++; return z; }
+    lo = 0; hi = g_tl_ns - 1;
+    if (t >= g_tl_t[hi]) lo = hi;
+    else {
+        while (hi - lo > 1) { int mid = (lo + hi) / 2; if (g_tl_t[mid] <= t) lo = mid; else hi = mid; }
+        if (fabs(g_tl_t[hi] - t) < fabs(g_tl_t[lo] - t)) lo = hi;
+    }
+    if (fabs(g_tl_t[lo] - t) > 1e-12 * fabs(t) + 1e-20) g_tl_miss++;
+    return g_tl_W[((size_t) lo * g_tl_nl * 2 + (size_t) l * 2 + q) * Mc + m];
+}
+
+/* the delayed excitations of column m at the current step, into g_pac_rhs_re/im */
+static void
+pac_tl_rhs(int m, int M)
+{
+    int l, i, q;
+    (void) M;
+    if (!g_tl_nl || g_tl_nodelay)
+        return;
+    for (l = 0; l < g_tl_nl; l++) {
+        TRAinstance *h = g_tl[l].h;
+        if (!h->TRAipOK) continue;
+        for (q = 0; q < 2; q++) {
+            PACc in = { 0.0, 0.0 };
+            for (i = 0; i < 3; i++)
+                in = pc_add(in, pc_scale(pac_tl_value(l, q, h->TRAipT[i], m), h->TRAipF[i]));
+            if (q == 0) { g_pac_rhs_re[h->TRAbrEq1] += in.re; g_pac_rhs_im[h->TRAbrEq1] += in.im; }
+            else        { g_pac_rhs_re[h->TRAbrEq2] += in.re; g_pac_rhs_im[h->TRAbrEq2] += in.im; }
+        }
+    }
+}
+
+/* keep the waves of every column at this accepted step (from g_pac_Cnew, the step's final solution) */
+static void
+pac_tl_store(double t, int M)
+{
+    int l, m;
+    if (!g_tl_nl) return;
+    if (g_tl_ns >= g_tl_cap) {
+        int nc = g_tl_cap ? 2 * g_tl_cap : 1024;
+        double *nt = TREALLOC(double, g_tl_t, nc);
+        PACc *nw;
+        if (!nt) { g_pac_failed = 1; return; }
+        g_tl_t = nt;
+        nw = TREALLOC(PACc, g_tl_W, (size_t) nc * g_tl_nl * 2 * M);
+        if (!nw) { fprintf(stderr, "PAC-TD: out of memory for the transmission-line trajectories (card #716).\n"); g_pac_failed = 1; return; }
+        g_tl_W = nw;
+        g_tl_cap = nc;
+    }
+    g_tl_t[g_tl_ns] = t;
+    for (l = 0; l < g_tl_nl; l++) {
+        TRAinstance *h = g_tl[l].h;
+        double z0 = h->TRAimped;
+        for (m = 0; m < M; m++) {
+            PACc w2 = pc_add(pc_sub(pac_get(g_pac_Cnew, h->TRAposNode2, M, m), pac_get(g_pac_Cnew, h->TRAnegNode2, M, m)),
+                             pc_scale(pac_get(g_pac_Cnew, h->TRAbrEq2, M, m), z0));
+            PACc w1 = pc_add(pc_sub(pac_get(g_pac_Cnew, h->TRAposNode1, M, m), pac_get(g_pac_Cnew, h->TRAnegNode1, M, m)),
+                             pc_scale(pac_get(g_pac_Cnew, h->TRAbrEq1, M, m), z0));
+            g_tl_W[((size_t) g_tl_ns * g_tl_nl * 2 + (size_t) l * 2 + 0) * M + m] = w2;   /* table column 1: sent to port 1 */
+            g_tl_W[((size_t) g_tl_ns * g_tl_nl * 2 + (size_t) l * 2 + 1) * M + m] = w1;   /* table column 2: sent to port 2 */
+        }
+    }
+    g_tl_ns++;
+}
+
+/* after a pass of length T: the waves of every column at tau_j + T, by the large-signal table's quadratic interpolation over
+ * the entries the line's delay table holds at the end of the run; out [g_tl_M * Mc] */
+static int
+pac_tl_readout(double T, PACc *out)
+{
+    int l, m, j, q, Mc = g_tl_Mc;
+    for (l = 0; l < g_tl_nl; l++) {
+        TRAinstance *h = g_tl[l].h;
+        int nn = h->TRAsizeDelay + 1, nh = g_tl[l].nh;
+        double *tab = TMALLOC(double, (size_t) nn * 3);
+        if (!tab) return 1;
+        for (j = 0; j < nn; j++) tab[3 * j] = h->TRAdelays[3 * j];
+        for (m = 0; m < Mc; m++)
+            for (q = 0; q < 2; q++) {
+                /* the operator is linear: interpolate the real and imaginary parts separately */
+                int part;
+                for (part = 0; part < 2; part++) {
+                    for (j = 0; j < nn; j++) {
+                        PACc v = pac_tl_value(l, q, tab[3 * j], m);
+                        tab[3 * j + 1] = part ? v.im : v.re;
+                    }
+                    for (j = 0; j < nh; j++) {
+                        double v = PSStlTableAt(tab, nn, h->TRApssHist[3 * j] + T, 1);
+                        PACc *o = &out[(size_t) (g_tl[l].off + q * nh + j) * Mc + m];
+                        if (part) o->im = v; else o->re = v;
+                    }
+                }
+            }
+        tfree(tab);
+    }
+    return 0;
+}
 /* ------------------------------------------------------------------ */
 /* card #542: GENERIC CHARGE-BASED HISTORY.
  *
@@ -2298,6 +2512,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
                 }
             }
             pac_hid_rhs(m, M);
+            pac_tl_rhs(m, M);   /* card #716 */
             if (pac_mq_on() && !pac_hid_active())
                 pac_mq_put(m);   /* card #558: solved for all columns after the loop (not with #557 hidden states: they update per column after the solve) */
             else {
@@ -2343,6 +2558,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
             }
         }
         pac_hid_rhs(m, M);
+        pac_tl_rhs(m, M);   /* card #716 */
         if (pac_mq_on() && !pac_hid_active())
             pac_mq_put(m);   /* card #558: solved for all columns after the loop (not with #557 hidden states: they update per column after the solve) */
         else {
@@ -2915,6 +3131,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
             }
         }
 
+        pac_tl_rhs(m, M);   /* card #716 */
         if (pac_mq_on() && !pac_hid_active())
             pac_mq_put(m);   /* card #558: solved for all columns after the loop */
         else {
@@ -3035,6 +3252,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
             fprintf(df, "\n"); fflush(df);
         }
     }
+    pac_tl_store(t_new, M);   /* card #716: the waves of this step's final solution */
     { PACc *tmp = g_pac_Cprev; g_pac_Cprev = g_pac_Cnew; g_pac_Cnew = tmp; }
     { PACc *tmp = g_pac_Tprev; g_pac_Tprev = g_pac_Tnew; g_pac_Tnew = tmp; }
     g_pac_tprev = t_new;
@@ -3443,6 +3661,8 @@ pac_circuit_has_model_charges(CKTcircuit *ckt, const char **delay_dev)
         if (!DEVices[i] || !ckt->CKThead[i] || !DEVices[i]->DEVpublic.name)
             continue;
         nm = DEVices[i]->DEVpublic.name;
+        if (!strcmp(nm, "Tranline") && PSStlCount() > 0)
+            continue;   /* card #716: a lossless line with the PSS's periodic history: conductances only, its delay in pac_tl_* */
         if (!strcmp(nm, "Tranline") || !strcmp(nm, "TransLine") || !strcmp(nm, "CplLines") ||
             !strcmp(nm, "LTRA")) {
             *delay_dev = nm;
@@ -3749,10 +3969,28 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     }
     has = pac_circuit_has_model_charges(ckt, &delay);
     if (delay) {
-        fprintf(stderr, "%s: REFUSED -- device type '%s' carries delay history that is not a charge state; "
-                "td small-signal analysis of it is not implemented (card #542).\n", who, delay);
+        if (!strcmp(delay, "Tranline"))
+            fprintf(stderr, "%s: REFUSED -- transmission line (TRA) without the periodic line history of the shooting PSS (PSS_TL_OFF "
+                    "set): the td small-signal recursion needs it (card #716).\n", who);
+        else
+            fprintf(stderr, "%s: REFUSED -- device type '%s' carries delay history that is not a charge state; td small-signal "
+                    "analysis of it is not implemented (card #542; the lossless line TRA is supported since card #716, the lossy "
+                    "LTRA, TXL and coupled CPL lines are not: their history is a convolution since t = 0).\n", who, delay);
         return E_UNSUPP;
     }
+    if (PSStlCount() > 0 && !strcmp(who, "PNOISE-TD")) {
+        fprintf(stderr, "%s: REFUSED -- a transmission line (TRA) in .pnoise: the adjoint sweep of the noise engine has no transpose of "
+                "the line's delay (an advance in reverse time over the periodic history); .pac/.pstb/.pxf (forward) handle it -- "
+                "card #716.\n", who);
+        return E_UNSUPP;
+    }
+#ifdef XSPICE
+    if (PSStlCount() > 0 && (g_hid_nc > 0 || g_hid_nhy > 0)) {
+        fprintf(stderr, "%s: REFUSED -- a transmission line together with a stateful XSPICE code model: the hidden-state rows and the "
+                "line history are not combined in the boundary solve -- card #716.\n", who);
+        return E_UNSUPP;
+    }
+#endif
     {
         const char *note = NULL;
         const char *nqs = pac_find_nqs_device(ckt, &note, !strcmp(who, "PNOISE-TD"));
@@ -3954,31 +4192,44 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
                                 fT==NULL) */)
 {
     int n = PAC_NST(map), neq = SMPmatSize(ckt->CKTmatrix);
-    int Mst = Phi_in ? 0 : n;   /* homogeneous (state) columns of pass 1 */
+    int Mtl = pac_tl_setup(ckt, "PAC-TD");   /* card #716: history unknowns of the transmission lines */
+    int Ntot = n + (Mtl > 0 ? Mtl : 0);       /* augmented Floquet state: native states, then the line history samples */
+    int Mst = (Phi_in && Mtl == 0) ? 0 : Ntot;   /* homogeneous (state) columns of pass 1 */
     int M1 = Mst + nfreq, f, d, j, err;
+    PACc *H1 = NULL, *R1 = NULL;
     double *omega1, *ic_zero_placeholder = NULL;
     int *useforce1;
     PACc *ic0_1, *Phi, *z;
     PACc *xi;
 
-    if (n <= 0 || nfreq <= 0)
+    if (n <= 0 || nfreq <= 0 || Mtl < 0) {
+        pac_tl_free();
         return 1;
+    }
+    NG_IGNORE(neq);
 
     omega1 = TMALLOC(double, M1);
     useforce1 = TMALLOC(int, M1);
     ic0_1 = TMALLOC(PACc, (size_t) n * M1);
-    Phi = TMALLOC(PACc, (size_t) n * n);
-    z = TMALLOC(PACc, (size_t) n * nfreq);
-    xi = TMALLOC(PACc, (size_t) n * nfreq);
+    Phi = TMALLOC(PACc, (size_t) Ntot * Ntot);
+    z = TMALLOC(PACc, (size_t) Ntot * nfreq);
+    xi = TMALLOC(PACc, (size_t) Ntot * nfreq);
+    if (Mtl > 0) {
+        H1 = TMALLOC(PACc, (size_t) Mtl * M1);
+        R1 = TMALLOC(PACc, (size_t) Mtl * M1);
+        if (!H1 || !R1) { if (H1) tfree(H1); if (R1) tfree(R1); H1 = R1 = NULL; Mtl = -1; }
+    }
     NG_IGNORE(ic_zero_placeholder);
 
-    if (!omega1 || !useforce1 || !ic0_1 || !Phi || !z || !xi) {
+    if (!omega1 || !useforce1 || !ic0_1 || !Phi || !z || !xi || Mtl < 0) {
         if (omega1) tfree(omega1); if (useforce1) tfree(useforce1);
         if (ic0_1) tfree(ic0_1); if (Phi) tfree(Phi); if (z) tfree(z); if (xi) tfree(xi);
+        pac_tl_free();
         return 1;
     }
 
     memset(ic0_1, 0, (size_t) n * M1 * sizeof(PACc));
+    if (H1) memset(H1, 0, (size_t) Mtl * M1 * sizeof(PACc));
     for (d = 0; d < Mst; d++) {
         omega1[d] = 0.0;
         useforce1[d] = 0;
@@ -3986,6 +4237,7 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
             PACc v = { (d == j) ? 1.0 : 0.0, 0.0 };
             ic0_1[(size_t) j * M1 + d] = v;   /* column d: unit at reduced-state row d */
         }
+        if (H1 && d >= n) { PACc one = { 1.0, 0.0 }; H1[(size_t) (d - n) * M1 + d] = one; }   /* card #716: unit history sample d-n */
     }
     for (f = 0; f < nfreq; f++) {
         omega1[Mst + f] = 2.0 * M_PI * freqs[f];
@@ -3996,20 +4248,29 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
     if (pac_reset(ckt, map, M1, br, bi, omega1, useforce1, ic0_1, 0, T)) {
         err = 1; goto cleanup;
     }
+    if (Mtl > 0 && pac_tl_reset(M1, H1)) { err = 1; goto cleanup; }
     PSSpacActive = 1;
     err = pac_run_period(ckt, job, T, "TD-shoot recording pass 1 (monodromy + forced)");
     PSSpacActive = 0;
     if (err || g_pac_failed) { err = 1; goto cleanup; }
-
-    for (d = 0; d < n; d++) {
-        int row_d = pac_map_row(map, d);
-        if (!Phi_in)
-            for (j = 0; j < n; j++)
-                Phi[(size_t) d * n + j] = pac_get(g_pac_Cprev, row_d, M1, j);
-        for (f = 0; f < nfreq; f++)
-            z[(size_t) d * nfreq + f] = pac_get(g_pac_Cprev, row_d, M1, Mst + f);
+    if (Mtl > 0) {
+        if (pac_tl_readout(T, R1)) { err = 1; goto cleanup; }
+        if (g_tl_miss) {   /* a delayed wave read from the nearest step instead of its own: the result would be wrong without notice */
+            fprintf(stderr, "PAC-TD: REFUSED -- %d transmission-line table time(s) not found among the recorded steps (pass 1): the "
+                    "delayed waves would be read from other time points (card #716).\n", g_tl_miss);
+            err = 1; goto cleanup;
+        }
     }
-    if (Phi_in) memcpy(Phi, Phi_in, (size_t) n * n * sizeof(PACc));
+
+    for (d = 0; d < Ntot; d++) {
+        int row_d = d < n ? pac_map_row(map, d) : 0;
+        if (!Phi_in || Mtl > 0)
+            for (j = 0; j < Ntot; j++)
+                Phi[(size_t) d * Ntot + j] = d < n ? pac_get(g_pac_Cprev, row_d, M1, j) : R1[(size_t) (d - n) * M1 + j];
+        for (f = 0; f < nfreq; f++)
+            z[(size_t) d * nfreq + f] = d < n ? pac_get(g_pac_Cprev, row_d, M1, Mst + f) : R1[(size_t) (d - n) * M1 + Mst + f];
+    }
+    if (Phi_in && Mtl == 0) memcpy(Phi, Phi_in, (size_t) n * n * sizeof(PACc));
     /* card #465 FOURTH pass, task 4 (red-proof, TEST-ONLY, default off):
      * PAC_REDPROOF_FREEZE_PHI substitutes the identity matrix for the real,
      * per-step-propagated LPTV monodromy Phi computed above -- a stand-in
@@ -4025,23 +4286,28 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
      * currently pass. Never set in production; not documented in any
      * user-facing help text. */
     if (getenv("PAC_REDPROOF_FREEZE_PHI")) {
-        for (d = 0; d < n; d++)
-            for (j = 0; j < n; j++) {
+        for (d = 0; d < Ntot; d++)
+            for (j = 0; j < Ntot; j++) {
                 PACc v = { (d == j) ? 1.0 : 0.0, 0.0 };
-                Phi[(size_t) d * n + j] = v;
+                Phi[(size_t) d * Ntot + j] = v;
             }
     }
-    if (Phi_out) memcpy(Phi_out, Phi, (size_t) n * n * sizeof(PACc));
+    if (Phi_out) {   /* card #716: with lines only the native block (callers reuse it only without lines, see Phi_in above) */
+        for (d = 0; d < n; d++)
+            for (j = 0; j < n; j++)
+                Phi_out[(size_t) d * n + j] = Phi[(size_t) d * Ntot + j];
+    }
     if (getenv("PXF_ADJ_DEBUG")) {
         fprintf(stderr, "PAC-V1-DEBUG: n=%d exact_jac=%d\n", n, g_pac_exact_jac);
         for (d = 0; d < n; d++) {
             for (j = 0; j < n; j++)
                 fprintf(stderr, "  Phi[%d][%d]=%.15g%+.15gi", d, j,
-                        Phi[(size_t) d * n + j].re, Phi[(size_t) d * n + j].im);
+                        Phi[(size_t) d * Ntot + j].re, Phi[(size_t) d * Ntot + j].im);
             fprintf(stderr, "\n");
         }
     }
     pac_free();
+    pac_tl_free_pass();
 
     /* card #489 SECOND pass (plan T6.2, task 5): free-running period-
      * variation correction. Applied to LOCAL copies (PhiB/zB below) used
@@ -4068,7 +4334,7 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
          * own report validates against. Never set in production. */
         if (map->generic && getenv("PAC_FREERUN_PROJ"))
             fprintf(stderr, "PAC-TD: PAC_FREERUN_PROJ ignored: the period-variation projection is not formed on the generic (model-charge) state set (card #544).\n");
-        if (!map->generic && fT && trig_idx >= 0 && fT[trig_idx] != 0.0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ")) {
+        if (!map->generic && Mtl == 0 && fT && trig_idx >= 0 && fT[trig_idx] != 0.0 && getenv("PAC_FREERUN_PROJ") && !getenv("PAC_FREERUN_NO_PROJ")) {
             double denom = fT[trig_idx];
             PhiCorr = TMALLOC(PACc, (size_t) n * n);
             zCorr = TMALLOC(PACc, (size_t) n * nfreq);
@@ -4095,9 +4361,9 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
      * fT/trig_idx were given, otherwise identically Phi/z -- the ordinary
      * driven-engine equation, byte-for-byte unchanged). */
     for (f = 0; f < nfreq; f++) {
-        PACc *A = TMALLOC(PACc, (size_t) n * n);
-        PACc *rhs = TMALLOC(PACc, n);
-        PACc *sol = TMALLOC(PACc, n);
+        PACc *A = TMALLOC(PACc, (size_t) Ntot * Ntot);
+        PACc *rhs = TMALLOC(PACc, Ntot);
+        PACc *sol = TMALLOC(PACc, Ntot);
         double w = 2.0 * M_PI * freqs[f];
         double wT = w * T;
         PACc ephase = { cos(wT), sin(wT) };
@@ -4198,21 +4464,21 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
             if (PhiCorr) tfree(PhiCorr); if (zCorr) tfree(zCorr);
             err = 1; goto cleanup;
         }
-        for (d = 0; d < n; d++)
-            for (j = 0; j < n; j++) {
-                PACc v = pc_scale(PhiB[(size_t) d * n + j], -1.0);
+        for (d = 0; d < Ntot; d++)
+            for (j = 0; j < Ntot; j++) {
+                PACc v = pc_scale(PhiB[(size_t) d * Ntot + j], -1.0);
                 if (d == j) v = pc_add(v, ephase);
-                A[(size_t) d * n + j] = v;
+                A[(size_t) d * Ntot + j] = v;
             }
-        for (d = 0; d < n; d++) rhs[d] = zB[(size_t) d * nfreq + f];
-        if (pac_complex_solve(A, rhs, n, sol)) {
+        for (d = 0; d < Ntot; d++) rhs[d] = zB[(size_t) d * nfreq + f];
+        if (pac_complex_solve(A, rhs, Ntot, sol)) {
             fprintf(stderr, "PAC-TD: WARNING -- boundary solve singular at f=%.6g Hz "
                     "(e^{jwT}=1 is a Floquet multiplier there: an undamped oscillation "
                     "or an unstable/marginal orbit); result at this frequency skipped.\n",
                     freqs[f]);
-            for (d = 0; d < n; d++) { PACc nan = { strtod("NaN", NULL), strtod("NaN", NULL) }; sol[d] = nan; }
+            for (d = 0; d < Ntot; d++) { PACc nan = { strtod("NaN", NULL), strtod("NaN", NULL) }; sol[d] = nan; }
         }
-        for (d = 0; d < n; d++)
+        for (d = 0; d < Ntot; d++)
             xi[(size_t) d * nfreq + f] = sol[d];
         tfree(A); tfree(rhs); tfree(sol);
     }
@@ -4227,8 +4493,9 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         double *omega2 = TMALLOC(double, M2);
         int *useforce2 = TMALLOC(int, M2);
         PACc *ic0_2 = TMALLOC(PACc, (size_t) n * M2);
-        if (!omega2 || !useforce2 || !ic0_2) {
-            if (omega2) tfree(omega2); if (useforce2) tfree(useforce2); if (ic0_2) tfree(ic0_2);
+        PACc *H2 = Mtl > 0 ? TMALLOC(PACc, (size_t) Mtl * M2) : NULL;
+        if (!omega2 || !useforce2 || !ic0_2 || (Mtl > 0 && !H2)) {
+            if (omega2) tfree(omega2); if (useforce2) tfree(useforce2); if (ic0_2) tfree(ic0_2); if (H2) tfree(H2);
             err = 1; goto cleanup;
         }
         for (f = 0; f < nfreq; f++) {
@@ -4236,15 +4503,23 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
             useforce2[f] = 1;
             for (d = 0; d < n; d++)
                 ic0_2[(size_t) d * M2 + f] = xi[(size_t) d * nfreq + f];
+            for (d = 0; d < Mtl; d++)   /* card #716: the history part of the boundary solution */
+                H2[(size_t) d * M2 + f] = xi[(size_t) (n + d) * nfreq + f];
         }
         pac_state_set_ic(map, x0);
-        if (pac_reset(ckt, map, M2, br, bi, omega2, useforce2, ic0_2, 1, T)) {
-            tfree(omega2); tfree(useforce2); tfree(ic0_2);
+        if (pac_reset(ckt, map, M2, br, bi, omega2, useforce2, ic0_2, 1, T) || (Mtl > 0 && pac_tl_reset(M2, H2))) {
+            tfree(omega2); tfree(useforce2); tfree(ic0_2); if (H2) tfree(H2);
             err = 1; goto cleanup;
         }
+        if (H2) tfree(H2);
         PSSpacActive = 1;
         err = pac_run_period(ckt, job, T, "TD-shoot recording pass 2 (re-propagate)");
         PSSpacActive = 0;
+        if (!err && Mtl > 0 && g_tl_miss) {   /* card #716: as after pass 1 */
+            fprintf(stderr, "PAC-TD: REFUSED -- %d transmission-line table time(s) not found among the recorded steps (pass 2): the "
+                    "delayed waves would be read from other time points (card #716).\n", g_tl_miss);
+            err = 1;
+        }
         if (!err && !g_pac_failed) {
             /* card #465 FOURTH pass, task 1: supply the [0,t_1] demod
              * segment that PSSpacRecordStep() deferred -- see
@@ -4265,11 +4540,15 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
             err = 1;
         }
         pac_free();
+        pac_tl_free_pass();
         tfree(omega2); tfree(useforce2); tfree(ic0_2);
     }
 
  cleanup:
     tfree(omega1); tfree(useforce1); tfree(ic0_1); tfree(Phi); tfree(z); tfree(xi);
+    if (H1) tfree(H1);
+    if (R1) tfree(R1);
+    pac_tl_free();
     return err;
 }
 
@@ -4495,6 +4774,11 @@ pac_engine_run_adjoint(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const doub
     /* card #557: a free-running (trigger=) orbit is transposed like a driven one: the forward operator on it is the fixed-period
      * LPTV engine on the polished orbit (the period-variation projection is opt-in, PAC_FREERUN_PROJ), so its exact transpose is
      * this sweep.  Only the opt-in projection (not transposed) keeps the refusal. */
+    if (PSStlCount() > 0) {   /* card #716: the transposed sweep has no transpose of the line delay; the forward engine runs */
+        fprintf(stderr, "PXF-TD-ADJ: transmission line in the circuit: the adjoint sweep does not transpose its delay; using the "
+                "forward per-source engine (card #716).\n");
+        return PAC_ADJOINT_REFUSED;
+    }
 #ifdef XSPICE
     if (g_hid_nh > 0) {   /* card #557: the transposed sweep does not carry the hidden states of stateful code models */
         fprintf(stderr, "PXF-TD-ADJ: stateful XSPICE code model in the circuit: the adjoint sweep does not transpose its hidden states (card #557).\n");

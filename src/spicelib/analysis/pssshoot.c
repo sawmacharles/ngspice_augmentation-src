@@ -102,6 +102,8 @@ What this does NOT do (see the card #458 report for the full list):
 #include "res/resdefs.h"   /* card #494 fifth pass: pss_salt_local_cond() below */
 #include "dio/diodefs.h"   /* card #510: pss_salt_ind_jump() diode term below */
 #include "vsrc/vsrcdefs.h"   /* card #510: pss_salt_node_is_stable() below */
+#include "tra/tradefs.h"   /* card #716: line history of the period restart */
+#include "ltra/ltradefs.h"   /* card #716: LTRA refusal (RG lines are memoryless and accepted) */
 
 #include <math.h>
 #include <string.h>
@@ -640,6 +642,158 @@ int PSSxsPacBegin(CKTcircuit *ckt) { (void) ckt; return 0; }
 void PSSxsPacEnd(void) { }
 #endif
 
+/* card #716: TRANSMISSION-LINE HISTORY of the period restart.
+ * A lossless line (TRA, "Tranline") carries, besides its port nodes, the travelling waves launched over the last delay TD: the
+ * excitation of port 1 at t is the wave v2 + Z0 i2 that left port 2 at t - TD (and vice versa), interpolated from the line's delay
+ * table.  A period run used to start every line from the CONSTANT history of its initial conditions (IC= values, default 0): the
+ * shooting fixed point was then that of a circuit whose line forgets everything at each period start, and was silently wrong
+ * (measured on s145: 23 % to 100 % of the peak-peak orbit off the settled transient on RC-terminated lines, up to 80 times the
+ * ripple on a buck output line, CONVERGED reported every time).
+ * Now a run started while the analysis carries line history (TRApssRestore, set around every period run of the shooting and td
+ * small-signal analyses) takes the line's delay table from TRApssHist (tra/traload.c, MODEINITTRAN).  Two sources fill it:
+ *   - pss_tl_latch(): the table at the end of every latching run (warm-up transient, Newton baselines: the runs that also latch
+ *     the hidden node vector), times shifted to the start of the next run.  Within a periodic orbit the waves over [-TD, 0] ARE
+ *     those of [T - TD, T] (for TD > T the periodic extension: the shifted table keeps every entry younger than TD), so this
+ *     lagged history is right at the fixed point, and it carries the warm-up and the native Newton to the neighbourhood of it.
+ *   - pss_tl_newton(): the joint Newton on (native states, history samples) that closes the orbit (the lagged history alone
+ *     does not settle where the line is lightly damped, see there).  Afterwards TRApssHist holds the converged samples, and the
+ *     Floquet runs, the emitted orbit and the td recording runs (pacshoot.c) start from them.
+ * LTRA (lossy: convolution over the whole past, indexed on the transient's global time-point list), TXL (TransLine) and
+ * CplLines (pole-residue history from t = 0) are REFUSED: their history is not a delay table that can be shifted or sampled
+ * (LTRA with R and G only, which is memoryless, is accepted).  A line in a free-running (trigger=) analysis is refused.
+ * PSS_TL_OFF=1 restores the old behaviour (constant history, no refusal, no joint Newton): red proof only. */
+static int g_tl_n = 0;            /* TRA instances whose history is carried (0: none, or PSS_TL_OFF) */
+static int g_tl_latches = 0;      /* latches in this analysis */
+static CKTcircuit *g_tl_ckt = NULL;
+static int g_tl_frozen = 0;       /* the joint Newton (pss_tl_newton) owns TRApssHist: runs do not latch */
+
+int PSStlCount(void) { return g_tl_n; }
+
+static int
+pss_tl_type(CKTcircuit *ckt)
+{
+    static int t = -2;
+    (void) ckt;
+    if (t == -2) t = CKTtypelook("Tranline");
+    return t;
+}
+
+/* kind 0 driven, 1 free-running; 0 ok, E_UNSUPP refused (message printed) */
+static int
+pss_tl_init(CKTcircuit *ckt, int kind, const char *who)
+{
+    int i, bad = 0, tt = pss_tl_type(ckt);
+    g_tl_n = 0; g_tl_latches = 0; g_tl_ckt = ckt; g_tl_frozen = 0;
+    if (tt >= 0 && ckt->CKThead[tt]) {
+        TRAmodel *m;
+        TRAinstance *h;
+        for (m = (TRAmodel *) ckt->CKThead[tt]; m; m = TRAnextModel(m))
+            for (h = TRAinstances(m); h; h = TRAnextInstance(h)) {
+                h->TRApssHistN = 0;
+                h->TRAipOK = 0;
+                g_tl_n++;
+            }
+    }
+    if (getenv("PSS_TL_OFF")) {
+        if (g_tl_n) fprintf(stdout, "%s: PSS_TL_OFF=1 -- transmission-line history NOT carried (old behaviour, card #716 red proof)\n", who);
+        g_tl_n = 0;
+        return 0;
+    }
+    if (g_tl_n && kind == 1) {
+        fprintf(stderr, "%s: REFUSED -- a transmission line (TRA) in a free-running (trigger=) analysis: its delay history at the "
+                "interpolated trigger crossing is not defined; use a driven analysis (fixed period) -- card #716.\n", who);
+        bad = 1;
+    }
+    for (i = 0; i < DEVmaxnum; i++) {
+        const char *nm;
+        if (!DEVices[i] || !ckt->CKThead[i] || !DEVices[i]->DEVpublic.name)
+            continue;
+        nm = DEVices[i]->DEVpublic.name;
+        if (!strcmp(nm, "LTRA")) {
+            LTRAmodel *lm;
+            for (lm = (LTRAmodel *) ckt->CKThead[i]; lm; lm = LTRAnextModel(lm))
+                if (LTRAinstances(lm) && lm->LTRAspecialCase != LTRA_MOD_RG) {
+                    fprintf(stderr, "%s: REFUSED -- lossy transmission line '%s' (LTRA model %s): its history is a convolution over "
+                            "the whole past indexed on the transient's time-point list, not a delay table the period restart can "
+                            "carry, so the orbit would be wrong (card #716). A lossless line (T element, TRA) is supported; for a "
+                            "lossy line use a lumped RLGC ladder or a lossless line with lumped loss.\n",
+                            who, LTRAinstances(lm)->LTRAname, lm->LTRAmodName);
+                    bad = 1;
+                    break;
+                }
+        } else if (!strcmp(nm, "TransLine") || !strcmp(nm, "CplLines")) {
+            fprintf(stderr, "%s: REFUSED -- device type '%s' (instance %s): its history (pole-residue convolution state since "
+                    "t = 0) is not carried by the period restart, so the orbit would be wrong (card #716). A lossless line (T "
+                    "element, TRA) is supported.\n", who, nm, ckt->CKThead[i]->GENinstances ?
+                    (const char *) ckt->CKThead[i]->GENinstances->GENname : "?");
+            bad = 1;
+        }
+    }
+    return bad ? E_UNSUPP : 0;
+}
+
+/* quadratic (three-point Lagrange) value of column q of a delay table at time t */
+static double pss_tl_table_at(const double *h, int n, double t, int q);
+double PSStlTableAt(const double *h, int n, double t, int q) { return pss_tl_table_at(h, n, t, q); }
+static double
+pss_tl_table_at(const double *h, int n, double t, int q)
+{
+    int lo = 0, hi = n - 1, j;
+    double t0, t1, t2, y0, y1, y2;
+    if (n < 3) return n > 0 ? h[q] : 0.0;
+    if (t <= h[0]) return h[q];
+    if (t >= h[3 * (n - 1)]) return h[3 * (n - 1) + q];
+    while (hi - lo > 1) { int mid = (lo + hi) / 2; if (h[3 * mid] <= t) lo = mid; else hi = mid; }
+    j = lo;   /* h[j] <= t < h[j+1] */
+    if (j + 2 >= n) j = n - 3;
+    else if (j > 0 && t - h[3 * (j - 1)] < h[3 * (j + 2)] - t) j = j - 1;
+    t0 = h[3 * j]; t1 = h[3 * (j + 1)]; t2 = h[3 * (j + 2)];
+    y0 = h[3 * j + q]; y1 = h[3 * (j + 1) + q]; y2 = h[3 * (j + 2) + q];
+    if (t0 == t1 || t1 == t2 || t0 == t2)
+        return y0;
+    return y0 * (t - t1) * (t - t2) / ((t0 - t1) * (t0 - t2)) + y1 * (t - t0) * (t - t2) / ((t1 - t0) * (t1 - t2))
+           + y2 * (t - t0) * (t - t1) / ((t2 - t0) * (t2 - t1));
+}
+
+/* latch the delay table of every line at the end of a latching run, times relative to the run's end */
+static void
+pss_tl_latch(CKTcircuit *ckt)
+{
+    int tt = pss_tl_type(ckt), k;
+    double tend = ckt->CKTtime;
+    TRAmodel *m;
+    TRAinstance *h;
+    if (!g_tl_n || tt < 0)
+        return;
+    for (m = (TRAmodel *) ckt->CKThead[tt]; m; m = TRAnextModel(m))
+        for (h = TRAinstances(m); h; h = TRAnextInstance(h)) {
+            int nn = h->TRAsizeDelay + 1;
+            if (h->TRApssHistAlloc < nn) {
+                if (h->TRApssHist) tfree(h->TRApssHist);
+                h->TRApssHist = TMALLOC(double, (size_t) nn * 3);
+                h->TRApssHistAlloc = h->TRApssHist ? nn : 0;
+            }
+            if (!h->TRApssHist) { h->TRApssHistN = 0; continue; }
+            for (k = 0; k < nn; k++) {
+                h->TRApssHist[3 * k] = h->TRAdelays[3 * k] - tend;
+                h->TRApssHist[3 * k + 1] = h->TRAdelays[3 * k + 1];
+                h->TRApssHist[3 * k + 2] = h->TRAdelays[3 * k + 2];
+            }
+            h->TRApssHistN = nn;
+            if (getenv("PSS_TL_DUMP")) {   /* diagnostic: <prefix>.<latch>.<instance> holds the latched table */
+                char fn[512];
+                FILE *df;
+                snprintf(fn, sizeof fn, "%s.%d.%s", getenv("PSS_TL_DUMP"), g_tl_latches + 1, h->TRAname);
+                if ((df = fopen(fn, "w")) != NULL) {
+                    for (k = 0; k < nn; k++)
+                        fprintf(df, "%.17g %.17g %.17g\n", h->TRApssHist[3 * k], h->TRApssHist[3 * k + 1], h->TRApssHist[3 * k + 2]);
+                    fclose(df);
+                }
+            }
+        }
+    g_tl_latches++;
+}
+
 /* card #553: PSS_MEM_TRACE=1 prints resident size and malloc in-use bytes after every period run (diagnostic only) */
 static void
 pss_mem_trace(const char *tag, const char *jobname)
@@ -705,7 +859,10 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
         /* the run that emits the converged trajectory is the plot the user reads (wrdata, plot): it keeps its data */
         PSSdiscardRunData = !g_pss_keep_run_data && strncmp(jobname, "Time Domain Periodic Steady State Analysis", 42) != 0;
     }
+    TRApssRestore = g_tl_n > 0;   /* card #716: start the lines from the latched history */
     err = DCtran(ckt, 1);   /* restart = 1: fresh run from t=0 */
+    TRApssRestore = 0;
+    if (!err && !g_hid_nolatch && !g_tl_frozen) pss_tl_latch(ckt);   /* card #716 */
     PSSdiscardRunData = 0;
     PSShidActive = 0;
 #ifdef XSPICE
@@ -4921,7 +5078,9 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
              * (and the ripple). If the forced rerun fails, keep the
              * recording run's result. PSS_NO_FORCED_BASELINE=1 restores
              * the old behaviour. */
-            if (!use_analytic && pss_ckt_has_switch(ckt) && !getenv("PSS_NO_FORCED_BASELINE")) {
+            /* card #716: with a transmission line the recording run has just latched a NEW line history; F must be taken from a
+             * run that starts from it, like the columns and trials that follow (otherwise F belongs to the old history). */
+            if (!use_analytic && (pss_ckt_has_switch(ckt) || g_tl_n > 0) && !getenv("PSS_NO_FORCED_BASELINE")) {
                 double *ob2 = TMALLOC(double, n_full);
                 if (ob2) {
                     pss_state_set_ic(map, icbuf);
@@ -6009,6 +6168,322 @@ pss_seed_stage1(void)
     return on;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* card #716: JOINT NEWTON ON THE NATIVE STATES AND THE SAMPLED LINE HISTORY.
+ * The lagged iteration of pss_tl_latch() (history taken from the end of the last latching run, native states re-converged
+ * against it) settles where the line is well damped (the RC-terminated decks: one or two rounds), but not where it is not: a
+ * line between two low-impedance ends (an output capacitor and a capacitive load) keeps its high-frequency waves for tens of
+ * periods (|Gamma1 Gamma2| ~ 0.99 per round trip at 100 MHz with 20 mOhm ESR and 100 nF), every native Newton step launches a
+ * new mismatch into it, and the iteration does not contract (measured: the history moving by 10-80 % of its peak-peak from
+ * round to round for hundreds of rounds, the orbit 58 % of the ripple off the settled transient).  So the history is made a
+ * Newton unknown: h = both excitations of every line sampled at Ns fixed times tau_j over [-TD - 2 dt, 0] (dt = T/Points,
+ * the run's own maximum step), the restored delay table of a run is exactly these samples, and the period map is
+ *     Phi(x, h) = (native states at T, excitations of the run's own table at tau_j + T)
+ * (for TD > T, tau_j + T < 0 reads the restored part of the same table: the periodic extension).  The fixed point
+ * Phi(z) = z, z = (x, h), is the periodic orbit with its periodic history.  It is solved by Newton with a dense
+ * finite-difference Jacobian (n + 2 Ns columns), on ONE discrete map at a time: a free run from z records the step grid, and F,
+ * every column and every step trial are runs that REPLAY that grid (same steps, same orders; PSSreplayActive, where the engine
+ * allows it, i.e. without an ideal switch; with a switch the recorded times are installed as breakpoints, the engine's usual
+ * forcing).  Measured on tra_lcp (linear): replayed, Newton converges in one step to 1e-8; with breakpoints only, the step
+ * control adds z-dependent steps and the iteration stalled at 0.2 of the excitation peak-peak; re-recording every iteration
+ * without replay wandered at 1e-3.  When the residual on a grid is below PSS_TL_TOL_IN (1e-7, or no longer decreasing below
+ * 1e-4: solve noise on a near-constant excitation), a new grid is recorded at the solution and F of that grid is the grid check:
+ * how far the discretisation itself moves the fixed point (tra_lcp: 1.5e-3 of the ripple, 3.7e-3 of the excitation peak-peak in
+ * the mean; the orbit is then 8e-4 of the ripple off the settled transient).  Converged when the check is within PSS_TL_TOL_X /
+ * PSS_TL_TOL_H (1e-2 / 1e-2) and the last grid's own residual is below tol_in; else up to PSS_TL_MAXREGRID (4) grids.
+ * The samples are spaced by the run's own maximum step, so the restored history resolves what the run itself resolves; the FD
+ * step of a history column is 1e-3 of max(|h|, peak-peak) (PSS_TL_FD_REL): the line is linear, and the excitation is a wave of
+ * the size of the port voltage, whose own solve noise (reltol |v|) swamps a smaller step.
+ * The spectral radius of the joint Jacobian is reported: it is the Floquet multiplier of the orbit WITH the line (the native
+ * Floquet report of the CONVERGED line is that of the native states with the history frozen).
+ * Cost: (n + 2 Ns + 1) period runs per Newton iteration plus the step trials (tra_rc: 248 samples, 506 runs, 0.5 s; tra_buckp:
+ * 128 samples, ~1900 runs, 13 s). */
+extern int TRApssBreaks;
+
+typedef struct {
+    TRAinstance *h;
+    int ns;          /* samples per excitation */
+    double *tau;     /* [ns] sample times, ascending, last = 0 */
+} PSStlLine;
+
+static void
+pss_tl_put(PSStlLine *L, int nl, const double *hv)
+{
+    int l, j, off = 0;
+    for (l = 0; l < nl; l++) {
+        TRAinstance *h = L[l].h;
+        int ns = L[l].ns;
+        if (h->TRApssHistAlloc < ns) {
+            if (h->TRApssHist) tfree(h->TRApssHist);
+            h->TRApssHist = TMALLOC(double, (size_t) ns * 3);
+            h->TRApssHistAlloc = h->TRApssHist ? ns : 0;
+        }
+        if (!h->TRApssHist) { h->TRApssHistN = 0; continue; }
+        for (j = 0; j < ns; j++) {
+            h->TRApssHist[3 * j] = L[l].tau[j];
+            h->TRApssHist[3 * j + 1] = hv[off + j];
+            h->TRApssHist[3 * j + 2] = hv[off + ns + j];
+        }
+        h->TRApssHistN = ns;
+        off += 2 * ns;
+    }
+}
+
+/* excitations of every line's current delay table (after a run of length tend) at tau_j + tend */
+static void
+pss_tl_read(PSStlLine *L, int nl, double tend, double *hv)
+{
+    int l, j, off = 0;
+    for (l = 0; l < nl; l++) {
+        TRAinstance *h = L[l].h;
+        int ns = L[l].ns, nn = h->TRAsizeDelay + 1;
+        for (j = 0; j < ns; j++) {
+            hv[off + j] = pss_tl_table_at(h->TRAdelays, nn, L[l].tau[j] + tend, 1);
+            hv[off + ns + j] = pss_tl_table_at(h->TRAdelays, nn, L[l].tau[j] + tend, 2);
+        }
+        off += 2 * ns;
+    }
+}
+
+/* one period run from z = (x, h); fills phi (may be NULL); record/force as pss_run_period_ex_safe() */
+static int
+pss_tl_eval(CKTcircuit *ckt, PSSstateMap *map, double T, PSStlLine *L, int nl, const double *z, double *phi,
+            int record, int force, const char *label)
+{
+    int n = map->n, err;
+    pss_state_set_ic(map, z);
+    pss_tl_put(L, nl, z + n);
+    TRApssBreaks = !force;   /* a forced run follows the recorded grid, history breakpoints included */
+    err = pss_run_period_ex_safe(ckt, T, label, record, force);
+    TRApssBreaks = 1;
+    if (err) return err;
+    if (phi) {
+        pss_state_get(map, ckt, phi);
+        pss_tl_read(L, nl, ckt->CKTtime, phi + n);
+    }
+    return 0;
+}
+
+/* returns 1 converged (x0 and the lines' TRApssHist updated), 0 not */
+static int
+pss_tl_newton(CKTcircuit *ckt, PSSstateMap *map, double T, double *x0, double tol, double tol_h, int maxit, double *res_out)
+{
+    int n = map->n, nl = 0, l, i, j, N, it, ok = 0, tt = pss_tl_type(ckt);
+    PSStlLine *L = NULL;
+    double *z = NULL, *phi = NULL, *F = NULL, *J = NULL, *A = NULL, *d = NULL, *zt = NULL, *pt = NULL, *Ft = NULL, *sc = NULL, *rip = NULL;
+    /* sample spacing: the run's maximum step T/Points, divided by PSS_TL_OVERSAMPLE (default 1).  The restored history is the
+     * quadratic interpolant of the samples, so a corner of the waves (an edge launched TD earlier) is smeared over ~2 samples:
+     * measured on tra_rc with TD = 1.5 T (the reflected source edge arriving with the next source edge), orbit error at that
+     * corner 3.4 / 1.2 / 0.24 % of the peak-peak at Points 200 / 400 / 800: O(dt^2) */
+    double ovs = getenv("PSS_TL_OVERSAMPLE") ? atof(getenv("PSS_TL_OVERSAMPLE")) : 1.0;
+    double dt = ckt->CKTmaxStep / (ovs >= 1.0 ? ovs : 1.0), res = 1e300;
+    int maxns = getenv("PSS_TL_MAXSAMPLES") ? atoi(getenv("PSS_TL_MAXSAMPLES")) : 4000;
+    TRAmodel *m;
+    TRAinstance *h;
+    long runs0 = g_pss_nruns;
+    int tl_save_replay = -2;
+    int need_record = 1, nregrid = 0, grid_ok = 0, grid_stall = 0, have_J = 0;
+    double grid_best = 1e300;
+    int maxregrid = getenv("PSS_TL_MAXREGRID") ? atoi(getenv("PSS_TL_MAXREGRID")) : 4;
+    double g_x = -1.0, g_h = -1.0;
+    double tol_in = getenv("PSS_TL_TOL_IN") ? atof(getenv("PSS_TL_TOL_IN")) : 1e-7;   /* on one (replayed) grid */
+
+    L = TMALLOC(PSStlLine, g_tl_n);
+    if (!L) return 0;
+    N = n;
+    for (m = (TRAmodel *) ckt->CKThead[tt]; m; m = TRAnextModel(m))
+        for (h = TRAinstances(m); h; h = TRAnextInstance(h)) {
+            int ns = (int) ceil((h->TRAtd + 2.0 * dt) / dt) + 1;
+            if (ns < 4) ns = 4;
+            L[nl].h = h; L[nl].ns = ns;
+            L[nl].tau = TMALLOC(double, ns);
+            for (j = 0; j < ns; j++) L[nl].tau[j] = -(ns - 1 - j) * ((h->TRAtd + 2.0 * dt) / (ns - 1));
+            N += 2 * ns;
+            nl++;
+        }
+    if (N - n > maxns) {
+        fprintf(stderr, "PSS-SHOOT: REFUSED -- the transmission-line history needs %d samples (> PSS_TL_MAXSAMPLES %d): the delay "
+                "is long against the period step T/Points; lower Points or shorten the line -- card #716.\n", N - n, maxns);
+        goto done;
+    }
+    z = TMALLOC(double, N); phi = TMALLOC(double, N); F = TMALLOC(double, N); J = TMALLOC(double, (size_t) N * N);
+    A = TMALLOC(double, (size_t) N * N); d = TMALLOC(double, N); zt = TMALLOC(double, N); pt = TMALLOC(double, N);
+    Ft = TMALLOC(double, N); sc = TMALLOC(double, N); rip = TMALLOC(double, n);
+    if (!z || !phi || !F || !J || !A || !d || !zt || !pt || !Ft || !sc || !rip) goto done;
+
+    /* start: x0 and the latched history resampled */
+    for (i = 0; i < n; i++) z[i] = x0[i];
+    {
+        int off = n;
+        for (l = 0; l < nl; l++) {
+            h = L[l].h;
+            for (j = 0; j < L[l].ns; j++) {
+                z[off + j] = h->TRApssHistN >= 3 ? pss_tl_table_at(h->TRApssHist, h->TRApssHistN, L[l].tau[j], 1) : 0.0;
+                z[off + L[l].ns + j] = h->TRApssHistN >= 3 ? pss_tl_table_at(h->TRApssHist, h->TRApssHistN, L[l].tau[j], 2) : 0.0;
+            }
+            off += 2 * L[l].ns;
+        }
+    }
+    g_tl_frozen = 1;
+    {   /* forced runs follow the recorded step AND order sequence exactly where the engine allows it (no ideal switch): the
+         * map is then one smooth discrete map (installing the recorded times as breakpoints alone lets the step control add
+         * z-dependent steps, measured to stall the iteration at 0.2 of the peak-peak on a linear deck) */
+        if (!getenv("PSS_TL_NOREPLAY")) { tl_save_replay = g_replay_mode; g_replay_mode = 1; }
+    }
+    for (it = 0; it <= maxit; it++) {
+        double rx = 0.0, rh = 0.0, lam;
+        int off, err;
+        /* every iteration records the grid of a free run from z and differentiates the map that REPLAYS it (same steps, same
+         * orders: one smooth discrete map; a linear deck converges in one step on it).  Recording once and keeping that grid
+         * converges to the fixed point of the first iterate's grid (2 % of the ripple off the transient on tra_lcp); the
+         * iteration ends when a re-recorded grid no longer moves the fixed point (F of the new grid within tolerance). */
+        int recorded_now = 0;
+        double rhm = 0.0;
+        if (need_record) {
+            pss_ripple_reset(map, z);
+            PSSrippleRecordActive = 1;
+            err = pss_tl_eval(ckt, map, T, L, nl, z, NULL, 1, 0, "PSS shoot (line Newton baseline)");
+            PSSrippleRecordActive = 0;
+            if (err) { fprintf(stderr, "PSS-SHOOT: line Newton baseline run failed (error %d) -- card #716.\n", err); goto done; }
+            pss_ripple_get(map, rip);
+            need_record = 0;
+            recorded_now = 1;
+        }
+        if ((err = pss_tl_eval(ckt, map, T, L, nl, z, phi, 0, 1, "PSS shoot (line Newton baseline, forced)")) != 0) goto done;
+        for (i = 0; i < N; i++) F[i] = phi[i] - z[i];
+        /* scales: native state ripple (floor 1e-3 of its magnitude, 1e-9), excitation peak-peak per line and wave */
+        for (i = 0; i < n; i++) {
+            sc[i] = rip[i];
+            if (sc[i] < 1e-3 * fabs(z[i])) sc[i] = 1e-3 * fabs(z[i]);
+            if (sc[i] < 1e-9) sc[i] = 1e-9;
+            if (fabs(F[i]) / sc[i] > rx) rx = fabs(F[i]) / sc[i];
+        }
+        off = n;
+        for (l = 0; l < nl; l++) {
+            int q;
+            for (q = 0; q < 2; q++) {
+                double lo = 1e300, hi = -1e300, am = 0.0, s2, acc = 0.0;
+                for (j = 0; j < L[l].ns; j++) {
+                    double v = z[off + q * L[l].ns + j];
+                    if (v < lo) lo = v; if (v > hi) hi = v; if (fabs(v) > am) am = fabs(v);
+                }
+                s2 = hi - lo;
+                if (s2 < 1e-3 * am) s2 = 1e-3 * am;
+                if (s2 < 1e-9) s2 = 1e-9;
+                for (j = 0; j < L[l].ns; j++) {
+                    int k = off + q * L[l].ns + j;
+                    sc[k] = s2;
+                    if (fabs(F[k]) / s2 > rh) rh = fabs(F[k]) / s2;
+                    acc += fabs(F[k]) / s2;
+                }
+                acc /= L[l].ns;
+                if (acc > rhm) rhm = acc;
+            }
+            off += 2 * L[l].ns;
+        }
+        res = fmax(rx, rh);
+        if (recorded_now && it > 0) {   /* the fixed point of the previous grid, seen from a grid recorded at it */
+            g_x = rx; g_h = rhm; nregrid++;
+            grid_ok = (g_x <= tol && g_h <= tol_h);
+        }
+        fprintf(stdout, "PSS-SHOOT: [line Newton] iter=%d%s native residual %.3e, history residual %.3e (mean %.3e) (%d unknowns)\n",
+                it, recorded_now ? " (new grid)" : "", rx, rh, rhm, N);
+        fflush(stdout);
+        /* converged on this grid: below tol_in, or no longer decreasing (3 iterations without halving the best residual of
+         * this grid) below the solve-noise bound 1e-4 (a near-constant excitation has a tiny peak-peak scale and its residual
+         * stalls at the runs' solve noise, measured 1e-6..1e-5 on tl_pstb) */
+        if (recorded_now) { grid_best = res; grid_stall = 0; }
+        else if (res < 0.5 * grid_best) { grid_best = res; grid_stall = 0; }
+        else grid_stall++;
+        if ((rx <= tol_in && rh <= tol_in) || (grid_stall >= 3 && res <= 1e-4)) {
+            if (grid_ok) { ok = 1; break; }
+            if (nregrid >= maxregrid) break;
+            need_record = 1;   /* converged on this grid: record a new one at the solution and check that the fixed point stays */
+            continue;
+        }
+        if (it == maxit) break;
+        /* dense FD Jacobian of Phi, every column forced onto the recording run's grid */
+        for (j = 0; j < N; j++) {
+            /* history columns: the excitation is a wave of the size of the port voltage (12 V on a 5 V / 1.5 A, 5 ohm line) and
+             * a period run's own solve noise is reltol * |v| (1e-4 V at reltol 1e-5): the step must be well above that (the line is
+             * linear, a large step costs nothing): PSS_TL_FD_REL (default 1e-3) of max(|h|, peak-peak) */
+            double hrel = getenv("PSS_TL_FD_REL") ? atof(getenv("PSS_TL_FD_REL")) : 1e-3;
+            double hj = (j < n) ? pss_newton_fd_h(z[j], rip[j], 1e-5) : hrel * fmax(fabs(z[j]), sc[j]);
+            for (i = 0; i < N; i++) zt[i] = z[i];
+            zt[j] += hj;
+            if ((err = pss_tl_eval(ckt, map, T, L, nl, zt, pt, 0, 1, "PSS shoot (line Newton column)")) != 0) {
+                fprintf(stderr, "PSS-SHOOT: line Newton column %d failed (error %d) -- card #716.\n", j, err);
+                goto done;
+            }
+            for (i = 0; i < N; i++) J[(size_t) i * N + j] = (pt[i] - phi[i]) / hj;
+        }
+        have_J = 1;
+        for (i = 0; i < N; i++)
+            for (j = 0; j < N; j++)
+                A[(size_t) i * N + j] = J[(size_t) i * N + j] - (i == j ? 1.0 : 0.0);
+        for (i = 0; i < N; i++) Ft[i] = -F[i];
+        if (pss_solve_dense(A, Ft, N, d)) {
+            fprintf(stderr, "PSS-SHOOT: line Newton: singular Jacobian (a Floquet multiplier at 1) -- card #716.\n");
+            goto done;
+        }
+        /* damped step: accept the first lambda that lowers the scaled residual (forced runs on the same grid) */
+        for (lam = 1.0; lam > 1.0 / 64; lam *= 0.5) {
+            double r2 = 0.0;
+            for (i = 0; i < N; i++) zt[i] = z[i] + lam * d[i];
+            if (pss_tl_eval(ckt, map, T, L, nl, zt, pt, 0, 1, "PSS shoot (line Newton trial)"))
+                continue;
+            for (i = 0; i < N; i++) { double f = fabs(pt[i] - zt[i]) / sc[i]; if (f > r2) r2 = f; }
+            if (r2 < res) break;
+        }
+        for (i = 0; i < N; i++) z[i] += lam * d[i];
+    }
+ done:
+    g_tl_frozen = 0;
+    if (tl_save_replay != -2) g_replay_mode = tl_save_replay;
+    if (ok && have_J) {   /* spectral radius of the joint monodromy (power iteration on the last FD Jacobian) */
+        double *v = d, *w = Ft, nrm = 0.0, rad = 0.0, rad_prev = -1.0;
+        int k2;
+        for (i = 0; i < N; i++) v[i] = 1.0 + 0.001 * (i % 7);
+        for (k2 = 0; k2 < 400; k2++) {
+            for (i = 0; i < N; i++) {
+                double acc = 0.0;
+                for (j = 0; j < N; j++) acc += J[(size_t) i * N + j] * v[j];
+                w[i] = acc;
+            }
+            nrm = 0.0;
+            for (i = 0; i < N; i++) nrm += w[i] * w[i];
+            nrm = sqrt(nrm);
+            if (nrm <= 0.0) { rad = 0.0; break; }
+            {   /* the norm ratio over two steps handles a complex or negative dominant pair */
+                double vn = 0.0;
+                for (i = 0; i < N; i++) vn += v[i] * v[i];
+                rad = nrm / sqrt(vn);
+            }
+            for (i = 0; i < N; i++) v[i] = w[i] / nrm;
+            if (k2 > 20 && fabs(rad - rad_prev) < 1e-6 * rad) break;
+            rad_prev = rad;
+        }
+        fprintf(stdout, "PSS-SHOOT: Floquet spectral radius of the orbit WITH the line history (joint monodromy, %d x %d): %.6f "
+                "(%s; the spectral_radius on the CONVERGED line is the native states' with the history frozen) -- card #716\n",
+                N, N, rad, rad < 1.0 ? "stable" : "NOT stable");
+    }
+    if (ok) {
+        for (i = 0; i < n; i++) x0[i] = z[i];
+        pss_tl_put(L, nl, z + n);
+    }
+    fprintf(stdout, "PSS-SHOOT: transmission-line history (card #716): joint Newton on %d native state(s) and %d history sample(s) "
+            "of %d line(s): %s, residual %.3e on its step grid; a grid recorded at the solution moves it by %.3e (native, of the "
+            "ripple) / %.3e (history, mean of its peak-peak) (tol %.1e / %.1e); %ld period run(s)\n", n, N - n, nl,
+            ok ? "converged" : "NOT converged", res, g_x, g_h, tol, tol_h, g_pss_nruns - runs0);
+    fflush(stdout);
+    if (res_out) *res_out = res;
+    if (L) { for (l = 0; l < nl; l++) if (L[l].tau) tfree(L[l].tau); tfree(L); }
+    if (z) tfree(z); if (phi) tfree(phi); if (F) tfree(F); if (J) tfree(J); if (A) tfree(A); if (d) tfree(d);
+    if (zt) tfree(zt); if (pt) tfree(pt); if (Ft) tfree(Ft); if (sc) tfree(sc); if (rip) tfree(rip);
+    return ok;
+}
+
 int
 PSSshootDriven(CKTcircuit *ckt, PSSan *job)
 {
@@ -6038,6 +6513,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     t_wall_start = SPfrontEnd->IFseconds();
 
     if (PSSxspicePolicy(ckt, 0, "PSS-SHOOT"))   /* card #551: XSPICE code models the orbit is validated for */
+        return E_UNSUPP;
+    if (pss_tl_init(ckt, 0, "PSS-SHOOT"))   /* card #716: transmission lines */
         return E_UNSUPP;
 
     /* card #537: matrix-free Newton-GMRES requested? card key krylov=1, or
@@ -6278,6 +6755,11 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * probe stages either). */
         use_analytic = (getenv("PSS_SHOOT_JACOBIAN") &&
                         strcmp(getenv("PSS_SHOOT_JACOBIAN"), "analytic") == 0);
+        if (use_analytic && g_tl_n > 0) {   /* card #716: the sensitivity recursion has no line-delay terms */
+            fprintf(stdout, "PSS-SHOOT: PSS_SHOOT_JACOBIAN=analytic ignored with a transmission line (the sensitivity recursion "
+                    "does not propagate the line's delayed waves); finite-difference Jacobian -- card #716.\n");
+            use_analytic = 0;
+        }
         g_pss_lag_enabled = !use_analytic;
 
         /* Tightened reltol for Newton's OWN (single-period) runs only --
@@ -6838,6 +7320,27 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
          * shoot_cleanup, as before. */
         ckt->CKTreltol = tight_reltol;
         ckt->CKTvoltTol = tight_vntol;   /* card #505 */
+
+        /* card #716: the periodic line history (see pss_tl_latch() and pss_tl_newton()): the native Newton above ran with the
+         * history lagged from its latching runs; the joint Newton on (native states, history samples) closes both, also when
+         * the native Newton did not converge (a line in a loop with no warm-up starts from a zero history the native states
+         * cannot match: measured on tl_pstb). */
+        if (g_tl_n > 0) {
+            double res_j = 0.0;
+            int jmax = getenv("PSS_TL_NEWTON_MAXIT") ? atoi(getenv("PSS_TL_NEWTON_MAXIT")) : 40;
+            /* tolerances of the grid check (how far a step grid recorded at the solution moves the fixed point: the
+             * discretisation's own sensitivity, measured 1.5e-3 of the ripple / 3.7e-3 of the excitation peak-peak on tra_lcp,
+             * where the orbit is within 8e-4 of the ripple of the settled transient) */
+            double tol_h = getenv("PSS_TL_TOL_H") ? atof(getenv("PSS_TL_TOL_H")) : 1e-2;
+            double tol_x = getenv("PSS_TL_TOL_X") ? atof(getenv("PSS_TL_TOL_X")) : 1e-2;
+            if (!converged_flag)
+                fprintf(stdout, "PSS-SHOOT: the native Newton with the lagged line history did not converge; joint Newton from its "
+                        "last iterate (card #716)\n");
+            converged_flag = pss_tl_newton(ckt, &map, T, x0, tol_x, tol_h, jmax, &res_j);
+            if (converged_flag) residual = res_j;
+            else fprintf(stderr, "PSS-SHOOT: FAILED -- the joint Newton on the native states and the transmission-line history did "
+                         "not converge (residual %.3e) -- card #716.\n", res_j);
+        }
 
         if (phi_full_detect) tfree(phi_full_detect);
         if (M_init) tfree(M_init);
@@ -7897,6 +8400,8 @@ PSSshootFreerun(CKTcircuit *ckt, PSSan *job)
     memset(&fr_ctx, 0, sizeof fr_ctx);
 
     if (PSSxspicePolicy(ckt, 1, "PSS-FREERUN"))   /* card #551 */
+        return E_UNSUPP;
+    if (pss_tl_init(ckt, 1, "PSS-FREERUN"))   /* card #716 */
         return E_UNSUPP;
     if (!job->PSStrigNode) {
         fprintf(stderr, "PSS-FREERUN: internal error -- dispatched with no "

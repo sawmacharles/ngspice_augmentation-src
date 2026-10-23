@@ -278,6 +278,8 @@ int PSSsaltForceOrder1(CKTcircuit *ckt);
  * pac_r6o_ctrl2out.cir against tools/pac_perturbed.py, an independent
  * nonlinear reference sharing no code with this engine). */
 int PSSsaltEventsSeen(void);
+int PSStlCount(void);   /* card #716: transmission lines whose history the shooting analyses carry (0: none or PSS_TL_OFF) */
+double PSStlTableAt(const double *h, int n, double t, int q);   /* card #716: quadratic value of column q of a delay table at t */
 
 /* card #555: PSS_RUN_STATS diagnostics */
 void PSSrunStatsAdd(const char *name, double dt);
