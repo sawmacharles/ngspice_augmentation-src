@@ -103,6 +103,7 @@ extern char* eng(double value, int digits, bool numeric, bool bytes);
 /* card #458: shooting-Newton driven PSS, implemented in pssshoot.c */
 extern int PSSshootDriven(CKTcircuit *ckt, PSSan *job);
 extern int PSSshootFreerun(CKTcircuit *ckt, PSSan *job);   /* card #489 */
+extern int ENVenvelopeRun(CKTcircuit *ckt, PSSan *job);    /* card #513: pssenv.c */
 
 #define INIT_STATS() \
 do { \
@@ -3627,6 +3628,26 @@ DCpss(CKTcircuit *ckt,
             fprintf (stderr, "PSS: driven circuit detected -- shooting at the fixed source period (%g Hz), frequency estimation off\n",
                      ckt->CKTguessedFreq) ;
         }
+    }
+
+    /* card #513 (round 11, plan T9.11): `.tranenv` implicit envelope-
+     * following dispatch -- checked BEFORE the PSSmethod==SHOOT dispatch
+     * below since a `.tranenv` job never sets PSSmethod at all (its own
+     * dot-card, dot_tranenv() in inp2dot.c, never touches "method"); this
+     * is its own top-level engine (pssenv.c), a peer of PSSshootDriven()/
+     * PSSshootFreerun() below, not a post-processing step layered on a
+     * converged PSS orbit the way .pac/.pstb/.pxf are. Needs a driven
+     * (clocked) circuit for the same reason PSSshootDriven() does --
+     * envelope following has no meaning without a known fast period. */
+    if (job->PSSdoEnv) {
+        if (!pss_driven) {
+            fprintf(stderr, "Error: .tranenv needs a driven (clocked) circuit "
+                    "(a native V/I source with a PULSE/SIN/PWL/... time "
+                    "function) -- card #513 implicit envelope following has "
+                    "no free-running/autonomous mode.\n");
+            return (E_UNSUPP);
+        }
+        return ENVenvelopeRun(ckt, job);
     }
 
     /* card #458, plan T4.1-T4.3: shooting-Newton dispatch. Only meaningful

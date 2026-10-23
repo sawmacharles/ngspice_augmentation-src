@@ -200,6 +200,28 @@ PSSsetParm(CKTcircuit *ckt, JOB *anal, int which, IFvalue *value)
         job->PSSkrylovSet = 1;   /* card #538: explicit choice, no automatic threshold */
         break;
 
+    /* card #513: `.tranenv` implicit envelope following -- see
+     * pssdefs.h's PSSdoEnv/EnvTstop/EnvMmax/EnvTol comment. */
+    case ENV_DO:
+        job->PSSdoEnv = value->iValue;
+        break;
+    case ENV_TSTOP:
+        job->EnvTstop = value->rValue;
+        break;
+    case ENV_MMAX:
+        job->EnvMmax = value->iValue;
+        break;
+    case ENV_TOL:
+        job->EnvTol = value->rValue;
+        break;
+    case ENV_PHASE:
+        job->EnvPhase = value->rValue;
+        break;
+    case ENV_MAPTOL:
+        job->EnvMapTol = value->rValue;
+        job->EnvMapTolGiven = 1;
+        break;
+
     default:
         return(E_BADPARM);
     }
@@ -242,7 +264,13 @@ static IFparm PSSparms[] = {
     { "driven",       PSS_FORCE_DRIVEN, IF_SET|IF_INTEGER,	"card #494: force driven-mode shooting at fguess even if no native V/I source has a time function (XSPICE-clocked decks, e.g. d_pwm)" },
     { "adjoint",      PXF_ADJOINT,	IF_SET|IF_INTEGER,	"card #504: .pxf true adjoint/transposed engine (1=force on, 0=force off, unset=auto by source count)" },
     { "krylov",       PSS_KRYLOV,	IF_SET|IF_INTEGER,	"card #537: matrix-free Newton-GMRES shooting for method=shoot (1=on, default 0 = dense finite-difference monodromy)" },
-    { "dev",          PNOISE_DEVTBL,	IF_SET|IF_INTEGER,	"card #509: .pnoise (solver=td) per-device noise contribution table (1=on, default off)" }
+    { "dev",          PNOISE_DEVTBL,	IF_SET|IF_INTEGER,	"card #509: .pnoise (solver=td) per-device noise contribution table (1=on, default off)" },
+    { "envelope",     ENV_DO,		IF_SET|IF_INTEGER,	"card #513: this job is a .tranenv implicit envelope-following run (set by the .tranenv dot-card)" },
+    { "envtstop",     ENV_TSTOP,	IF_SET|IF_REAL,	"card #513: .tranenv total simulated time (s)" },
+    { "envmmax",      ENV_MMAX,	IF_SET|IF_INTEGER,	"card #513: .tranenv maximum periods per envelope jump" },
+    { "envtol",       ENV_TOL,		IF_SET|IF_REAL,	"card #513: .tranenv local envelope error tolerance (relative, default 0.0005)" },
+    { "envphase",     ENV_PHASE,	IF_SET|IF_REAL,	"card #513: .tranenv sampling phase (fraction of a period, default 0)" },
+    { "envmaptol",    ENV_MAPTOL,	IF_SET|IF_REAL,	"card #719: .tranenv period-map reltol (default 1e-5, 0 = the deck's reltol)" }
 };
 
 SPICEanalysis PSSinfo  = {

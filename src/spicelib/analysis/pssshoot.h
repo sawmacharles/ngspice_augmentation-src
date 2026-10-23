@@ -86,6 +86,35 @@ extern int PSSeventLocateActive, PSSeventLocateRestart, PSSswLagActive, PSSevent
 int PSSeventLocate(CKTcircuit *ckt, double *newdelta);
 int PSSshootLagEnabled(void);   /* card #498: PAC/PSTB recording passes follow the PSS orbit's sw treatment */  /* called right after the restart-path breaks reset */
 
+/* card #513 (round 11, plan T9.11): implicit envelope following
+ * (pssenv.c, new file) -- see that file's header comment for the full
+ * design. These generalise the breakpoint-forcing hooks above (and
+ * dctran.c's own restart branch) from "a period always starts at
+ * absolute t=0" to an arbitrary absolute start time, needed because an
+ * envelope step's own period map F(x;t) must evaluate slowly-varying
+ * sources (a soft-start ramp) at the TRUE absolute landing time. Every
+ * one of these defaults to 0/off, so every existing analysis (plain
+ * `.tran`, every `.pss`/`.pac`/`.pstb`/`.pxf`) is completely unaffected;
+ * only pssenv.c's own env_run_period_at() ever touches them. */
+extern double PSSbreakPeriodT0;   /* pssshoot.c: t0-relative version of the "t<=0"/"tt>0" tests above */
+extern int    PSSenvActive;       /* dctran.c: start the restart-branch period at PSSenvPeriodT0, not 0 */
+extern double PSSenvPeriodT0;
+/* card #513: PSSenvOutMode 0 = ordinary plot per DCtran(), 1 = no plot
+ * (scratch Newton/FD period maps), 2 = append to the persistent kept plot
+ * PSSenvKeptPlot (created by the first kept period; dctran.c leaves it
+ * open, pssenv.c ends it). Only consulted while PSSenvActive. */
+extern int    PSSenvOutMode;
+extern void  *PSSenvKeptPlot;
+
+/* card #513: trivial exported wrappers around pssshoot.c's own private
+ * g_break_times buffer (see PSSbreakRecordStep/PSSbreakInstallHook above)
+ * -- pssenv.c needs to reset/free the SAME buffer those two hooks already
+ * use for its own FD-monodromy grid-forcing, without duplicating its
+ * bookkeeping or exposing its layout. */
+void PSSbreakReset(void);
+
+void PSSbreakFreeBuf(void);
+
 /* ---- card #458 FOURTH pass (plan T4.2): analytic (discretise-then-
  * linearise) sensitivity monodromy, replacing finite differences. See
  * pssshoot.c's PSSsensRecordStep() header comment for the full S_k/T_k

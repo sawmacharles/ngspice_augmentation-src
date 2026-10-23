@@ -913,6 +913,30 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
 int PSSbreakRecordActive  = 0;
 int PSSbreakInstallActive = 0;
 
+/* card #513 (round 11, plan T9.11): generalises this hook's hardcoded
+ * "a period always starts at absolute t=0" assumption to an arbitrary
+ * absolute start time, needed by the new implicit envelope-following
+ * engine (pssenv.c), whose own period map F(x;t) must evaluate a
+ * slowly-varying source (e.g. a soft-start PWL ramp) at the TRUE absolute
+ * landing time, not always t=0..T like every existing `.pss`/`.pac`/
+ * `.pstb`/`.pxf` period run. Default 0.0 reproduces the exact previous
+ * behaviour of both functions below for every one of those (unchanged)
+ * callers -- only pssenv.c's own env_run_period_at() ever sets this to
+ * something else, and resets it to 0.0 when done (see pssenv.c). */
+double PSSbreakPeriodT0 = 0.0;
+
+/* card #513: dctran.c reads these (see the new envT0 handling in its
+ * restart branch) to start a period at an arbitrary ABSOLUTE time instead
+ * of the hardcoded 0 every other DCtran(ckt,1) restart caller relies on.
+ * 0/off by default -- every existing analysis (including every other use
+ * of this SAME restart path: plain `.tran`, and every `.pss`/`.pac`/
+ * `.pstb`/`.pxf` period run) is completely unaffected. Only pssenv.c's
+ * own env_run_period_at() ever sets PSSenvActive. */
+int    PSSenvActive = 0;
+double PSSenvPeriodT0 = 0.0;
+int    PSSenvOutMode = 0;
+void  *PSSenvKeptPlot = NULL;
+
 static double *g_break_times = NULL;
 static unsigned char *g_break_is_event = NULL;   /* card #498 SECOND pass, see below */
 static int g_break_count = 0, g_break_cap = 0;
@@ -931,6 +955,17 @@ pss_break_reset(void)
 {
     g_break_count = 0;
     g_rp_n = 0;
+}
+
+/* card #513: trivial exported wrappers so pssenv.c (a new file, kept
+ * independent of this file's own private state-map/Newton internals --
+ * see pssenv.c's header comment for why) can drive the SAME breakpoint-
+ * forcing buffer every existing `.pss method=shoot` FD monodromy already
+ * relies on, without duplicating g_break_times' bookkeeping. */
+void
+PSSbreakReset(void)
+{
+    pss_break_reset();
 }
 
 static void
@@ -993,14 +1028,20 @@ pss_break_step_is_switch_event(CKTcircuit *ckt)
     return 0;
 }
 
+void
+PSSbreakFreeBuf(void)
+{
+    pss_break_free();
+}
+
 /* Called from dctran.c right after CKTaccept() when PSSbreakRecordActive. */
 void
 PSSbreakRecordStep(CKTcircuit *ckt)
 {
     int is_event;
 
-    if (ckt->CKTtime <= 0.0)
-        return;   /* t=0 is already a breakpoint; nothing to add */
+    if (ckt->CKTtime <= PSSbreakPeriodT0)
+        return;   /* the period's own start (t=0, or the envelope period start, card #513) is already a breakpoint */
 
     /* card #505: full accepted-step record for exact replay */
     if (g_rp_n >= g_rp_cap) {
@@ -1210,7 +1251,7 @@ PSSbreakInstallHook(CKTcircuit *ckt)
      * deck never sets g_break_is_event[i], so this is an exact no-op for
      * every existing no-`sw` fixture. */
 
-    double early_floor = ckt->CKTmaxStep * 0.1;
+    double early_floor = PSSbreakPeriodT0 + ckt->CKTmaxStep * 0.1;   /* card #513: t0-relative */
     int skipping = (getenv("PSS_SHOOT_NO_EARLY_SKIP") == NULL);
     int skipped_event = 0;
 
@@ -1258,7 +1299,7 @@ PSSbreakInstallHook(CKTcircuit *ckt)
             continue;
         }
         skipping = 0;   /* first time we clear the floor, force everything after it */
-        if (tt > 0.0 && tt < ckt->CKTfinalTime) {
+        if (tt > PSSbreakPeriodT0 && tt < ckt->CKTfinalTime) {   /* card #513: t0-relative */
             if (bulk_t) bulk_t[bulk_n++] = tt;
             else CKTsetBreak(ckt, tt);
         }

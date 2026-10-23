@@ -2053,6 +2053,101 @@ dot_pxf(char *line, void *ckt, INPtables *tab, struct card *current,
 
     return (0);
 }
+
+/* card #513 (round 11, plan T9.11): `.tranenv` -- implicit, Newton-
+ * corrected envelope following for long switching-converter transients
+ * (soft-start/slow ramps spanning thousands of periods; pssenv.c, new
+ * file, has the full design). A NEW directive, not an extension of the
+ * universally-shared `.tran` card's own grammar/engine (dot_tran() above,
+ * unchanged) -- same "additive, new dot-card" choice this fork already
+ * made for .pac/.pstb/.pxf on top of .pss rather than touching .ac/.tf's
+ * own grammar: a new C engine needs a fresh build regardless, and keeping
+ * it off the universally-shared TRAN analysis path means every existing
+ * `.tran` deck (and this fork's own large `.pss`/`.pac`/`.pstb`/`.pxf`
+ * test suite) is provably unaffected by this card.
+ *
+ *   .tranenv Fguess Points SC_iter Steady_coeff Tstop Mmax
+ *            [envtol=<tol>] [uic]
+ *
+ * Reuses the "PSS" analysis type (like .pac/.pstb/.pxf already do).
+ * Fguess/Points/SC_iter/Steady_coeff are the SAME fields `.pss` uses
+ * (clock frequency, integration points/period, Newton iteration budget,
+ * Newton convergence tolerance) -- now for the IMPLICIT envelope
+ * equation's own Newton solve (pssenv.c), not a periodic-steady-state
+ * residual. StabTime/OscNode/Harmonics are DROPPED (not carried as dead
+ * fields for grammar-compatibility's own sake) -- this engine has no
+ * stabilisation phase (it bootstraps directly from `uic` at t=0), no
+ * single oscillation node, and no harmonic count. */
+static int
+dot_tranenv(char *line, void *ckt, INPtables *tab, struct card *current,
+            void *task, void *gnode, JOB *foo)
+{
+    int error;
+    IFvalue ptemp;
+    IFvalue *parm;
+    int which;
+    char *word;
+
+    NG_IGNORE(gnode);
+    NG_IGNORE(current);
+
+    which = ft_find_analysis("PSS");
+    if (which == -1) {
+        LITERR("Envelope-following (.tranenv) analysis unsupported.\n");
+        return (0);
+    }
+    IFC(newAnalysis, (ckt, which, "Envelope Following Analysis", &foo, task));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);      /* Fguess */
+    GCA(INPapName, (ckt, which, foo, "fguess", parm));
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);   /* Points */
+    GCA(INPapName, (ckt, which, foo, "points", parm));
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);   /* SC_iter */
+    GCA(INPapName, (ckt, which, foo, "sc_iter", parm));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);      /* Steady_coeff */
+    GCA(INPapName, (ckt, which, foo, "steady_coeff", parm));
+
+    parm = INPgetValue(ckt, &line, IF_REAL, tab);      /* Tstop */
+    GCA(INPapName, (ckt, which, foo, "envtstop", parm));
+
+    parm = INPgetValue(ckt, &line, IF_INTEGER, tab);   /* Mmax */
+    GCA(INPapName, (ckt, which, foo, "envmmax", parm));
+
+    ptemp.iValue = 1;
+    GCA(INPapName, (ckt, which, foo, "envelope", &ptemp));   /* selects ENVenvelopeRun() in dcpss.c */
+
+    /* zero or more trailing tokens, order-independent -- same
+     * "method"/"uic" two-token-split convention dot_pss() already
+     * documents (INPgetTok() splits on '=' as a plain separator, so
+     * "envtol=0.02" and "envtol 0.02" both arrive as two tokens). */
+    while (*line) {
+        INPgetTok(&line, &word, 1);
+        if (!*word) {
+            tfree(word);
+            break;
+        }
+        if (strcmp(word, "uic") == 0) {
+            ptemp.iValue = 1;
+            GCA(INPapName, (ckt, which, foo, "uic", &ptemp));
+        } else if (strcmp(word, "envtol") == 0) {
+            parm = INPgetValue(ckt, &line, IF_REAL, tab);
+            GCA(INPapName, (ckt, which, foo, "envtol", parm));
+        } else if (strcmp(word, "phase") == 0) {
+            parm = INPgetValue(ckt, &line, IF_REAL, tab);
+            GCA(INPapName, (ckt, which, foo, "envphase", parm));
+        } else if (strcmp(word, "maptol") == 0) {   /* card #719 */
+            parm = INPgetValue(ckt, &line, IF_REAL, tab);
+            GCA(INPapName, (ckt, which, foo, "envmaptol", parm));
+        } else {
+            fprintf(stderr, "Error: unknown parameter %s on .tranenv - ignored\n", word);
+        }
+        tfree(word);
+    }
+    return (0);
+}
 #endif
 
 
@@ -2272,6 +2367,10 @@ INP2dot(CKTcircuit *ckt, INPtables *tab, struct card *current, TSKtask *task, CK
         /* Enhancement-132: Periodic S-parameters */
     } else if ((strcmp(token, ".psp") == 0)) {
         rtn = dot_psp(line, ckt, tab, current, task, gnode, foo);
+        goto quit;
+        /* card #513 (round 11): implicit envelope following */
+    } else if ((strcmp(token, ".tranenv") == 0)) {
+        rtn = dot_tranenv(line, ckt, tab, current, task, gnode, foo);
         goto quit;
 #endif
 #ifdef RFSPICE

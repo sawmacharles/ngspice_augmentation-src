@@ -210,6 +210,30 @@ typedef struct {
      * behaviour). See pssshoot.c "card #537". */
     int      PSSkrylov;
     int      PSSkrylovSet;   /* card #538: krylov= given on the card (0 or 1): no automatic choice */
+
+    /* card #513 (plan T9.11, round 11 of transient acceleration): implicit
+     * (Newton-corrected) envelope following, `.tranenv Fguess Points
+     * SC_iter Steady_coeff Tstop Mmax [envtol=<tol>] [uic]` -- a NEW
+     * directive (its own dot-card, inp2dot.c's dot_tranenv()), not an
+     * extension of the universally-shared `.tran` grammar/engine, for the
+     * same "additive, isolated, doesn't touch a shared path" reasoning
+     * this fork already used for .pac/.pstb/.pxf on top of .pss -- see
+     * pssenv.c's header comment for the full design and docs/envelope.md
+     * for the writeup. Reuses PSSguessedFreq/PSSpoints/sc_iter/
+     * steady_coeff above (the clock period, integration points/period,
+     * and Newton iteration budget/tolerance -- now for the IMPLICIT
+     * envelope equation's own Newton solve, not a periodic-steady-state
+     * residual); StabTime/OscNode/Harmonics are not used by this engine
+     * (no stabilisation phase, no single oscillation node, no harmonic
+     * count) and are left at whatever default dot_tranenv() gives them. */
+    int      PSSdoEnv;    /* 1 = this job is a `.tranenv` envelope-following run */
+    double   EnvTstop;    /* total real simulated time (s) */
+    int      EnvMmax;     /* maximum periods per envelope jump (adaptive M is capped here) */
+    double   EnvTol;      /* local envelope error tolerance (relative); <=0 = engine default */
+    double   EnvPhase;    /* sampling phase, fraction of a period in [0,1): period maps run [k*T+phase*T, (k+1)*T+phase*T] */
+    /* card #719: transient reltol of every envelope period map (min with the deck's reltol); default 1e-5, 0 = the deck's reltol */
+    double   EnvMapTol;
+    int      EnvMapTolGiven;
 } PSSan;
 
 enum {
@@ -258,6 +282,14 @@ enum {
     PXF_ADJOINT,
     PNOISE_DEVTBL,
     PSS_KRYLOV,
+
+    /* card #513: `.tranenv` implicit envelope following */
+    ENV_DO,
+    ENV_TSTOP,
+    ENV_MMAX,
+    ENV_TOL,
+    ENV_PHASE,
+    ENV_MAPTOL,   /* card #719 */
 };
 
 #endif

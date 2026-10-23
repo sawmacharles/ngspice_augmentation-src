@@ -117,6 +117,21 @@ DCtran(CKTcircuit *ckt,
 #if defined SHARED_MODULE
     int redostep;
 #endif
+    /* card #513 (round 11): the restart branch below starts a period at
+     * absolute t=0 unconditionally, in several places -- fine for every
+     * existing caller of DCtran(ckt,1) (plain `.tran`, every `.pss`/
+     * `.pac`/`.pstb`/`.pxf` period run), all of which genuinely want that.
+     * The new implicit envelope-following engine (pssenv.c) needs its own
+     * period map to start at an arbitrary ABSOLUTE time instead (so a
+     * slowly time-varying source, e.g. a soft-start ramp, evaluates at
+     * the true landing time) -- envT0 is 0.0 unless pssenv.c's own
+     * env_run_period_at() set PSSenvActive, so every other caller is
+     * completely unaffected. See pssshoot.h for PSSenvActive/PSSenvPeriodT0. */
+    double envT0 = 0.0;
+#ifdef WITH_PSS
+    if (PSSenvActive)
+        envT0 = PSSenvPeriodT0;
+#endif
 #ifdef XSPICE
     XSadcLocateActive = XSadcLocateWanted();   /* card #714: adc_bridge crossings located (periodic runs, or XS_ADC_LOCATE=1) */
 #endif
@@ -242,7 +257,7 @@ DCtran(CKTcircuit *ckt,
            if 'set nostepsizelimit' is not given in .spiceinit.*/
 
         /* Set the first delta (step) time, typically depending on TSTEP */
-        delta=MIN(ckt->CKTfinalTime/100,ckt->CKTstep)/10;
+        delta=MIN((ckt->CKTfinalTime-envT0)/100,ckt->CKTstep)/10;   /* card #513: t0-relative */
 
 #ifdef STEPDEBUG
         printf("delta = %g    finalTime/100: %g    CKTstep: %g\n",delta,ckt->CKTfinalTime/100,ckt->CKTstep);
@@ -269,7 +284,7 @@ DCtran(CKTcircuit *ckt,
         if(ckt->CKTbreaks) FREE(ckt->CKTbreaks);
         ckt->CKTbreaks = TMALLOC(double, 2);
         if(ckt->CKTbreaks == NULL) return(E_NOMEM);
-        ckt->CKTbreaks[0] = 0;
+        ckt->CKTbreaks[0] = envT0;   /* card #513: was hardcoded 0 */
         ckt->CKTbreaks[1] = ckt->CKTfinalTime;
         ckt->CKTbreakSize = 2;
 
@@ -309,6 +324,19 @@ DCtran(CKTcircuit *ckt,
         error = CKTnames(ckt,&numNames,&nameList);
         if(error) return(error);
         SPfrontEnd->IFnewUid (ckt, &timeUid, NULL, "time", UID_OTHER, NULL);
+#ifdef WITH_PSS
+        /* card #513: envelope-following output modes (pssshoot.h):
+         * 1 = scratch period map, no plot at all; 2 = kept period,
+         * appended to one persistent plot (PSSenvKeptPlot, NULL on the
+         * first kept period = begin it now and leave it open). */
+        if (PSSenvActive && PSSenvOutMode == 1) {
+            job->TRANplot = NULL;
+            error = 0;
+        } else if (PSSenvActive && PSSenvOutMode == 2 && PSSenvKeptPlot) {
+            job->TRANplot = PSSenvKeptPlot;
+            error = 0;
+        } else
+#endif
         error = SPfrontEnd->OUTpBeginPlot (ckt, ckt->CKTcurJob,
                                            ckt->CKTcurJob->JOBname,
                                            timeUid, IF_REAL,
@@ -321,7 +349,7 @@ DCtran(CKTcircuit *ckt,
         if (ckt->CKTsoaCheck)
             error = CKTsoaInit();
 
-        ckt->CKTtime = 0;
+        ckt->CKTtime = envT0;   /* card #513: was hardcoded 0 */
         ckt->CKTdelta = 0;
         ckt->CKTbreak = 1;
         firsttime = 1;
@@ -426,7 +454,7 @@ DCtran(CKTcircuit *ckt,
 #ifdef STEPDEBUG
         (void)printf("delta initialized to %g\n",ckt->CKTdelta);
 #endif
-        ckt->CKTsaveDelta = ckt->CKTfinalTime/50;
+        ckt->CKTsaveDelta = (ckt->CKTfinalTime-envT0)/50;   /* card #513: t0-relative */
 
 #ifdef WANT_SENSE2
         if(ckt->CKTsenInfo && (ckt->CKTsenInfo->SENmode & TRANSEN)){
@@ -586,9 +614,10 @@ DCtran(CKTcircuit *ckt,
 #endif
 
     /* Output the data of the current accepted time point */
-    if ((ckt->CKTmode & MODEUIC && ckt->CKTtime > 0 && ckt->CKTtime >= ckt->CKTinitTime)
-        || (!(ckt->CKTmode & MODEUIC) && ckt->CKTtime >= ckt->CKTinitTime)) {
-        CKTdump(ckt, ckt->CKTtime, job->TRANplot);
+    if ((ckt->CKTmode & MODEUIC && ckt->CKTtime > envT0 && ckt->CKTtime >= ckt->CKTinitTime)
+        || (!(ckt->CKTmode & MODEUIC) && ckt->CKTtime >= ckt->CKTinitTime)) {   /* card #513: was ckt->CKTtime > 0 */
+        if (job->TRANplot)   /* card #513: NULL in envelope scratch mode */
+            CKTdump(ckt, ckt->CKTtime, job->TRANplot);
     }
 #ifdef XSPICE
     /* Update event queues/data for accepted timepoint */
@@ -610,8 +639,17 @@ DCtran(CKTcircuit *ckt,
         printf(" done:  time is %g, final time is %g, and tol is %g\n",
         ckt->CKTtime, ckt->CKTfinalTime, ckt->CKTminBreak);
 #endif
-        SPfrontEnd->OUTendPlot (job->TRANplot);
+#ifdef WITH_PSS
+        if (PSSenvActive && PSSenvOutMode == 2) {
+            /* card #513: keep the plot open for the next kept period;
+             * pssenv.c reads it back from job->TRANplot and ends it. */
+        } else
+#endif
+        {
+        if (job->TRANplot)
+            SPfrontEnd->OUTendPlot (job->TRANplot);
         job->TRANplot = NULL;
+        }
         UPDATE_STATS(0);
 #ifdef WANT_SENSE2
         if(ckt->CKTsenInfo && (ckt->CKTsenInfo->SENmode & TRANSEN)){
@@ -695,7 +733,7 @@ resume:
         if(firsttime) {
             /* set a breakpoint to reduce ringing of current in devices */
             if (ckt->CKTmode & MODEUIC)
-                CKTsetBreak(ckt, ckt->CKTstep);
+                CKTsetBreak(ckt, envT0 + ckt->CKTstep);   /* card #513: t0-relative (envT0 = 0 for every other caller) */
 
             ckt->CKTdelta /= 10;
 #ifdef STEPDEBUG
@@ -1140,7 +1178,13 @@ resume:
             } else {
                 UPDATE_STATS(DOING_TRAN);
                 errMsg = CKTtrouble(ckt, "Timestep too small");
-                SPfrontEnd->OUTendPlot(job->TRANplot);
+#ifdef WITH_PSS
+                if (PSSenvActive && PSSenvOutMode == 2 && job->TRANplot)
+                    PSSenvKeptPlot = job->TRANplot;   /* card #513: keep open */
+                else
+#endif
+                if (job->TRANplot)
+                    SPfrontEnd->OUTendPlot(job->TRANplot);
                 job->TRANplot = NULL;
                 UPDATE_STATS(0);
                 ckt->CKTag[0] = ckt->CKTag[1] = 0.;
