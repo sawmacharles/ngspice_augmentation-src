@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 153 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s151`; `s151` is the latest.
-- **Size of the change:** 101 files, about 27 000 lines added, 242 removed.
+- **This fork:** 154 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s152`; `s152` is the latest.
+- **Size of the change:** 102 files, about 27 000 lines added, 244 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -292,7 +292,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (57 at `s151`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (57 at `s152`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -304,7 +304,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s151` is attached to the [s151 release](../../releases/tag/s151)
+A Linux x86-64 binary of `s152` is attached to the [s152 release](../../releases/tag/s152)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -346,3 +346,4 @@ change on its own. The tags are:
 | s149 | lossless transmission lines in `.pss` shooting and td `.pac/.pstb/.pxf` (the orbit was wrong without a message); lossy lines refused |
 | s150 | td `.pac/.pstb/.pxf` through digital XSPICE blocks (was refused): edge-time shifts; exact comparator crossings in `.pss` |
 | s151 | `.tranenv`: envelope following for closed-loop converter soft-starts (6x faster than plain `.tran` on a voltage-mode buck, more accurate) |
+| s152 | `.pss` with an XSPICE `d_osc` clock: some start phases failed (or crashed) in the restarted period runs; a converter that is off in steady state is accepted instead of reported as not converged |
