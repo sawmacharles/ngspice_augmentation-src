@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 149 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s148`; `s148` is the latest.
-- **Size of the change:** 94 files, about 23 000 lines added, 175 removed.
+- **This fork:** 151 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s149`; `s149` is the latest.
+- **Size of the change:** 96 files, about 24 000 lines added, 231 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -116,10 +116,11 @@ gain and margins, and noise of a circuit that never sits at a DC point.
   has at each instant of the orbit. Flicker noise is folded correctly from every sideband.
 - Handles ideal-switch converters (buck, boost, half bridge, with or without dead time,
   synchronous or diode rectified), device-model charges (MOS, BSIM3/4 including their
-  non-quasi-static models, diode, BJT), stateful
+  non-quasi-static models, diode, BJT), lossless transmission lines (`T` element), stateful
   XSPICE analog models, and free-running orbits.
 - Says so when it cannot answer correctly: for example discontinuous conduction at a coarse
-  step, transmission lines in shooting `.pss`, or small-signal through digital blocks.
+  step, lossy transmission lines (LTRA, TXL, coupled lines) in shooting `.pss`, a lossless line in
+  `.pnoise`, or small-signal through digital blocks.
 
 ### 4. Speed (results unchanged)
 
@@ -244,6 +245,12 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
   `.model` line: given on the device line of a BSIM3 3.0–3.2 or BSIM4 4.5–4.7 device (versions
   refused with the option on the model line), a td small-signal analysis ran unvalidated without
   a message. Since `s148` the device line is checked too and such a device is refused.
+  Builds before `s149` reported `.pss` with a lossless transmission line as converged while each
+  period restarted the line from its initial history: on test circuits the orbit was 23–100 % of
+  its peak-peak off the settled transient (a buck with a line at its output: 3.9 V off a 56 mV
+  ripple); LTRA, TXL and coupled lines were accepted too (their error not measured). Since `s149` the line's
+  delayed history is part of the periodic state: within 0.03–1.2 % of peak-peak on five circuits,
+  and td `.pac`/`.pstb`/`.pxf` run on it (`.pac` against `.ac` within 1.3e-4 dB); lossy lines are refused.
   Builds before `s145` left out the source/drain part of the BSIM4 `tnoimod=1` channel noise
   in `.pnoise` (about 4.4 dB low on a test circuit): the model created those internal noise
   nodes only when the deck also had a plain `.noise` analysis. Since `s145` `.pnoise` (and
@@ -256,7 +263,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (55 at `s148`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (56 at `s149`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -268,7 +275,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s148` is attached to the [s148 release](../../releases/tag/s148)
+A Linux x86-64 binary of `s149` is attached to the [s149 release](../../releases/tag/s149)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -307,3 +314,4 @@ change on its own. The tags are:
 | s146 | boost / buck-boost with a capacitor at the switch node within 0.005° of an exact reference; full event buffer refused, never dropped |
 | s147 | `.pnoise` on non-quasi-static BSIM4 / BSIM3 models (was refused), checked against transient-noise ensembles |
 | s148 | a non-quasi-static option on the device line is checked like one on the `.model` line (unvalidated versions ran without a message) |
+| s149 | lossless transmission lines in `.pss` shooting and td `.pac/.pstb/.pxf` (the orbit was wrong without a message); lossy lines refused |
