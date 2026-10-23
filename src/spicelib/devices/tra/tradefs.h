@@ -49,6 +49,17 @@ typedef struct sTRAinstance {
     double *TRAdelays;     /* delayed values of excitation */
     int TRAsizeDelay;       /* size of active delayed table */
     int TRAallocDelay;      /* allocated size of delayed table */
+    /* card #716: periodic history of the shooting analyses (.pss method=shoot, td small signal).  TRApssHist holds the delay
+     * table (time, excitation of port 1, excitation of port 2 triples, like TRAdelays) latched at the end of a shooting run, its
+     * times shifted to the start of the next run (<= 0); a run started while TRApssRestore is set takes it as its history instead
+     * of the constant initial-condition history.  TRAip* record the three table points and Lagrange weights the excitation of the
+     * current time point was interpolated with (the small-signal recursion applies the same weights to its own trajectory). */
+    double *TRApssHist;
+    int TRApssHistN;        /* entries in TRApssHist (0: none latched) */
+    int TRApssHistAlloc;    /* entries allocated */
+    double TRAipT[3];       /* times of the interpolation points of the current excitation */
+    double TRAipF[3];       /* their weights */
+    int TRAipOK;            /* TRAip* valid (an interpolated excitation, not the constant initial one) */
     int TRAbrEq1;       /* number of branch equation for end 1 of t. line */
     int TRAbrEq2;       /* number of branch equation for end 2 of t. line */
     double *TRAibr1Ibr2Ptr;     /* pointer to sparse matrix */
@@ -156,6 +167,9 @@ enum {
 /* device questions */
 
 /* model questions */
+
+extern int TRApssRestore;   /* card #716, see TRApssHist */
+extern int TRAinterp(TRAinstance *here, double t);   /* card #716 */
 
 #include "traext.h"
 
