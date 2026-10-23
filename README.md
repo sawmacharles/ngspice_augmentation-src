@@ -10,9 +10,9 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Five later
   upstream fixes were picked on top.
-- **This fork:** 151 commits on top of that base, the branch `main`. Releases are the tags
-  `s125` … `s149`; `s149` is the latest.
-- **Size of the change:** 96 files, about 24 000 lines added, 231 removed.
+- **This fork:** 152 commits on top of that base, the branch `main`. Releases are the tags
+  `s125` … `s150`; `s150` is the latest.
+- **Size of the change:** 98 files, about 25 000 lines added, 232 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
 - The full list of changes is in [CHANGES-FORK.md](CHANGES-FORK.md). The upstream ngspice
@@ -117,10 +117,15 @@ gain and margins, and noise of a circuit that never sits at a DC point.
 - Handles ideal-switch converters (buck, boost, half bridge, with or without dead time,
   synchronous or diode rectified), device-model charges (MOS, BSIM3/4 including their
   non-quasi-static models, diode, BJT), lossless transmission lines (`T` element), stateful
-  XSPICE analog models, and free-running orbits.
+  XSPICE analog models, digital XSPICE blocks (a comparator PWM built from `adc_bridge`, gates,
+  flip-flops and `dac_bridge`; a `d_pwm` whose duty is an analog input; clock-only digital
+  paths), and free-running orbits. Through digital blocks, the small signal moves the edge
+  times: a closed comparator-PWM loop gives `.pstb` within 0.0012 dB of a brute-force FRA
+  (phase margin 38.350° vs 38.345°).
 - Says so when it cannot answer correctly: for example discontinuous conduction at a coarse
   step, lossy transmission lines (LTRA, TXL, coupled lines) in shooting `.pss`, a lossless line in
-  `.pnoise`, or small-signal through digital blocks.
+  `.pnoise`, two digital edges of different origin at the same instant, a multi-bit ADC or a
+  voltage-controlled oscillator in the small-signal path, or noise through digital blocks.
 
 ### 4. Speed (results unchanged)
 
@@ -263,7 +268,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (56 at `s149`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (57 at `s150`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -275,7 +280,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s149` is attached to the [s149 release](../../releases/tag/s149)
+A Linux x86-64 binary of `s150` is attached to the [s150 release](../../releases/tag/s150)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -315,3 +320,4 @@ change on its own. The tags are:
 | s147 | `.pnoise` on non-quasi-static BSIM4 / BSIM3 models (was refused), checked against transient-noise ensembles |
 | s148 | a non-quasi-static option on the device line is checked like one on the `.model` line (unvalidated versions ran without a message) |
 | s149 | lossless transmission lines in `.pss` shooting and td `.pac/.pstb/.pxf` (the orbit was wrong without a message); lossy lines refused |
+| s150 | td `.pac/.pstb/.pxf` through digital XSPICE blocks (was refused): edge-time shifts; exact comparator crossings in `.pss` |
