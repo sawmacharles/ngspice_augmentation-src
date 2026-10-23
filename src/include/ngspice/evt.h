@@ -167,6 +167,7 @@ struct Evt_Output_Event {
     Mif_Boolean_t     removed;        /* True if event has been deactivated */
     double            removed_time;   /* Time at which event was deactivated */
     void              *value;         /* The delayed value sent to this output */
+    int               tag;            /* card #714: timing dependence of this edge (0 fixed; see mif.h g_xs_dig_*) */
 };
 
 struct Evt_Output_Queue {

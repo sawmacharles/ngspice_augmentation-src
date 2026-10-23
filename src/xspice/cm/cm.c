@@ -428,6 +428,16 @@ xs_bkpt_to_circuit(CKTcircuit *ckt, double time)
     if (g_xs_toff != 0.0 && ckt->CKTfinalTime > 0.0 &&
         fabs(rel - ckt->CKTfinalTime) <= 64.0 * DBL_EPSILON * (fabs(time) + fabs(g_xs_toff)))
         rel = ckt->CKTfinalTime;
+    /* card #714: a breakpoint a model sets at the current event time (dac_bridge: cm_analog_set_perm_bkpt(TIME) at its input edge) comes
+     * back a few 1e-19 s off it; dctran.c then refuses it as earlier than the event ("bp >= evt_step") and the edge does not land on a time
+     * point in the periodic analyses.  Snap it onto the event time. */
+    {
+        static int nosnap = -1;
+        if (nosnap < 0) nosnap = getenv("XS_NO_EVT_SNAP") != NULL;   /* experiments: the s149 behaviour */
+        if (!nosnap && g_xs_toff != 0.0 &&
+            fabs(rel - g_mif_info.circuit.evt_step) <= 64.0 * DBL_EPSILON * (fabs(time) + fabs(g_xs_toff)))
+            rel = g_mif_info.circuit.evt_step;
+    }
     return rel;
 }
 
@@ -491,7 +501,7 @@ int cm_analog_set_perm_bkpt(
     /* Get the address of the ckt and instance structs from g_mif_info */
     ckt  = g_mif_info.ckt;
 
-    time -= g_xs_toff;   /* card #551: model time -> circuit time */
+    time = xs_bkpt_to_circuit(ckt, time);   /* card #551: model time -> circuit time (#714: snapped onto the event / final time) */
 
     /* Call cm_analog_set_temp_bkpt() to force backup if less than current time */
     if(time < (ckt->CKTtime + ckt->CKTminBreak))

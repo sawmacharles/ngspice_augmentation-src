@@ -166,6 +166,10 @@ WHAT THIS DOES NOT DO (see the card #465 report for the full list)
 #include "ngspice/mif.h"
 #include "ngspice/mifdefs.h"
 #include "ngspice/mifcmdat.h"
+#include "ngspice/cmtypes.h"   /* card #714: Digital_t */
+#include "ngspice/mifparse.h"   /* card #714: Mif_Param_Info_t */
+#include "ngspice/missing_math.h"   /* card #714: AlmostEqualUlps */
+#include "ngspice/evt.h"
 #endif
 
 #include <math.h>
@@ -446,6 +450,12 @@ pac_ckt_has_events(CKTcircuit *ckt)
         ev = dn && (!strcmp(dn, "Switch") || !strcmp(dn, "CSwitch"));
 #ifdef XSPICE
         ev = ev || DEVices[i]->DEVpublic.cm_func != NULL;   /* a code model (DEVload is the .cm library's MIFload wrapper, not MIFload) */
+        /* card #714: the digital / hybrid blocks do not keep the coarse grid: their edge-shift injection is formed per accepted step for
+         * any grid (measured: the comparator-PWM buck 0.006 dB off the FRA at the inherited 1e-5, 0.0004 dB at 1e-7).  PAC_DIG_COARSE=1:
+         * inherited value. */
+        if (ev && DEVices[i]->DEVpublic.cm_func && dn && (!strncmp(dn, "d_", 2) || !strcmp(dn, "adc_bridge") || !strcmp(dn, "dac_bridge")) &&
+            !getenv("PAC_DIG_COARSE"))
+            ev = 0;
 #endif
         if (!ev)
             continue;
@@ -550,7 +560,9 @@ pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
 #ifdef XSPICE
         /* card #551/#557: stateless models: no state to carry, model time 0.  With stateful analog models the carried hidden state
          * of the converged orbit (analog CKTstate values, model time) is put back, as for a restarted shooting run. */
-        if (g_hid_nc > 0 || g_hid_nhy > 0) PSSxsPacBegin(ckt); else g_xs_toff = 0.0;
+        /* card #714: event-driven blocks have state too (digital node values, queues, model time): put the carried snapshot back */
+        if (g_hid_nc > 0 || g_hid_nhy > 0 || (ckt->evt && ckt->evt->counts.num_insts > 0)) PSSxsPacBegin(ckt); else g_xs_toff = 0.0;
+        XSperiodicRun = 1;   /* card #714: adc_bridge crossings located as in the shooting runs */
 #endif
         /* card #553: the recording pass's plot is never read; keep one point per vector (PSS_KEEP_RUN_DATA=1: old behaviour) */
         PSSdiscardRunData = !(getenv("PSS_KEEP_RUN_DATA") && atoi(getenv("PSS_KEEP_RUN_DATA")) != 0);
@@ -561,7 +573,8 @@ pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
         PSSdiscardRunData = 0;
         ckt->CKTreltol = save_reltol;
 #ifdef XSPICE
-        if (g_hid_nc > 0 || g_hid_nhy > 0) PSSxsPacEnd();
+        if (g_hid_nc > 0 || g_hid_nhy > 0 || (ckt->evt && ckt->evt->counts.num_insts > 0)) PSSxsPacEnd();
+        XSperiodicRun = 0;
 #endif
     }
     PSSeventLocateActive = PSSswLagActive = 0;
@@ -1075,6 +1088,11 @@ pac_set(PACc *C, int row, int M, int m, PACc v)
     C[(size_t) row * M + m] = v;
 }
 
+#ifdef XSPICE
+static void pac_dig_reset(CKTcircuit *ckt, int M);   /* card #714, defined with the digital edge-timing code */
+static void pac_dig_stop(void);
+#endif
+
 static void
 pac_free(void)
 {
@@ -1106,6 +1124,9 @@ pac_free(void)
     g_pac_n = g_pac_neq = g_pac_M = 0;
     g_pac_failed = 1;
     g_pac_demod_active = 0;
+#ifdef XSPICE
+    pac_dig_stop();   /* card #714 */
+#endif
 }
 
 /* br/bi: shared forcing pattern (size neq+1, 1-based), or NULL for no
@@ -1210,6 +1231,9 @@ pac_reset(CKTcircuit *ckt, PACstateMap *map, int M, const double *br, const doub
     g_pac_gen_bad = 0;
     g_pac_failed = 0;
     PSSsaltReset();   /* card #494 third pass: fresh run -- filter the first step's event */
+#ifdef XSPICE
+    pac_dig_reset(ckt, M);   /* card #714: digital edge timing of this pass */
+#endif
     return 0;
 }
 
@@ -2241,6 +2265,811 @@ static void pac_hid_rhs(int m, int M) { (void) m; (void) M; }
 static void pac_hid_update(int m, int M) { (void) m; (void) M; }
 #endif
 
+#ifdef XSPICE
+/* ------------------------------------------------------------------------------------------------------------------------------- */
+/* card #714: SMALL SIGNAL THROUGH DIGITAL XSPICE BLOCKS (td .pac / .pstb / .pxf).
+ *
+ * A digital block has no small-signal gain: a quantiser's output does not move when its input moves a little.  What moves is the TIME
+ * of a digital edge, when that time is set by an analog quantity.  The linearisation of the digital path is therefore a chain of edge
+ * shifts:
+ *   - an adc_bridge (single-bit) whose input v crosses the level L at which its state changes: the edge moves by
+ *         dtau = -dv(t_c) / v'(t_c)
+ *     dv(t_c) is the small-signal input at the crossing (linear interpolation of the recursion's columns between the two accepted points
+ *     around the crossing; with the crossing located (XSadcLocate) the second point is the crossing itself), v' the orbit slope there;
+ *   - every digital block with fixed delays passes the shift of the input edge that triggered an output change on to that output
+ *     (gates, flip-flops clocked by the shifted edge, latches, dividers, d_lut / d_state): the delay is a constant, so the output edge
+ *     moves by the same dtau.  An output triggered by an edge of fixed time (a clock) does not move, whatever the data inputs did (the
+ *     zero gain of the quantiser).  This is followed per event at run time: every queued output event carries a tag (evtload.c), 0 for
+ *     a fixed time, else the timing record below;
+ *   - a dac_bridge input edge moved by dtau moves the analog ramp that follows it: for t from the edge until the output is flat again
+ *         dout(t) = (s_before - s_after) * dtau
+ *     (s_before / s_after: the orbit's output slope just before / after the edge; a ramp from a flat level gives -s_after * dtau, i.e.
+ *     minus the ramp slope times the shift).  It is injected on the dac output's branch (voltage output) or node pair (current output)
+ *     at every accepted point inside that window: the left half of the point's trapezoid weight is the window's, which gives the exact
+ *     area of the shifted ramp whenever the window starts and ends on accepted points (the dac sets breakpoints at both).  The analog
+ *     network then carries the perturbation like any other source (through a smooth switch model, or an ideal sw whose control it moves:
+ *     the switch's own saltation term reads it at its event).
+ * Digital outputs whose time is fixed (clocks: d_osc / d_pwm with a control that has no small-signal part) are fixed waveforms: nothing
+ * is injected, and the analog part sees them as the time functions they are (card #714 case (c)).
+ *
+ * Refused with a message naming the instance (the recursion would otherwise be wrong without notice):
+ *   - simultaneous input edges of different timing origin at one instance (a tie: which input decides is not differentiable);
+ *   - a multi-bit adc_bridge (one input, several outputs), an inverted adc output port, an adc input of type vnam, a dac_bridge in
+ *     multi-input mode, a dac output of another type, when a moved edge reaches the analog side through them;
+ *   - a d_osc / d_pwm whose control input has a small-signal part (a VCO / an analog-duty PWM: its edge times are hidden state that
+ *     carries over the period boundary);
+ *   - a moved edge or a moved ramp still in flight at the end of the period (the shift would be a Floquet state of its own);
+ *   - .pnoise (the transposed sweep does not carry the edge shifts) and .pxf adjoint=1 falls back to the forward engine.
+ * PAC_DIG_REFUSE=1 restores the s149 refusal of every digital model (red proof); PAC_DIG_NOSHIFT=1 keeps the digital blocks but drops
+ * the edge-shift injection (red proof: the digital path then has zero gain, the s149-with-the-policy-lifted answer). */
+typedef struct {
+    int kind;            /* 1 adc crossing, 2 unmodelled (refused if it reaches the analog side) */
+    int pending;         /* kind 1: dtau not computed yet (the crossing's accepted point has not been recorded) */
+    int win;             /* kind 1: watched input */
+    double t, L;         /* time of the cause, level crossed */
+    int pwm;             /* kind 1 from a d_pwm decision: dt = shift of last_time + k dc (pwm_k), computed at the decision's point */
+    double pwm_k;
+    PACc *dt;            /* [M] edge shift per column */
+    char why[240];
+} PACdigRec;
+
+typedef struct {         /* an analog input watched by the recursion: adc_bridge input port, d_osc / d_pwm control */
+    MIFinstance *inst;
+    int conn, port, type, pos, neg, ibr, ok;
+    double t[3], v[3];   /* the last three accepted points, [2] the latest */
+    PACc *y1, *y0;       /* [M] the column values at the latest / previous accepted point */
+    /* d_pwm with a control that has a small-signal part (case (b)): the shift of its last transition time is a Floquet state */
+    int is_pwm, fl, pinned, last_tag, out_index, nt;
+    double fpwm, tctl[32], tdc[32];
+    PACc *tau;           /* [M] shift of state->last_time (s) */
+} PACdigIn;
+
+typedef struct {         /* a dac_bridge output port (non-multi mode) */
+    MIFinstance *inst;
+    int port, type, pos, neg, br, innode, ok;
+    double lo, hi, und, srise, sfall;
+    int last_state;      /* digital input state last seen (0, 1, 2 = unknown) */
+    double vprev, vcur, tprev, tcur;
+    int have;            /* number of accepted points seen (vcur valid if >= 1) */
+} PACdigOut;
+
+typedef struct {         /* a moved edge at a dac input */
+    int out, tag, started, done;
+    double t0, lev_old, lev_new, coef, w;
+} PACdigInj;
+
+static PACdigRec *g_dig_rec = NULL;
+static int g_dig_nrec = 0, g_dig_caprec = 0;
+static PACdigIn *g_dig_in = NULL;
+static int g_dig_nin = 0;
+static PACdigOut *g_dig_out = NULL;
+static int g_dig_nout = 0;
+static PACdigInj *g_dig_inj = NULL;
+static int g_dig_ninj = 0, g_dig_capinj = 0;
+static int g_dig_have = 0;        /* event-driven XSPICE instances in the circuit (td analysis with the digital machinery) */
+static int g_dig_M = 0, g_dig_failed = 0, g_dig_active = 0;
+static CKTcircuit *g_dig_ckt = NULL;
+static long g_dig_nshift = 0, g_dig_ninjsteps = 0;   /* statistics of a pass: edges moved at a dac, injected steps */
+static int g_dig_noshift = 0;
+static int g_dig_nfl = 0;         /* Floquet states of the d_pwm instances with an analog duty (pac_dig_floquet_setup) */
+static double g_dig_T = 0.0;
+
+static char g_dig_msg[600];
+
+static void
+pac_dig_fail(const char *msg)
+{
+    if (g_dig_failed)
+        return;
+    fprintf(stderr, "PAC-TD: REFUSED -- %s (card #714)\n", msg);
+    g_dig_failed = 1;
+    g_pac_failed = 1;
+}
+
+static const char *
+pac_dig_model(MIFinstance *inst)
+{
+    const char *nm = DEVices[MIFmodPtr(inst)->MIFmodType]->DEVpublic.name;
+    return nm ? nm : "?";
+}
+
+static double
+pac_dig_param(MIFinstance *inst, const char *name, double dflt, int *given)
+{
+    int type = MIFmodPtr(inst)->MIFmodType, k;
+    IFdevice *pub = &DEVices[type]->DEVpublic;
+    if (given) *given = 0;
+    for (k = 0; k < pub->num_param && k < inst->num_param; k++)
+        if (pub->param[k].name && !strcmp(pub->param[k].name, name) && inst->param[k] && inst->param[k]->element) {
+            if (given) *given = !inst->param[k]->is_null;
+            return inst->param[k]->element[0].rvalue;
+        }
+    return dflt;
+}
+
+static int
+pac_dig_state(CKTcircuit *ckt, int node_index)
+{
+    Evt_Node_t *rhs = ckt->evt->data.node->rhs;
+    const Digital_t *d;
+    if (node_index < 0 || !rhs || !rhs[node_index].node_value)
+        return -1;
+    d = (const Digital_t *) rhs[node_index].node_value;
+    return (int) d->state;
+}
+
+static void
+pac_dig_free(void)
+{
+    int i;
+    for (i = 0; i < g_dig_nrec; i++) tfree(g_dig_rec[i].dt);
+    tfree(g_dig_rec); g_dig_nrec = g_dig_caprec = 0;
+    for (i = 0; i < g_dig_nin; i++) { tfree(g_dig_in[i].y0); tfree(g_dig_in[i].y1); tfree(g_dig_in[i].tau); }
+    tfree(g_dig_in); g_dig_nin = 0;
+    tfree(g_dig_out); g_dig_nout = 0;
+    tfree(g_dig_inj); g_dig_ninj = g_dig_capinj = 0;
+    g_dig_M = 0;
+}
+
+static int
+pac_dig_add_in(MIFinstance *inst, int conn, int port)
+{
+    Mif_Port_Data_t *p = inst->conn[conn]->port[port];
+    PACdigIn *w;
+    g_dig_in = TREALLOC(PACdigIn, g_dig_in, g_dig_nin + 1);
+    w = &g_dig_in[g_dig_nin];
+    memset(w, 0, sizeof *w);
+    w->inst = inst; w->conn = conn; w->port = port; w->type = p->type;
+    w->pos = p->smp_data.pos_node; w->neg = p->smp_data.neg_node; w->ibr = p->smp_data.ibranch;
+    w->ok = (p->type == MIF_VOLTAGE || p->type == MIF_DIFF_VOLTAGE || p->type == MIF_CURRENT || p->type == MIF_DIFF_CURRENT);
+    return g_dig_nin++;
+}
+
+/* the event-driven instances: watched analog inputs (adc_bridge, d_osc, d_pwm) and the dac_bridge outputs */
+static void
+pac_dig_collect(CKTcircuit *ckt)
+{
+    int i;
+    pac_dig_free();
+    g_dig_ckt = ckt;
+    g_dig_have = (ckt->evt && ckt->evt->counts.num_insts > 0) && !getenv("PAC_DIG_REFUSE");
+    g_dig_noshift = getenv("PAC_DIG_NOSHIFT") != NULL;
+    if (!g_dig_have)
+        return;
+    for (i = 0; i < ckt->evt->counts.num_insts; i++) {
+        MIFinstance *inst = ckt->evt->info.inst_table[i]->inst_ptr;
+        const char *nm = pac_dig_model(inst);
+        int j;
+        if (!strcmp(nm, "adc_bridge") && inst->num_conn >= 2 && !inst->conn[0]->is_null) {
+            for (j = 0; j < inst->conn[0]->size; j++)
+                if (!inst->conn[0]->port[j]->is_null) pac_dig_add_in(inst, 0, j);
+        } else if ((!strcmp(nm, "d_osc") || !strcmp(nm, "d_pwm")) && inst->num_conn >= 1 && !inst->conn[0]->is_null &&
+                   inst->conn[0]->is_input && !inst->conn[0]->port[0]->is_null) {
+            int w = pac_dig_add_in(inst, 0, 0);
+            if (!strcmp(nm, "d_pwm") && inst->num_conn >= 2 && !inst->conn[1]->is_null) {
+                /* the PWL duty table exactly as cm_d_pwm uses it (duty entries outside (0, 1) replaced by 0.01 / 0.99 at INIT) */
+                PACdigIn *pw = &g_dig_in[w];
+                int type = MIFmodPtr(inst)->MIFmodType, k, ic = -1, id = -1;
+                IFdevice *pub = &DEVices[type]->DEVpublic;
+                pw->is_pwm = 1;
+                pw->fl = -1;
+                pw->fpwm = pac_dig_param(inst, "frequency", 1e6, NULL);
+                pw->out_index = inst->conn[1]->port[0]->evt_data.output_index;
+                for (k = 0; k < pub->num_param && k < inst->num_param; k++) {
+                    if (pub->param[k].name && !strcmp(pub->param[k].name, "cntl_array")) ic = k;
+                    if (pub->param[k].name && !strcmp(pub->param[k].name, "dc_array")) id = k;
+                }
+                if (ic >= 0 && id >= 0 && inst->param[ic] && inst->param[id] && inst->param[ic]->size == inst->param[id]->size &&
+                    inst->param[ic]->size >= 2 && inst->param[ic]->size <= 32) {
+                    pw->nt = inst->param[ic]->size;
+                    for (k = 0; k < pw->nt; k++) {
+                        double dc = inst->param[id]->element[k].rvalue;
+                        pw->tctl[k] = inst->param[ic]->element[k].rvalue;
+                        pw->tdc[k] = dc <= 0.0 ? 0.01 : dc >= 1.0 ? 0.99 : dc;
+                    }
+                }
+            }
+        } else if (!strcmp(nm, "dac_bridge") && inst->num_conn >= 2 && !inst->conn[0]->is_null && !inst->conn[1]->is_null) {
+            Mif_Conn_Data_t *cin = inst->conn[0], *cout = inst->conn[1];
+            int multi = (cin->size != cout->size && cout->size == 1);
+            double lo = pac_dig_param(inst, "out_low", 0.0, NULL), hi = pac_dig_param(inst, "out_high", 1.0, NULL);
+            int gl, gh, gu;
+            double und = pac_dig_param(inst, "out_undef", 0.5, &gu);
+            (void) pac_dig_param(inst, "out_low", 0.0, &gl);
+            (void) pac_dig_param(inst, "out_high", 1.0, &gh);
+            if (gl && gh && !gu) und = lo + 0.5 * (hi - lo);   /* as cm_dac_bridge */
+            for (j = 0; j < cin->size && j < (multi ? cin->size : cout->size); j++) {
+                Mif_Port_Data_t *po = cout->port[multi ? 0 : j];
+                PACdigOut *o;
+                g_dig_out = TREALLOC(PACdigOut, g_dig_out, g_dig_nout + 1);
+                o = &g_dig_out[g_dig_nout++];
+                memset(o, 0, sizeof *o);
+                o->inst = inst; o->port = j; o->type = po->type;
+                o->pos = po->smp_data.pos_node; o->neg = po->smp_data.neg_node; o->br = po->smp_data.branch;
+                o->innode = cin->port[j]->is_null ? -1 : cin->port[j]->evt_data.node_index;
+                o->ok = !multi && !po->is_null &&
+                        (po->type == MIF_VOLTAGE || po->type == MIF_DIFF_VOLTAGE || po->type == MIF_CURRENT || po->type == MIF_DIFF_CURRENT);
+                o->lo = lo; o->hi = hi; o->und = und;
+                o->srise = (hi - lo) / pac_dig_param(inst, "t_rise", 1e-9, NULL);
+                o->sfall = (hi - lo) / pac_dig_param(inst, "t_fall", 1e-9, NULL);
+            }
+        }
+    }
+}
+
+static double
+pac_dig_out_value(const PACdigOut *o, const double *x)
+{
+    if (o->type == MIF_CURRENT || o->type == MIF_DIFF_CURRENT)
+        return 0.0;   /* a current output: the ramp is followed through the model's own value (see pac_dig_prestep) */
+    return x[o->pos] - x[o->neg];
+}
+
+static double
+pac_dig_level(const PACdigOut *o, int st)
+{
+    return st == 1 ? o->hi : st == 0 ? o->lo : o->und;
+}
+
+static int pac_dig_hook(void *vckt, void *vinst, int what, int conn, int port, int intag, double t);
+
+/* is node `node` held by an independent V source to ground that this forcing pattern does not excite (its small-signal value is then 0)? */
+static int
+pac_dig_pinned(CKTcircuit *ckt, int node, const double *br, const double *bi)
+{
+    int vt = CKTtypelook("Vsource");
+    VSRCmodel *mod;
+    VSRCinstance *v;
+    if (node == 0)
+        return 1;
+    if (vt < 0)
+        return 0;
+    for (mod = (VSRCmodel *) ckt->CKThead[vt]; mod; mod = VSRCnextModel(mod))
+        for (v = VSRCinstances(mod); v; v = VSRCnextInstance(v))
+            if (v->VSRCposNode == node && v->VSRCnegNode == 0) {
+                int b = v->VSRCbranch;
+                if ((br && br[b] != 0.0) || (bi && bi[b] != 0.0))
+                    return 0;
+                return 1;
+            }
+    return 0;
+}
+
+/* card #714 case (b): the d_pwm instances whose control can carry a small-signal part get a Floquet state each (the shift of the time of
+ * their last transition, state->last_time of cm_d_pwm, which carries over the period boundary); returns their number */
+static int
+pac_dig_floquet_setup(CKTcircuit *ckt, const double *br, const double *bi, double T)
+{
+    int i;
+    g_dig_nfl = 0;
+    g_dig_T = T;
+    if (!g_dig_have || g_dig_ckt != ckt)
+        return 0;
+    for (i = 0; i < g_dig_nin; i++) {
+        PACdigIn *w = &g_dig_in[i];
+        if (!w->is_pwm)
+            continue;
+        w->fl = -1;
+        w->pinned = w->ok && (w->type == MIF_VOLTAGE || w->type == MIF_DIFF_VOLTAGE) &&
+                    pac_dig_pinned(ckt, w->pos, br, bi) && pac_dig_pinned(ckt, w->neg, br, bi);
+        if (!w->pinned && w->ok && w->nt >= 2 && !g_dig_noshift)
+            w->fl = g_dig_nfl++;
+    }
+    return g_dig_nfl;
+}
+
+static int pac_dig_new_rec(int kind, double t);
+
+/* initial shifts (Floquet values x T) of the d_pwm states for the M columns of this pass: H[(fl)*M + m]; NULL = 0 */
+static void
+pac_dig_floquet_init(const PACc *H, int M)
+{
+    int i, m;
+    if (!g_dig_active || g_dig_nfl == 0)
+        return;
+    tfree(g_xs_dig_carry_tag);
+    g_xs_dig_ncarry = g_dig_ckt->evt->counts.num_outputs;
+    g_xs_dig_carry_tag = TMALLOC(int, g_xs_dig_ncarry > 0 ? g_xs_dig_ncarry : 1);
+    memset(g_xs_dig_carry_tag, 0, (size_t) (g_xs_dig_ncarry > 0 ? g_xs_dig_ncarry : 1) * sizeof(int));
+    for (i = 0; i < g_dig_nin; i++) {
+        PACdigIn *w = &g_dig_in[i];
+        int tag;
+        if (!w->is_pwm || w->fl < 0)
+            continue;
+        tfree(w->tau);
+        w->tau = TMALLOC(PACc, M);
+        for (m = 0; m < M; m++) {
+            PACc z = { 0.0, 0.0 };
+            w->tau[m] = H ? pc_scale(H[(size_t) w->fl * M + m], g_dig_T) : z;
+        }
+        tag = pac_dig_new_rec(1, 0.0);   /* the transition carried in from the previous period (an output event put back at t = 0) */
+        memcpy(g_dig_rec[tag - 1].dt, w->tau, (size_t) M * sizeof(PACc));
+        w->last_tag = tag;
+        if (w->out_index >= 0 && w->out_index < g_xs_dig_ncarry)
+            g_xs_dig_carry_tag[w->out_index] = tag;
+    }
+}
+
+static void
+pac_dig_floquet_readout(PACc *R, int M)
+{
+    int i, m;
+    if (g_dig_nfl == 0)
+        return;
+    for (i = 0; i < g_dig_nin; i++) {
+        PACdigIn *w = &g_dig_in[i];
+        if (!w->is_pwm || w->fl < 0 || !w->tau)
+            continue;
+        for (m = 0; m < M; m++)
+            R[(size_t) w->fl * M + m] = pc_scale(w->tau[m], 1.0 / g_dig_T);
+    }
+}
+
+/* d(duty)/d(control) of the d_pwm table at c (0 where cm_d_pwm clamps the duty to 0.01 / 0.99) */
+static double
+pac_dig_pwm_slope(const PACdigIn *w, double c, double *d)
+{
+    int i, n = w->nt;
+    double s;
+    for (i = 0; i < n; i++)
+        if (w->tctl[i] > c) break;
+    if (i > 0) { if (i == n) i -= 2; else i--; }
+    s = (w->tdc[i + 1] - w->tdc[i]) / (w->tctl[i + 1] - w->tctl[i]);
+    *d = w->tdc[i] + (c - w->tctl[i]) * s;
+    if (*d > 0.99 || *d < 0.01)
+        return 0.0;
+    return s;
+}
+
+/* start of a recording pass with M columns */
+static void
+pac_dig_reset(CKTcircuit *ckt, int M)
+{
+    int i;
+    g_dig_active = 0;
+    if (!g_dig_have || g_dig_ckt != ckt)
+        return;
+    for (i = 0; i < g_dig_nrec; i++) tfree(g_dig_rec[i].dt);
+    g_dig_nrec = 0;
+    g_dig_ninj = 0;
+    g_dig_M = M;
+    g_dig_failed = 0;
+    g_dig_nshift = g_dig_ninjsteps = 0;
+    for (i = 0; i < g_dig_nin; i++) {
+        PACdigIn *w = &g_dig_in[i];
+        tfree(w->y0); tfree(w->y1);
+        w->y0 = TMALLOC(PACc, M); w->y1 = TMALLOC(PACc, M);
+        memset(w->y0, 0, (size_t) M * sizeof(PACc)); memset(w->y1, 0, (size_t) M * sizeof(PACc));
+        w->t[0] = w->t[1] = w->t[2] = -1e300;
+    }
+    for (i = 0; i < g_dig_nout; i++) {
+        g_dig_out[i].have = 0;
+        g_dig_out[i].last_state = -1;
+    }
+    XSdigReset(ckt->evt->counts.num_nodes);
+    tfree(g_xs_dig_carry_tag);
+    g_xs_dig_ncarry = 0;
+    g_xs_dig_hook = pac_dig_hook;
+    g_xs_dig_on = 1;
+    g_dig_active = 1;
+}
+
+static void
+pac_dig_stop(void)
+{
+    g_xs_dig_on = 0;
+    g_xs_dig_hook = NULL;
+    g_dig_active = 0;
+}
+
+static int
+pac_dig_new_rec(int kind, double t)
+{
+    PACdigRec *r;
+    if (g_dig_nrec == g_dig_caprec) {
+        g_dig_caprec = g_dig_caprec ? 2 * g_dig_caprec : 64;
+        g_dig_rec = TREALLOC(PACdigRec, g_dig_rec, g_dig_caprec);
+    }
+    r = &g_dig_rec[g_dig_nrec];
+    memset(r, 0, sizeof *r);
+    r->kind = kind;
+    r->t = t;
+    r->win = -1;
+    if (kind == 1) {
+        r->dt = TMALLOC(PACc, g_dig_M);
+        memset(r->dt, 0, (size_t) g_dig_M * sizeof(PACc));
+    }
+    return ++g_dig_nrec;   /* tag = index + 1 */
+}
+
+static int
+pac_dig_unmodelled(double t, const char *fmt, const char *a, const char *b)
+{
+    int tag = pac_dig_new_rec(2, t);
+    snprintf(g_dig_rec[tag - 1].why, sizeof g_dig_rec[tag - 1].why, fmt, a ? a : "?", b ? b : "?");
+    return tag;
+}
+
+/* small-signal value of watched input w in column m at the latest (cur=1) / previous (cur=0) accepted point */
+static PACc
+pac_dig_in_y(const PACdigIn *w, const PACc *C, int M, int m)
+{
+    PACc z = { 0.0, 0.0 };
+    if (w->type == MIF_CURRENT || w->type == MIF_DIFF_CURRENT)
+        return w->ibr > 0 ? pac_get(C, w->ibr, M, m) : z;
+    if (w->pos > 0) z = pac_get(C, w->pos, M, m);
+    if (w->neg > 0) z = pc_sub(z, pac_get(C, w->neg, M, m));
+    return z;
+}
+
+static double
+pac_dig_in_v(const PACdigIn *w, const double *x)
+{
+    if (w->type == MIF_CURRENT || w->type == MIF_DIFF_CURRENT)
+        return x[w->ibr];
+    return x[w->pos] - x[w->neg];
+}
+
+/* dtau of crossing record r, once the accepted point of the crossing has been recorded (watched input times [1] [2] around it) */
+static void
+pac_dig_rec_compute(PACdigRec *r)
+{
+    PACdigIn *w = &g_dig_in[r->win];
+    double th, slope = 0.0, hmin;
+    int m, j;
+    if (fabs(w->t[2] - r->t) > 1e-12 * fabs(r->t) + 1e-30)
+        return;   /* not yet */
+    r->pending = 0;
+    if (r->pwm) {   /* card #714 case (b): the control as cm_d_pwm read it (the latest accepted point) */
+        static int nostate = -1;
+        if (nostate < 0) nostate = getenv("PAC_DIG_PWM_NOSTATE") != NULL;   /* red proof: each transition moved by k dc alone */
+        for (m = 0; m < g_dig_M; m++) {
+            if (nostate) { w->tau[m].re = 0.0; w->tau[m].im = 0.0; }
+            w->tau[m] = pc_add(w->tau[m], pc_scale(w->y1[m], r->pwm_k));
+            r->dt[m] = w->tau[m];
+        }
+        return;
+    }
+    if (w->t[1] < -1e299) {
+        r->kind = 2;
+        snprintf(r->why, sizeof r->why, "the threshold crossing of adc_bridge %s at the first time point of the period has no previous point",
+                 (char *) w->inst->MIFname);
+        return;
+    }
+    th = (w->v[2] != w->v[1]) ? (r->L - w->v[1]) / (w->v[2] - w->v[1]) : 1.0;
+    if (th < 0.0) th = 0.0;
+    if (th > 1.0) th = 1.0;
+    /* orbit slope at the crossing: the secant over the last step, or over two steps when the last one is very short (a located crossing
+     * ends with a step of the order of the location tolerance, too short for a secant of the orbit) */
+    hmin = 1e-3 * (g_dig_ckt ? g_dig_ckt->CKTmaxStep : 0.0);
+    for (j = 1; j >= 0; j--) {
+        if (w->t[j] < -1e299) break;
+        slope = (w->v[2] - w->v[j]) / (w->t[2] - w->t[j]);
+        if (w->t[2] - w->t[j] >= hmin) break;
+    }
+    if (!(fabs(slope) > 0.0) || !isfinite(slope)) {
+        r->kind = 2;
+        snprintf(r->why, sizeof r->why, "the input of adc_bridge %s touches its threshold with zero slope at t=%.6g (no edge-time derivative)",
+                 (char *) w->inst->MIFname, r->t);
+        return;
+    }
+    for (m = 0; m < g_dig_M; m++) {
+        PACc dv = pc_add(w->y0[m], pc_scale(pc_sub(w->y1[m], w->y0[m]), th));
+        r->dt[m] = pc_scale(dv, -1.0 / slope);
+    }
+    if (getenv("PAC_DIG_DEBUG"))
+        fprintf(stderr, "PAC-DIG: crossing %s t=%.12g L=%.6g pts (%.12g,%.9g) (%.12g,%.9g) th=%.6g slope=%.9g dt0=%.6g%+.6gj\n",
+                (char *) w->inst->MIFname, r->t, r->L, w->t[1], w->v[1], w->t[2], w->v[2], th, slope, r->dt[0].re, r->dt[0].im);
+}
+
+/* evtload.c hook (see mif.h).  what 0: input (conn, port) of inst changed at t with tag intag; 1: output (conn, port) changed, return its
+ * tag; 2: simultaneous input edges of different origin, return a tag for them. */
+static int
+pac_dig_hook(void *vckt, void *vinst, int what, int conn, int port, int intag, double t)
+{
+    CKTcircuit *ckt = (CKTcircuit *) vckt;
+    MIFinstance *inst = (MIFinstance *) vinst;
+    const char *nm;
+    int i;
+    if (!g_dig_active)
+        return intag;
+    nm = pac_dig_model(inst);
+    if (what == 2)
+        return pac_dig_unmodelled(t, "simultaneous input edges of different timing origin at XSPICE instance %s (%s): which input decides "
+                                  "the output edge is not differentiable (a tie)", (char *) inst->MIFname, nm);
+    if (what == 0) {
+        if (strcmp(nm, "dac_bridge"))
+            return intag;
+        for (i = 0; i < g_dig_nout; i++) {
+            PACdigOut *o = &g_dig_out[i];
+            int st, k;
+            if (o->inst != inst || o->port != port)
+                continue;
+            st = pac_dig_state(ckt, o->innode);
+            if (intag > 0 && !g_dig_noshift) {
+                PACdigRec *r = &g_dig_rec[intag - 1];
+                PACdigInj *q = NULL;
+                if (r->kind == 2) {
+                    snprintf(g_dig_msg, sizeof g_dig_msg, "%s; the edge reaches dac_bridge %s at t=%.9g", r->why, (char *) inst->MIFname, t);
+                    pac_dig_fail(g_dig_msg);
+                    return intag;
+                }
+                if (!o->ok) {
+                    snprintf(g_dig_msg, sizeof g_dig_msg, "dac_bridge %s receives an edge whose time depends on an analog quantity (t=%.9g), "
+                             "in multi-input mode or with an output type other than v / vd / i / id: not modelled", (char *) inst->MIFname, t);
+                    pac_dig_fail(g_dig_msg);
+                    return intag;
+                }
+                for (k = 0; k < g_dig_ninj; k++)   /* the same edge seen again (event re-evaluation, hybrid step call) */
+                    if (g_dig_inj[k].out == i && g_dig_inj[k].t0 == t) { q = &g_dig_inj[k]; break; }
+                if (!q) {
+                    if (g_dig_ninj == g_dig_capinj) {
+                        g_dig_capinj = g_dig_capinj ? 2 * g_dig_capinj : 32;
+                        g_dig_inj = TREALLOC(PACdigInj, g_dig_inj, g_dig_capinj);
+                    }
+                    q = &g_dig_inj[g_dig_ninj++];
+                    memset(q, 0, sizeof *q);
+                    q->lev_old = pac_dig_level(o, o->last_state >= 0 ? o->last_state : st);
+                    g_dig_nshift++;
+                }
+                q->out = i; q->tag = intag; q->t0 = t;
+                q->lev_new = pac_dig_level(o, st);
+                if (getenv("PAC_DIG_DEBUG"))
+                    fprintf(stderr, "PAC-DIG: register edge dac %s t0=%.12g tag %d (rec t=%.12g) CKTtime=%.12g delta=%.4g lev %g -> %g\n",
+                            (char *) inst->MIFname, t, intag, r->t, ckt->CKTtime, ckt->CKTdelta, q->lev_old, q->lev_new);
+                {   /* the moved ramp must end on an accepted point (the injection window is then exact up to the difference of the first
+                     * steps after its two ends): cm_dac_bridge sets its ramp-end breakpoint only when the edge falls inside a step, not when
+                     * it lands on one (the usual case, the edge time is a breakpoint itself).  From a flat level the ramp lasts
+                     * |dlevel| / slope; a ramp interrupted by another edge is followed by the step weights below. */
+                    double dl = q->lev_new - q->lev_old, s = dl > 0.0 ? o->srise : o->sfall;
+                    if (dl != 0.0 && s > 0.0 && !getenv("PAC_DIG_NOBREAK")) {
+                        double te = t + fabs(dl) / s;
+                        if (te > ckt->CKTtime + ckt->CKTminBreak && te < ckt->CKTfinalTime)
+                            CKTsetBreak(ckt, te);
+                    }
+                }
+            }
+            if (st >= 0) o->last_state = st;
+        }
+        return intag;
+    }
+    /* what == 1: an output changed */
+    if (!strcmp(nm, "adc_bridge")) {
+        Mif_Conn_Data_t *cin = inst->conn[0], *cout = inst->conn[1];
+        Mif_Port_Data_t *po = cout->port[port];
+        int w = -1, o, n, tag;
+        double lo, hi, L;
+        if (cin->size != cout->size)
+            return pac_dig_unmodelled(t, "multi-bit adc_bridge %s%s: its code edges are not linearised", (char *) inst->MIFname, "");
+        if (po->invert)
+            return pac_dig_unmodelled(t, "inverted output port of adc_bridge %s%s", (char *) inst->MIFname, "");
+        for (i = 0; i < g_dig_nin; i++)
+            if (g_dig_in[i].inst == inst && g_dig_in[i].port == port) { w = i; break; }
+        if (w < 0 || !g_dig_in[w].ok)
+            return pac_dig_unmodelled(t, "adc_bridge %s: input type of port %s not linearised (v, vd, i, id are)", (char *) inst->MIFname,
+                                      cin->port[port]->type_str);
+        o = pac_dig_state(ckt, po->evt_data.node_index);
+        n = po->output.pvalue ? (int) ((Digital_t *) po->output.pvalue)->state : -1;
+        lo = pac_dig_param(inst, "in_low", 0.1, NULL);
+        hi = pac_dig_param(inst, "in_high", 0.9, NULL);
+        if (o < 0 || o > 2 || n < 0 || n > 2 || o == n)
+            return pac_dig_unmodelled(t, "adc_bridge %s: output edge without a defined previous state (%s)", (char *) inst->MIFname, "");
+        if (lo <= hi) L = (n == 1) ? hi : (n == 0) ? lo : (o == 0 ? lo : hi);
+        else L = (n == 1) ? lo : hi;
+        tag = pac_dig_new_rec(1, t);
+        g_dig_rec[tag - 1].win = w;
+        g_dig_rec[tag - 1].L = L;
+        g_dig_rec[tag - 1].pending = 1;
+        pac_dig_rec_compute(&g_dig_rec[tag - 1]);   /* at once if the crossing's point is already recorded, else at that point */
+        return tag;
+    }
+    if (!strcmp(nm, "d_osc") || !strcmp(nm, "d_pwm")) {
+        /* a clock: its edges are fixed if its control has no small-signal part (checked on the latest recorded point; the control of a
+         * clock is normally a DC source) */
+        for (i = 0; i < g_dig_nin; i++) {
+            PACdigIn *w = &g_dig_in[i];
+            int m;
+            if (w->inst != inst)
+                continue;
+            if (w->is_pwm && w->fl >= 0 && w->tau) {
+                /* card #714 case (b): cm_d_pwm decides the next transition at this call, from the control it reads now (the value of the
+                 * last accepted point): when = last_time + T d(c) (falling) or + T (1 - d(c)) (rising).  The shift is the shift of
+                 * last_time plus +-T d'(c) dc; the orbit control must be constant (open loop): a control that moves along the orbit makes the
+                 * PWM period depend on it (a closed loop through a d_pwm is a free-running oscillator, card #712) */
+                Mif_Port_Data_t *po = inst->conn[1]->port[0];
+                int n = po->output.pvalue ? (int) ((Digital_t *) po->output.pvalue)->state : -1, tag;
+                double d, s, k;
+                if (w->t[2] < -1e299)
+                    return pac_dig_unmodelled(t, "d_pwm %s: a transition decided before the first recorded point of the period%s", (char *) inst->MIFname, "");
+                if (w->t[1] > -1e299 && fabs(w->v[2] - w->v[1]) > 1e-9 * (fabs(w->v[2]) + 1e-3))
+                    return pac_dig_unmodelled(t, "d_pwm %s: its control moves along the orbit (a closed loop or a periodic control): the PWM period then "
+                                              "depends on the control%s and the steady state is not periodic with the analysis period", (char *) inst->MIFname, "");
+                if (n != 0 && n != 1)
+                    return pac_dig_unmodelled(t, "d_pwm %s: transition to an undefined state%s", (char *) inst->MIFname, "");
+                s = pac_dig_pwm_slope(w, w->v[2], &d);
+                k = (n == 0 ? 1.0 : -1.0) * s / w->fpwm;
+                tag = pac_dig_new_rec(1, t);
+                g_dig_rec[tag - 1].win = i;
+                g_dig_rec[tag - 1].pwm = 1;
+                g_dig_rec[tag - 1].pwm_k = k;
+                g_dig_rec[tag - 1].pending = 1;
+                pac_dig_rec_compute(&g_dig_rec[tag - 1]);   /* now, or at the accepted point the decision belongs to (a hybrid step call) */
+                w->last_tag = tag;
+                (void) m;
+                return tag;
+            }
+            if (w->t[2] < -1e299)
+                return 0;   /* t = 0: nothing recorded yet; checked at the next edge */
+            for (m = 0; m < g_dig_M; m++) {
+                PACc y = w->y1[m];
+                double sc = 1.0;
+                if (pc_mag(y) > 1e-12 * sc)
+                    return pac_dig_unmodelled(t, "%s %s: its control input has a small-signal part (an analog-controlled duty / frequency; the "
+                                              "edge times are a state carried over the period, not linearised)", nm, (char *) inst->MIFname);
+            }
+            return 0;
+        }
+        return 0;
+    }
+    return intag;
+}
+
+/* accepted point t_new, before the columns are solved: the injection weight of every moved ramp over (t_prev, t_new] */
+static void
+pac_dig_prestep(CKTcircuit *ckt, double t_new, double h)
+{
+    int i, k;
+    if (!g_dig_active)
+        return;
+    for (i = 0; i < g_dig_nout; i++) {
+        PACdigOut *o = &g_dig_out[i];
+        if (o->last_state < 0) o->last_state = pac_dig_state(ckt, o->innode);
+        o->vprev = o->vcur; o->tprev = o->tcur;
+        o->vcur = pac_dig_out_value(o, ckt->CKTrhs);
+        o->tcur = t_new;
+        o->have++;
+    }
+    for (k = 0; k < g_dig_ninj; k++) {
+        PACdigInj *q = &g_dig_inj[k];
+        PACdigOut *o = &g_dig_out[q->out];
+        double span = fabs(o->hi - o->lo) + 1e-30, dv, s, f, eps_t = 1e-9 * h;
+        q->w = 0.0;
+        if (q->done || o->tcur <= q->t0 + eps_t || o->have < 2)
+            continue;
+        if (!q->started) {
+            double v0 = o->vprev, sb, sa;
+            q->started = 1;
+            if (o->tprev < q->t0 - eps_t) {   /* the edge falls inside this step (not on a time point): the window starts inside it */
+                double a = (q->t0 - o->tprev) / h, te, b = 1.0;
+                sb = (fabs(o->vprev - q->lev_old) <= 1e-9 * span) ? 0.0 : (q->lev_old > o->vprev ? o->srise : -o->sfall);
+                v0 = o->vprev + sb * (q->t0 - o->tprev);
+                sa = (q->lev_new > v0 + 1e-9 * span) ? o->srise : (q->lev_new < v0 - 1e-9 * span ? -o->sfall : 0.0);
+                q->coef = sb - sa;
+                te = (sa != 0.0) ? q->t0 + fabs(q->lev_new - v0) / fabs(sa) : q->t0;
+                if (te < o->tcur) { b = (te - o->tprev) / h; q->done = 1; }
+                q->w = b * b - a * a;   /* left half-hat weight of the part [t0, min(te, t)] of the step */
+                g_dig_ninjsteps++;
+                if (getenv("PAC_DIG_DEBUG"))
+                    fprintf(stderr, "PAC-DIG: inj %d edge inside step (%.12g, %.12g]: a=%.6g b=%.6g w=%.6g coef=%.6g\n", k, o->tprev, o->tcur,
+                            a, b, q->w, q->coef);
+                continue;
+            }
+            if (o->type == MIF_CURRENT || o->type == MIF_DIFF_CURRENT) {
+                snprintf(g_dig_msg, sizeof g_dig_msg, "dac_bridge %s: a moved edge (t=%.9g) on a current output is not modelled",
+                         (char *) o->inst->MIFname, q->t0);
+                pac_dig_fail(g_dig_msg);
+                return;
+            }
+            sb = (fabs(v0 - q->lev_old) <= 1e-9 * span) ? 0.0 : (q->lev_old > v0 ? o->srise : -o->sfall);
+            sa = (q->lev_new > v0 + 1e-9 * span) ? o->srise : (q->lev_new < v0 - 1e-9 * span ? -o->sfall : 0.0);
+            q->coef = sb - sa;
+        }
+        dv = o->vcur - o->vprev;
+        if (fabs(dv) <= 1e-12 * span) {   /* flat: the moved ramp is over */
+            q->done = 1;
+            continue;
+        }
+        s = dv > 0.0 ? o->srise : o->sfall;
+        f = fabs(dv) / (s * h);
+        q->w = (f >= 1.0 - 1e-6) ? 1.0 : f * f;   /* a ramp ending inside the step: the left half-hat weight of its part */
+        g_dig_ninjsteps++;
+        if (getenv("PAC_DIG_DEBUG"))
+            fprintf(stderr, "PAC-DIG: inj %d out %s t0=%.12g step (%.12g, %.12g] h=%.4g v %.6g -> %.6g f=%.6g w=%.6g coef=%.6g\n", k,
+                    (char *) o->inst->MIFname, q->t0, o->tprev, o->tcur, h, o->vprev, o->vcur, f, q->w, q->coef);
+    }
+}
+
+/* column m: the injections of this step (before the solve) */
+static void
+pac_dig_rhs(int m, int M)
+{
+    int k;
+    if (!g_dig_active || g_dig_ninj == 0)
+        return;
+    for (k = 0; k < g_dig_ninj; k++) {
+        PACdigInj *q = &g_dig_inj[k];
+        PACdigOut *o;
+        PACdigRec *r;
+        PACc u;
+        if (q->w == 0.0)
+            continue;
+        r = &g_dig_rec[q->tag - 1];
+        if (r->pending) {
+            snprintf(g_dig_msg, sizeof g_dig_msg, "internal: the shift of an edge at dac_bridge %s (t=%.9g) is used before its crossing was "
+                     "recorded", (char *) g_dig_out[q->out].inst->MIFname, q->t0);
+            pac_dig_fail(g_dig_msg);
+            return;
+        }
+        if (r->kind != 1)
+            continue;
+        o = &g_dig_out[q->out];
+        u = pc_scale(r->dt[m], q->coef * q->w);
+        (void) M;
+        if (o->type == MIF_VOLTAGE || o->type == MIF_DIFF_VOLTAGE) {
+            g_pac_rhs_re[o->br] += u.re;
+            g_pac_rhs_im[o->br] += u.im;
+        }
+    }
+}
+
+/* a tagged output event still queued at the end of the period is fine if it is a d_pwm transition: its shift is that d_pwm's Floquet state */
+static int
+pac_dig_carried(int tag)
+{
+    int k;
+    for (k = 0; k < g_dig_nin; k++)
+        if (g_dig_in[k].is_pwm && g_dig_in[k].fl >= 0 && g_dig_in[k].last_tag == tag)
+            return 1;
+    return 0;
+}
+
+/* accepted point t_new, after the columns are final (before Cprev/Cnew swap): the watched inputs and the pending crossings */
+static void
+pac_dig_track(CKTcircuit *ckt, double t_new, int M)
+{
+    int i, m;
+    if (!g_dig_active)
+        return;
+    for (i = 0; i < g_dig_nin; i++) {
+        PACdigIn *w = &g_dig_in[i];
+        PACc *tmp;
+        if (!w->ok) continue;
+        w->t[0] = w->t[1]; w->v[0] = w->v[1];
+        w->t[1] = w->t[2]; w->v[1] = w->v[2];
+        w->t[2] = t_new; w->v[2] = pac_dig_in_v(w, ckt->CKTrhs);
+        tmp = w->y0; w->y0 = w->y1; w->y1 = tmp;
+        for (m = 0; m < M && m < g_dig_M; m++)
+            w->y1[m] = pac_dig_in_y(w, g_pac_Cnew, M, m);
+    }
+    for (i = 0; i < g_dig_nrec; i++)
+        if (g_dig_rec[i].pending)
+            pac_dig_rec_compute(&g_dig_rec[i]);
+    if (AlmostEqualUlps(t_new, ckt->CKTfinalTime, 100)) {   /* end of the period: nothing moved may still be in flight */
+        int k, tg = XSdigPendingTag(ckt, pac_dig_carried);
+        for (k = 0; k < g_dig_ninj; k++)
+            if (!g_dig_inj[k].done) {
+                snprintf(g_dig_msg, sizeof g_dig_msg, "a ramp of dac_bridge %s moved by an analog-timed edge (at t=%.9g) is still in flight at "
+                         "the end of the period: its shift would be a state of the next period, not modelled; shift the period phase (a source "
+                         "delay) so that no such edge is near t = T", (char *) g_dig_out[g_dig_inj[k].out].inst->MIFname, g_dig_inj[k].t0);
+                pac_dig_fail(g_dig_msg);
+                break;
+            }
+        if (!g_dig_failed && tg > 0 && tg <= g_dig_nrec && g_dig_rec[tg - 1].kind == 1) {
+            snprintf(g_dig_msg, sizeof g_dig_msg, "a digital edge set by an analog threshold crossing (t=%.9g) is still queued at the end of "
+                     "the period: its shift would be a state of the next period, not modelled", g_dig_rec[tg - 1].t);
+            pac_dig_fail(g_dig_msg);
+        }
+        if (getenv("PAC_DIG_TRACE"))
+            fprintf(stderr, "PAC-DIG: pass end: %d timing records, %ld moved dac edges, %ld injected steps\n", g_dig_nrec, g_dig_nshift,
+                    g_dig_ninjsteps);
+    }
+}
+#else
+static void pac_dig_prestep(CKTcircuit *ckt, double t_new, double h) { (void) ckt; (void) t_new; (void) h; }
+static void pac_dig_rhs(int m, int M) { (void) m; (void) M; }
+static void pac_dig_track(CKTcircuit *ckt, double t_new, int M) { (void) ckt; (void) t_new; (void) M; }
+#endif
+
 /* card #713: the event coefficient (y(posCntrl) - y(negCntrl)) / h_dot of a jump.  A continuation (PSSsaltCont in pssshoot.c) gives the
  * rest of a switch flip's routed jump over the following accepted steps, while the switch node completes its transition; every part of it
  * belongs to the flip, i.e. to the event time t_e, and takes the flip's coefficient (the small-signal control at t_e).  Read at the step it
@@ -2513,6 +3342,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
             }
             pac_hid_rhs(m, M);
             pac_tl_rhs(m, M);   /* card #716 */
+            pac_dig_rhs(m, M);   /* card #714 */
             if (pac_mq_on() && !pac_hid_active())
                 pac_mq_put(m);   /* card #558: solved for all columns after the loop (not with #557 hidden states: they update per column after the solve) */
             else {
@@ -2559,6 +3389,7 @@ pac_step_generic(CKTcircuit *ckt, int first, double ag0, double ag1, int order, 
         }
         pac_hid_rhs(m, M);
         pac_tl_rhs(m, M);   /* card #716 */
+        pac_dig_rhs(m, M);   /* card #714 */
         if (pac_mq_on() && !pac_hid_active())
             pac_mq_put(m);   /* card #558: solved for all columns after the loop (not with #557 hidden states: they update per column after the solve) */
         else {
@@ -3006,6 +3837,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
     order = (fabs(ag1 + ag0) < 1e-6 * fabs(ag0)) ? 1 : 2;
     t_new = ckt->CKTtime;
     h = t_new - g_pac_tprev;
+    pac_dig_prestep(ckt, t_new, h);   /* card #714: weights of the moved dac ramps over this step */
     if (getenv("PAC_STEP_TRACE"))   /* card #517 diagnostics */
         fprintf(stderr, "STEP517 t=%.17g h=%.17g\n", t_new, h);
 
@@ -3132,6 +3964,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
         }
 
         pac_tl_rhs(m, M);   /* card #716 */
+        pac_dig_rhs(m, M);   /* card #714 */
         if (pac_mq_on() && !pac_hid_active())
             pac_mq_put(m);   /* card #558: solved for all columns after the loop */
         else {
@@ -3253,6 +4086,7 @@ PSSpacRecordStep(CKTcircuit *ckt)
         }
     }
     pac_tl_store(t_new, M);   /* card #716: the waves of this step's final solution */
+    pac_dig_track(ckt, t_new, M);   /* card #714: watched analog inputs, pending crossings, end-of-period checks */
     { PACc *tmp = g_pac_Cprev; g_pac_Cprev = g_pac_Cnew; g_pac_Cnew = tmp; }
     { PACc *tmp = g_pac_Tprev; g_pac_Tprev = g_pac_Tnew; g_pac_Tnew = tmp; }
     g_pac_tprev = t_new;
@@ -3947,6 +4781,11 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
     if (PSSxspicePolicy(ckt, !strcmp(who, "PNOISE-TD") ? 3 : 2, who))
         return E_UNSUPP;
 #ifdef XSPICE
+    pac_dig_collect(ckt);   /* card #714: digital edge timing (adc_bridge inputs, dac_bridge outputs, clocks) */
+    if (g_dig_have)
+        fprintf(stderr, "%s: event-driven XSPICE blocks (card #714): %d watched analog input(s), %d dac_bridge output(s); digital edges whose "
+                "time is set by an analog threshold crossing are linearised as edge shifts, all other digital edges are fixed in time%s\n",
+                who, g_dig_nin, g_dig_nout, g_dig_noshift ? " [PAC_DIG_NOSHIFT: edge shifts DROPPED, red proof]" : "");
     pac_hid_collect(ckt);
     if ((g_hid_nc > 0 || g_hid_nhy > 0) && ckt->CKTintegrateMethod == GEAR) {
         fprintf(stderr, "%s: REFUSED -- a stateful XSPICE code model (s_xfer int d_dt slew hyst) with method=gear: the hidden-state recursion "
@@ -4193,8 +5032,15 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
 {
     int n = PAC_NST(map), neq = SMPmatSize(ckt->CKTmatrix);
     int Mtl = pac_tl_setup(ckt, "PAC-TD");   /* card #716: history unknowns of the transmission lines */
-    int Ntot = n + (Mtl > 0 ? Mtl : 0);       /* augmented Floquet state: native states, then the line history samples */
-    int Mst = (Phi_in && Mtl == 0) ? 0 : Ntot;   /* homogeneous (state) columns of pass 1 */
+#ifdef XSPICE
+    int Mdp = pac_dig_floquet_setup(ckt, br, bi, T);   /* card #714: transition-time shifts of the d_pwm instances with an analog duty */
+#else
+    int Mdp = 0;
+#endif
+    int Ntot = n + (Mtl > 0 ? Mtl : 0) + Mdp;   /* augmented Floquet state: native states, the line history samples, the d_pwm shifts */
+    int Mst = (Phi_in && Mtl == 0 && Mdp == 0) ? 0 : Ntot;   /* homogeneous (state) columns of pass 1 */
+    int Ndp0 = n + (Mtl > 0 ? Mtl : 0);       /* first d_pwm state */
+    PACc *Hd1 = NULL, *Rd1 = NULL;
     int M1 = Mst + nfreq, f, d, j, err;
     PACc *H1 = NULL, *R1 = NULL;
     double *omega1, *ic_zero_placeholder = NULL;
@@ -4219,6 +5065,13 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         R1 = TMALLOC(PACc, (size_t) Mtl * M1);
         if (!H1 || !R1) { if (H1) tfree(H1); if (R1) tfree(R1); H1 = R1 = NULL; Mtl = -1; }
     }
+    if (Mdp > 0) {
+        Hd1 = TMALLOC(PACc, (size_t) Mdp * M1);
+        Rd1 = TMALLOC(PACc, (size_t) Mdp * M1);
+        if (Hd1) memset(Hd1, 0, (size_t) Mdp * M1 * sizeof(PACc));
+        if (Rd1) memset(Rd1, 0, (size_t) Mdp * M1 * sizeof(PACc));
+        if (!Hd1 || !Rd1) Mtl = -1;
+    }
     NG_IGNORE(ic_zero_placeholder);
 
     if (!omega1 || !useforce1 || !ic0_1 || !Phi || !z || !xi || Mtl < 0) {
@@ -4237,7 +5090,8 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
             PACc v = { (d == j) ? 1.0 : 0.0, 0.0 };
             ic0_1[(size_t) j * M1 + d] = v;   /* column d: unit at reduced-state row d */
         }
-        if (H1 && d >= n) { PACc one = { 1.0, 0.0 }; H1[(size_t) (d - n) * M1 + d] = one; }   /* card #716: unit history sample d-n */
+        if (H1 && d >= n && d < Ndp0) { PACc one = { 1.0, 0.0 }; H1[(size_t) (d - n) * M1 + d] = one; }   /* card #716: unit history sample d-n */
+        if (Hd1 && d >= Ndp0) { PACc one = { 1.0, 0.0 }; Hd1[(size_t) (d - Ndp0) * M1 + d] = one; }   /* card #714: unit d_pwm shift (x T) */
     }
     for (f = 0; f < nfreq; f++) {
         omega1[Mst + f] = 2.0 * M_PI * freqs[f];
@@ -4249,10 +5103,16 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         err = 1; goto cleanup;
     }
     if (Mtl > 0 && pac_tl_reset(M1, H1)) { err = 1; goto cleanup; }
+#ifdef XSPICE
+    pac_dig_floquet_init(Hd1, M1);   /* card #714 */
+#endif
     PSSpacActive = 1;
     err = pac_run_period(ckt, job, T, "TD-shoot recording pass 1 (monodromy + forced)");
     PSSpacActive = 0;
     if (err || g_pac_failed) { err = 1; goto cleanup; }
+#ifdef XSPICE
+    if (Mdp > 0) pac_dig_floquet_readout(Rd1, M1);
+#endif
     if (Mtl > 0) {
         if (pac_tl_readout(T, R1)) { err = 1; goto cleanup; }
         if (g_tl_miss) {   /* a delayed wave read from the nearest step instead of its own: the result would be wrong without notice */
@@ -4264,13 +5124,15 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
 
     for (d = 0; d < Ntot; d++) {
         int row_d = d < n ? pac_map_row(map, d) : 0;
-        if (!Phi_in || Mtl > 0)
+        if (!Phi_in || Mtl > 0 || Mdp > 0)
             for (j = 0; j < Ntot; j++)
-                Phi[(size_t) d * Ntot + j] = d < n ? pac_get(g_pac_Cprev, row_d, M1, j) : R1[(size_t) (d - n) * M1 + j];
+                Phi[(size_t) d * Ntot + j] = d < n ? pac_get(g_pac_Cprev, row_d, M1, j) :
+                                             d < Ndp0 ? R1[(size_t) (d - n) * M1 + j] : Rd1[(size_t) (d - Ndp0) * M1 + j];
         for (f = 0; f < nfreq; f++)
-            z[(size_t) d * nfreq + f] = d < n ? pac_get(g_pac_Cprev, row_d, M1, Mst + f) : R1[(size_t) (d - n) * M1 + Mst + f];
+            z[(size_t) d * nfreq + f] = d < n ? pac_get(g_pac_Cprev, row_d, M1, Mst + f) :
+                                        d < Ndp0 ? R1[(size_t) (d - n) * M1 + Mst + f] : Rd1[(size_t) (d - Ndp0) * M1 + Mst + f];
     }
-    if (Phi_in && Mtl == 0) memcpy(Phi, Phi_in, (size_t) n * n * sizeof(PACc));
+    if (Phi_in && Mtl == 0 && Mdp == 0) memcpy(Phi, Phi_in, (size_t) n * n * sizeof(PACc));
     /* card #465 FOURTH pass, task 4 (red-proof, TEST-ONLY, default off):
      * PAC_REDPROOF_FREEZE_PHI substitutes the identity matrix for the real,
      * per-step-propagated LPTV monodromy Phi computed above -- a stand-in
@@ -4494,8 +5356,9 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         int *useforce2 = TMALLOC(int, M2);
         PACc *ic0_2 = TMALLOC(PACc, (size_t) n * M2);
         PACc *H2 = Mtl > 0 ? TMALLOC(PACc, (size_t) Mtl * M2) : NULL;
-        if (!omega2 || !useforce2 || !ic0_2 || (Mtl > 0 && !H2)) {
-            if (omega2) tfree(omega2); if (useforce2) tfree(useforce2); if (ic0_2) tfree(ic0_2); if (H2) tfree(H2);
+        PACc *Hd2 = Mdp > 0 ? TMALLOC(PACc, (size_t) Mdp * M2) : NULL;
+        if (!omega2 || !useforce2 || !ic0_2 || (Mtl > 0 && !H2) || (Mdp > 0 && !Hd2)) {
+            if (omega2) tfree(omega2); if (useforce2) tfree(useforce2); if (ic0_2) tfree(ic0_2); if (H2) tfree(H2); if (Hd2) tfree(Hd2);
             err = 1; goto cleanup;
         }
         for (f = 0; f < nfreq; f++) {
@@ -4505,6 +5368,8 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
                 ic0_2[(size_t) d * M2 + f] = xi[(size_t) d * nfreq + f];
             for (d = 0; d < Mtl; d++)   /* card #716: the history part of the boundary solution */
                 H2[(size_t) d * M2 + f] = xi[(size_t) (n + d) * nfreq + f];
+            for (d = 0; d < Mdp; d++)   /* card #714: the d_pwm part */
+                Hd2[(size_t) d * M2 + f] = xi[(size_t) (Ndp0 + d) * nfreq + f];
         }
         pac_state_set_ic(map, x0);
         if (pac_reset(ckt, map, M2, br, bi, omega2, useforce2, ic0_2, 1, T) || (Mtl > 0 && pac_tl_reset(M2, H2))) {
@@ -4512,6 +5377,10 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
             err = 1; goto cleanup;
         }
         if (H2) tfree(H2);
+#ifdef XSPICE
+        pac_dig_floquet_init(Hd2, M2);   /* card #714 */
+#endif
+        if (Hd2) tfree(Hd2);
         PSSpacActive = 1;
         err = pac_run_period(ckt, job, T, "TD-shoot recording pass 2 (re-propagate)");
         PSSpacActive = 0;
@@ -4548,6 +5417,8 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
     tfree(omega1); tfree(useforce1); tfree(ic0_1); tfree(Phi); tfree(z); tfree(xi);
     if (H1) tfree(H1);
     if (R1) tfree(R1);
+    if (Hd1) tfree(Hd1);
+    if (Rd1) tfree(Rd1);
     pac_tl_free();
     return err;
 }
@@ -6908,6 +7779,13 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
             want_adjoint = 0;   /* card #557: the opt-in projection is not transposed (default free-running forward = fixed-period engine) */
         }
 
+#ifdef XSPICE
+        if (want_adjoint && g_dig_have) {
+            fprintf(stderr, "PXF-TD: adjoint engine REFUSED (event-driven XSPICE blocks: the digital edge shifts of card #714 are not "
+                    "transposed) -- using the per-source engine.\n");
+            want_adjoint = 0;
+        }
+#endif
         t0 = SPfrontEnd->IFseconds();
         err = OK;
 

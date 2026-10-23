@@ -599,6 +599,9 @@ PSSxspicePolicy(CKTcircuit *ckt, int kind, const char *who)
                 bad = 1;
             } else if (kind == 2 && cls == 2 && PSSxsTdStateful(nm)) {
                 /* card #557: handled by pacshoot.c's hidden-state recursion */
+            } else if (kind == 2 && cls == 3 && !getenv("PAC_DIG_REFUSE")) {
+                /* card #714: digital / hybrid blocks: edges of fixed time are fixed waveforms, edges set by an analog threshold crossing
+                 * are linearised as edge shifts (pacshoot.c pac_dig_*); what cannot be linearised is refused there, per instance */
             } else if ((kind == 2 || kind == 3) && cls != 1) {
                 fprintf(stderr, "%s: REFUSED -- XSPICE code model '%s' (instance %s) %s; the time-domain small-signal recursion cannot "
                         "linearise it and would return a wrong curve (card #551). Use a converged FRA (tools/fra*.py) or "
@@ -860,7 +863,13 @@ pss_run_period(CKTcircuit *ckt, double T, const char *jobname)
         PSSdiscardRunData = !g_pss_keep_run_data && strncmp(jobname, "Time Domain Periodic Steady State Analysis", 42) != 0;
     }
     TRApssRestore = g_tl_n > 0;   /* card #716: start the lines from the latched history */
+#ifdef XSPICE
+    XSperiodicRun = 1;   /* card #714: adc_bridge threshold crossings located (evtsetup.c XSadcLocate) */
+#endif
     err = DCtran(ckt, 1);   /* restart = 1: fresh run from t=0 */
+#ifdef XSPICE
+    XSperiodicRun = 0;
+#endif
     TRApssRestore = 0;
     if (!err && !g_hid_nolatch && !g_tl_frozen) pss_tl_latch(ckt);   /* card #716 */
     PSSdiscardRunData = 0;

@@ -117,6 +117,9 @@ DCtran(CKTcircuit *ckt,
 #if defined SHARED_MODULE
     int redostep;
 #endif
+#ifdef XSPICE
+    XSadcLocateActive = XSadcLocateWanted();   /* card #714: adc_bridge crossings located (periodic runs, or XS_ADC_LOCATE=1) */
+#endif
     if(ckt->CKTcheckpoint) {
         /* Enhancement-131: continue a transient run from a checkpoint that was
            restored from disk (see com_loadstate() in com_checkpoint.c).  The
@@ -531,6 +534,10 @@ DCtran(CKTcircuit *ckt,
 #endif /* STEPDEBUG */
     ckt->CKTstat->STATaccepted ++;
     ckt->CKTbreak = 0;
+#ifdef XSPICE
+    if (XSadcLocateActive)
+        XSadcAccept(ckt);   /* card #714 */
+#endif
     /* XXX Error will cause single process to bail. */
     if(error)  {
         UPDATE_STATS(DOING_TRAN);
@@ -995,6 +1002,10 @@ resume:
 #ifdef WITH_PSS
             /* card #498 second pass: exact switch-event location. */
             int evloc = PSSeventLocateActive ? PSSeventLocate(ckt, &newdelta) : 0;
+#ifdef XSPICE
+            if (!evloc && XSadcLocateActive)
+                evloc = XSadcLocate(ckt, &newdelta);   /* card #714: adc_bridge threshold crossing */
+#endif
             if (evloc == 1) {
                 ckt->CKTtime = ckt->CKTtime - ckt->CKTdelta;
                 ckt->CKTstat->STATrejected ++;

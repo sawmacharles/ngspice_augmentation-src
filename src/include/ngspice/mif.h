@@ -89,4 +89,27 @@ extern double          g_xs_toff;
 extern double          g_xs_ag0_fix;   /* card #557: when nonzero cm_analog_integrate() uses it instead of CKTag[0] (td small-signal C extraction) */
 extern Mif_Private_t   g_mif_noise_cm_data;
 
+/* card #714: digital edge-timing tracking for the td small-signal analyses (pacshoot.c).  While g_xs_dig_on is set, every queued
+ * output event carries a tag (0: its time does not depend on any analog quantity; > 0: a timing record of pacshoot.c), every event
+ * node remembers the tag and time of its last change, and an instance called because inputs changed passes the tag of those inputs to
+ * its outputs.  g_xs_dig_hook (set by pacshoot.c) is told about input edges (what 0), decides the tag of each changed output (what 1)
+ * and makes a record for simultaneous input edges of different origin (what 2).  Defined in evtload.c. */
+extern int     g_xs_dig_on;
+extern int     g_xs_dig_cur_tag;
+extern int     g_xs_dig_nnode;
+extern int    *g_xs_dig_node_tag;
+extern double *g_xs_dig_node_t;
+extern int   (*g_xs_dig_hook)(void *ckt, void *inst, int what, int conn, int port, int intag, double t);
+void XSdigReset(int num_nodes);
+extern int    *g_xs_dig_carry_tag;   /* [num_outputs] tag of an output event put back from the XSPICE snapshot (card #714) */
+extern int     g_xs_dig_ncarry;
+int  XSdigPendingTag(void *ckt, int (*allowed)(int tag));
+
+/* card #714: exact location of adc_bridge threshold crossings (evtsetup.c), called from dctran.c */
+extern int XSadcLocateActive;
+int  XSadcLocateWanted(void);
+int  XSadcLocate(void *ckt, double *newdelta);
+void XSadcAccept(void *ckt);
+extern int XSperiodicRun;   /* set by the shooting / td recording runs (pssshoot.c, pacshoot.c) */
+
 #endif

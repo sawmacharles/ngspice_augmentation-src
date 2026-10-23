@@ -70,6 +70,35 @@ static void EVTprocess_output(
     CKTcircuit          *ckt,
     Mif_Port_Data_t     *port);
 
+/* card #714: digital edge-timing tracking, see mif.h */
+int     g_xs_dig_on = 0;
+int     g_xs_dig_cur_tag = 0;
+int     g_xs_dig_nnode = 0;
+int    *g_xs_dig_node_tag = NULL;
+double *g_xs_dig_node_t = NULL;
+int   (*g_xs_dig_hook)(void *ckt, void *inst, int what, int conn, int port, int intag, double t) = NULL;
+int    *g_xs_dig_carry_tag = NULL;
+int     g_xs_dig_ncarry = 0;
+
+void
+XSdigReset(int num_nodes)
+{
+    int i;
+    if (num_nodes != g_xs_dig_nnode || !g_xs_dig_node_tag) {
+        tfree(g_xs_dig_node_tag);
+        tfree(g_xs_dig_node_t);
+        g_xs_dig_nnode = 0;
+        if (num_nodes > 0) {
+            g_xs_dig_node_tag = TMALLOC(int, num_nodes);
+            g_xs_dig_node_t = TMALLOC(double, num_nodes);
+            if (!g_xs_dig_node_tag || !g_xs_dig_node_t) return;
+            g_xs_dig_nnode = num_nodes;
+        }
+    }
+    for (i = 0; i < g_xs_dig_nnode; i++) { g_xs_dig_node_tag[i] = 0; g_xs_dig_node_t[i] = -1e300; }
+    g_xs_dig_cur_tag = 0;
+}
+
 /*
 EVTload
 
@@ -108,6 +137,7 @@ int EVTload_with_event(
     Evt_Node_Data_t     *node_data;
 
     Mif_Private_t       cm_data;
+    int                 intag;      /* card #714 */
 
     /* ***************************** */
     /* Prepare the code model inputs */
@@ -247,6 +277,35 @@ int EVTload_with_event(
     cm_data.callback = &(inst->callback);
 
 
+    /* card #714: timing origin of this call: the tags of the digital inputs that changed at this event time.  Different origins
+     * at the same instant (a tie) get a record of their own from the hook (refused if it reaches the analog side). */
+    intag = 0;
+    if (g_xs_dig_on && g_mif_info.circuit.anal_type == MIF_TRAN && g_xs_dig_node_tag) {
+        int nchg = 0, conflict = 0;
+        for(i = 0; i < inst->num_conn; i++) {
+            conn = inst->conn[i];
+            if(conn->is_null || !conn->is_input)
+                continue;
+            for(j = 0; j < conn->size; j++) {
+                int ni;
+                port = conn->port[j];
+                if(port->is_null || port->type != MIF_DIGITAL)
+                    continue;
+                ni = port->evt_data.node_index;
+                if (ni < 0 || ni >= g_xs_dig_nnode || g_xs_dig_node_t[ni] != g_mif_info.circuit.evt_step)
+                    continue;
+                if (nchg == 0) intag = g_xs_dig_node_tag[ni];
+                else if (g_xs_dig_node_tag[ni] != intag) conflict = 1;
+                nchg++;
+                if (g_xs_dig_hook)
+                    g_xs_dig_hook(ckt, inst, 0, i, j, g_xs_dig_node_tag[ni], g_mif_info.circuit.evt_step);
+            }
+        }
+        if (conflict && g_xs_dig_hook)
+            intag = g_xs_dig_hook(ckt, inst, 2, -1, -1, intag, g_mif_info.circuit.evt_step);
+    }
+    g_xs_dig_cur_tag = intag;
+
     /* ******************* */
     /* Call the code model */
     /* ******************* */
@@ -304,8 +363,12 @@ int EVTload_with_event(
 
             /* If output changed, process it */
 
-            if (port->changed)
+            if (port->changed) {
+                if (g_xs_dig_on && g_xs_dig_hook && g_mif_info.circuit.anal_type == MIF_TRAN)   /* card #714 */
+                    g_xs_dig_cur_tag = g_xs_dig_hook(ckt, inst, 1, i, j, intag, g_mif_info.circuit.evt_step);
                 EVTprocess_output(ckt, port);
+                g_xs_dig_cur_tag = intag;
+            }
 
             /* And prevent erroneous models from overwriting it during */
             /* analog iterations */
@@ -321,6 +384,8 @@ int EVTload_with_event(
         (ckt->evt->data.statistics->op_load_calls)++;
     else if(g_mif_info.circuit.anal_type == MIF_TRAN)
         (ckt->evt->data.statistics->tran_load_calls)++;
+
+    g_xs_dig_cur_tag = 0;   /* card #714 */
 
     /* Mark that the instance has been called once */
     inst->initialized = MIF_TRUE;

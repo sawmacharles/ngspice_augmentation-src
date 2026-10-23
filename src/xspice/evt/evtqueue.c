@@ -111,6 +111,7 @@ void EVTqueue_output(
     new_event->event_time = event_time;
     new_event->posted_time = posted_time;
     new_event->removed = MIF_FALSE;
+    new_event->tag = g_xs_dig_on ? g_xs_dig_cur_tag : 0;   /* card #714 */
 
     /* Update next_time in output queue */
     if((output_queue->num_pending <= 0) ||

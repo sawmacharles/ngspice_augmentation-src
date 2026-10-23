@@ -49,6 +49,7 @@ NON-STANDARD FEATURES
 #include "ngspice/evtproto.h"
 
 
+static int g_xs_dig_deq_tag = 0;   /* card #714: tag of the output event being applied */
 static void EVTdequeue_output(CKTcircuit *ckt, double time);
 static void EVTdequeue_inst(CKTcircuit *ckt, double time);
 
@@ -137,7 +138,9 @@ static void EVTdequeue_output(
             continue;
 
         /* It must match, so pull the event from the queue and process it */
+        g_xs_dig_deq_tag = output->tag;   /* card #714 */
         EVTprocess_output(ckt, index, output->value);
+        g_xs_dig_deq_tag = 0;
 
         /* Move current to point to next non-removed item in list */
         output_ptr = &(output->next);
@@ -349,6 +352,12 @@ static void EVTprocess_output(
             g_evt_udn_info[udn_index]->copy
                     (value, rhsold[node_index].node_value);
         }
+    }
+
+    /* card #714: the node remembers the timing origin and the time of its last change */
+    if (!equal && g_xs_dig_on && node_index >= 0 && node_index < g_xs_dig_nnode) {
+        g_xs_dig_node_tag[node_index] = g_xs_dig_deq_tag;
+        g_xs_dig_node_t[node_index] = g_mif_info.circuit.evt_step;
     }
 
     /* If different, put in changed list of output queue */

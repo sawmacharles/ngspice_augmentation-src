@@ -52,6 +52,8 @@ NON-STANDARD FEATURES
 #include "ngspice/mifproto.h"
 #include "ngspice/evtproto.h"
 #include "ngspice/devdefs.h"
+#include "ngspice/cmtypes.h"   /* card #714: Digital_State_t */
+#include "ngspice/mifparse.h"   /* card #714: Mif_Param_Info_t */
 #include <math.h>
 
 
@@ -1084,7 +1086,9 @@ XSsnapPut(CKTcircuit *ckt, const XSsnap *s, int values)
             Evt_Output_Event_t *ev = TMALLOC(Evt_Output_Event_t, 1);
             g_evt_udn_info[udn]->create(&ev->value);
             g_evt_udn_info[udn]->copy(s->oe_val[k], ev->value);
+            g_xs_dig_cur_tag = (g_xs_dig_on && g_xs_dig_carry_tag && out < g_xs_dig_ncarry) ? g_xs_dig_carry_tag[out] : 0;   /* card #714 */
             EVTqueue_output(ckt, out, udn, ev, 0.0, s->oe_t[k]);
+            g_xs_dig_cur_tag = 0;
         }
         g_mif_info.circuit.evt_step = 0.0;
         EVTop_save(ckt, MIF_FALSE, 0.0);   /* the (emptied) node history is seeded from rhsold exactly as after EVTop() */
@@ -1146,4 +1150,226 @@ XSsnapAnalogDiff(const XSsnap *a, const XSsnap *b)
             m = d;
     }
     return m;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------------------- */
+/* card #714: EXACT LOCATION OF adc_bridge THRESHOLD CROSSINGS.
+ *
+ * The stock adc_bridge compares its input with in_low / in_high at every analog time point and, when the digital value it would give
+ * differs from its state, schedules itself at that time point: the digital edge is quantised to the adaptive time grid (up to one step
+ * late).  In a closed loop that makes the shooting map x0 -> x(T) piecewise constant in the edge time; the finite-difference monodromy
+ * then sees 0 or a whole step, and the Newton iteration of `.pss` stalls (card #712: residual 0.75 after 150 iterations on a comparator
+ * loop) or "converges" with a wrong Floquet radius.  Here a converged trial step in which the input of a single-bit adc_bridge crossed
+ * the level its state changes at is rejected and redone to end at the linearly interpolated crossing (plus half the tolerance), until
+ * the overshoot is below XS_ADC_TTOL (default 1e-16 s), exactly like the ideal-switch location of pssshoot.c (card #498).  The digital
+ * edge then is a smooth function of the analog state.
+ *
+ * Active in the shooting and td recording runs (XSperiodicRun; PSS_ADC_LOCATE=0 turns it off) and in any transient with
+ * XS_ADC_LOCATE=1 (so a settled .tran / FRA reference can use the same edge times).  Not done: multi-bit adc_bridge (one input, several
+ * outputs), the input types vnam; their edges stay on the grid. */
+int XSadcLocateActive = 0;
+int XSperiodicRun = 0;
+
+typedef struct {
+    MIFinstance *inst;
+    int inst_index, port, type, pos, neg, ibr;
+    double lo, hi;
+    double t_acc, v_acc;   /* input at the last accepted time point */
+} XSadcPort;
+static XSadcPort *g_adc = NULL;
+static int g_adc_n = -1;
+static CKTcircuit *g_adc_ckt = NULL;
+static double g_adc_tacc = -1.0;
+static int g_adc_iter = 0;
+
+int
+XSadcLocateWanted(void)
+{
+    const char *e = getenv("XS_ADC_LOCATE"), *p = getenv("PSS_ADC_LOCATE");
+    if (e && atoi(e) != 0)
+        return 1;
+    if (XSperiodicRun && !(p && atoi(p) == 0))
+        return 1;
+    return 0;
+}
+
+static double
+xs_param_real(MIFinstance *inst, const char *name, double dflt)
+{
+    int type = MIFmodPtr(inst)->MIFmodType, k;
+    IFdevice *pub = &DEVices[type]->DEVpublic;
+    for (k = 0; k < pub->num_param && k < inst->num_param; k++)
+        if (pub->param[k].name && !strcmp(pub->param[k].name, name) && inst->param[k] && inst->param[k]->element)
+            return inst->param[k]->element[0].rvalue;
+    return dflt;
+}
+
+static void
+xs_adc_collect(CKTcircuit *ckt)
+{
+    int i, cap = 0;
+    tfree(g_adc);
+    g_adc = NULL;
+    g_adc_n = 0;
+    g_adc_ckt = ckt;
+    if (!ckt->evt)
+        return;
+    for (i = 0; i < ckt->evt->counts.num_insts; i++) {
+        MIFinstance *inst = ckt->evt->info.inst_table[i]->inst_ptr;
+        const char *nm = DEVices[MIFmodPtr(inst)->MIFmodType]->DEVpublic.name;
+        Mif_Conn_Data_t *cin, *cout;
+        int j;
+        if (!nm || strcmp(nm, "adc_bridge") || inst->num_conn < 2)
+            continue;
+        cin = inst->conn[0];
+        cout = inst->conn[1];
+        if (cin->is_null || cout->is_null || cin->size != cout->size)
+            continue;   /* multi-bit (one input, several outputs): not located */
+        for (j = 0; j < cin->size; j++) {
+            Mif_Port_Data_t *p = cin->port[j];
+            XSadcPort *a;
+            if (p->is_null || !(p->type == MIF_VOLTAGE || p->type == MIF_DIFF_VOLTAGE || p->type == MIF_CURRENT || p->type == MIF_DIFF_CURRENT))
+                continue;
+            if (g_adc_n == cap) {
+                cap = cap ? 2 * cap : 8;
+                g_adc = TREALLOC(XSadcPort, g_adc, cap);
+            }
+            a = &g_adc[g_adc_n++];
+            a->inst = inst;
+            a->inst_index = inst->inst_index;
+            a->port = j;
+            a->type = p->type;
+            a->pos = p->smp_data.pos_node;
+            a->neg = p->smp_data.neg_node;
+            a->ibr = p->smp_data.ibranch;
+            a->lo = xs_param_real(inst, "in_low", 0.1);
+            a->hi = xs_param_real(inst, "in_high", 0.9);
+            a->t_acc = -1e300;
+            a->v_acc = 0.0;
+        }
+    }
+}
+
+static double
+xs_adc_value(const XSadcPort *a, const double *x)
+{
+    if (a->type == MIF_CURRENT || a->type == MIF_DIFF_CURRENT)
+        return x[a->ibr];
+    return x[a->pos] - x[a->neg];
+}
+
+/* the digital state the adc_bridge holds for output j (its event state block: one Digital_State_t per output) */
+static int
+xs_adc_state(CKTcircuit *ckt, const XSadcPort *a)
+{
+    Evt_State_Data_t *sd = ckt->evt->data.state;
+    Evt_State_t *st;
+    if (a->inst_index < 0 || !sd->tail || !sd->tail[a->inst_index])
+        return -1;
+    st = *(sd->tail[a->inst_index]);
+    if (!st || !st->block)
+        return -1;
+    return (int) ((Digital_State_t *) st->block)[a->port];
+}
+
+/* digital value for input v and the level at which state o changes to n (-1: no change / not located) */
+static int
+xs_adc_level(const XSadcPort *a, int o, double v, double *L)
+{
+    int n;
+    if (o < 0 || o > 2)
+        return -1;
+    if (a->lo <= a->hi) {
+        n = (v >= a->hi) ? 1 : (v <= a->lo) ? 0 : 2;
+        if (n == o) return -1;
+        *L = (n == 1) ? a->hi : (n == 0) ? a->lo : (o == 0 ? a->lo : a->hi);
+    } else {   /* Schmitt trigger: the band keeps the state */
+        n = (v >= a->lo) ? 1 : (v <= a->hi) ? 0 : o;
+        if (n == o) return -1;
+        *L = (n == 1) ? a->lo : a->hi;
+    }
+    return n;
+}
+
+void
+XSadcAccept(void *vckt)
+{
+    CKTcircuit *ckt = (CKTcircuit *) vckt;
+    int k;
+    if (!XSadcLocateActive)
+        return;
+    if (g_adc_n < 0 || g_adc_ckt != ckt)
+        xs_adc_collect(ckt);
+    for (k = 0; k < g_adc_n; k++) {
+        g_adc[k].t_acc = ckt->CKTtime;
+        g_adc[k].v_acc = xs_adc_value(&g_adc[k], ckt->CKTrhs);
+    }
+}
+
+/* 1 = reject this converged step and retry with *newdelta (to the estimated crossing); 0 = carry on */
+int
+XSadcLocate(void *vckt, double *newdelta)
+{
+    CKTcircuit *ckt = (CKTcircuit *) vckt;
+    static double ttol = -1.0;
+    double t = ckt->CKTtime, tacc = ckt->CKTtime - ckt->CKTdelta, tbest = 1e300;
+    int k, rej = 0;
+    if (ttol < 0.0)
+        ttol = getenv("XS_ADC_TTOL") ? atof(getenv("XS_ADC_TTOL")) : 1e-16;
+    if (g_adc_n < 0 || g_adc_ckt != ckt)
+        xs_adc_collect(ckt);
+    if (g_adc_n == 0)
+        return 0;
+    if (tacc != g_adc_tacc) {
+        g_adc_tacc = tacc;
+        g_adc_iter = 0;
+    }
+    for (k = 0; k < g_adc_n; k++) {
+        XSadcPort *a = &g_adc[k];
+        double v, L, tc;
+        int o;
+        if (fabs(a->t_acc - tacc) > 1e-12 * fabs(tacc) + 1e-30)
+            continue;   /* no input value at the last accepted point */
+        o = xs_adc_state(ckt, a);
+        v = xs_adc_value(a, ckt->CKTrhs);   /* NIiter leaves the converged x_k in CKTrhs (see pacshoot.c) */
+        if (xs_adc_level(a, o, v, &L) < 0)
+            continue;
+        if ((a->v_acc - L) * (v - L) > 0.0 || v == a->v_acc)
+            continue;   /* not a crossing of this step */
+        tc = tacc + (t - tacc) * (L - a->v_acc) / (v - a->v_acc);
+        if (t - tc > ttol && tc < tbest)
+            tbest = tc;
+    }
+    if (tbest < 1e300 && g_adc_iter < 60) {
+        double nd = tbest + 0.5 * ttol - tacc;
+        if (nd < 2.0 * ckt->CKTdelmin)
+            nd = 2.0 * ckt->CKTdelmin;
+        if (nd < ckt->CKTdelta) {
+            *newdelta = nd;
+            g_adc_iter++;
+            rej = 1;
+        }
+    }
+    return rej;
+}
+
+/* card #714: the first non-zero timing tag among the output events still queued (0: none) */
+int
+XSdigPendingTag(void *vckt, int (*allowed)(int tag))
+{
+    CKTcircuit *ckt = (CKTcircuit *) vckt;
+    Evt_Output_Queue_t *oq;
+    int i;
+    if (!ckt->evt)
+        return 0;
+    oq = &(ckt->evt->queue.output);
+    for (i = 0; i < ckt->evt->counts.num_outputs; i++) {
+        Evt_Output_Event_t *ev;
+        if (!oq->current || !oq->current[i])
+            continue;
+        for (ev = *(oq->current[i]); ev; ev = ev->next)
+            if (!ev->removed && ev->tag != 0 && !(allowed && allowed(ev->tag)))
+                return ev->tag;
+    }
+    return 0;
 }
