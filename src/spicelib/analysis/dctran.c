@@ -423,7 +423,11 @@ DCtran(CKTcircuit *ckt,
 
         /* return upon failure to converge during op */
         if (converged != 0) {
+            /* (#741) clear the pointer like every other OUTendPlot site here: a caller that
+             * ends a still-open plot afterwards (pssshoot.c, pssenv.c) must not free it twice */
             SPfrontEnd->OUTendPlot(job->TRANplot);
+            if (!getenv("PSS_XS_ENDPLOT_OFF"))
+                job->TRANplot = NULL;
             return(converged);
         }
 #ifdef XSPICE

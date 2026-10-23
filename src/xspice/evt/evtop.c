@@ -88,6 +88,8 @@ int EVTop(
     char        *err_msg;
 
     Mif_Boolean_t       firstime;
+    int                 alternations = 0;   /* (#741) this call's own count */
+    static int          alt_cumulative = -1;
 
     Evt_Inst_Queue_t    *inst_queue;
     Evt_Output_Queue_t  *output_queue;
@@ -158,6 +160,7 @@ int EVTop(
 
         /* Increment count of successful alternations */
         (ckt->evt->data.statistics->op_alternations)++;
+        alternations++;
 
         /* If .option card specified not to alternate solutions, exit */
         /* immediately with this first pass solution */
@@ -169,8 +172,15 @@ int EVTop(
         if(ckt->evt->queue.output.num_changed == 0)
             return(0);
 
-        /* If too many alternations, exit with error */
-        if(ckt->evt->data.statistics->op_alternations >=
+        /* If too many alternations, exit with error.
+         * (#741) The limit applies to the alternations of this operating point.  The statistic counts them over the whole job
+         * (EVTsetup() zeroes it once per job), and a periodic steady-state analysis solves the t = 0 point of every restarted
+         * period run again: compared with the job total, a run whose t = 0 point needs a second alternation (a d_osc whose
+         * init_phase puts an edge in the past toggles its output there) failed once enough earlier runs had added theirs.
+         * PSS_XS_ALTCOUNT_OFF=1 restores the job-total comparison (red proof only). */
+        if (alt_cumulative < 0)
+            alt_cumulative = getenv("PSS_XS_ALTCOUNT_OFF") != NULL && atoi(getenv("PSS_XS_ALTCOUNT_OFF")) != 0;
+        if((alt_cumulative ? ckt->evt->data.statistics->op_alternations : alternations) >=
                 ckt->evt->limits.max_op_alternations) {
 
             SPfrontEnd->IFerrorf (ERR_WARNING,

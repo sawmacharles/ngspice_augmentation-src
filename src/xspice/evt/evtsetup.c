@@ -776,8 +776,9 @@ xs_collect_analog(MIFinstance *here, void *ctx)
 {
     XSidxList *l = (XSidxList *) ctx;
     int i, j, k, d;
+    /* (#741) only the doubles that hold the block's bytes: cm_analog_alloc() adds one padding double no model writes */
     for (k = 0; k < here->num_state; k++)
-        for (d = 0; d < here->state[k].doubles; d++)
+        for (d = 0; d < (here->state[k].bytes + (int) sizeof(double) - 1) / (int) sizeof(double); d++)
             xs_idx_add(l, here->state[k].index + d);
     if (!here->analog)
         return;
@@ -785,7 +786,8 @@ xs_collect_analog(MIFinstance *here, void *ctx)
         if (here->conn[i]->is_null || !here->conn[i]->is_input)
             continue;
         for (j = 0; j < here->conn[i]->size; j++)
-            if (!here->conn[i]->port[j]->is_null)
+            if (!here->conn[i]->port[j]->is_null &&   /* (#741) event ports have an old_input slot too, never written */
+                here->conn[i]->port[j]->type != MIF_DIGITAL && here->conn[i]->port[j]->type != MIF_USER_DEFINED)
                 xs_idx_add(l, here->conn[i]->port[j]->old_input);
     }
 }

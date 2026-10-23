@@ -141,6 +141,9 @@ void cm_analog_alloc(
             ckt->CKTstates[i] = TMALLOC(double, ckt->CKTnumStates);
         else
             ckt->CKTstates[i] = TREALLOC(double, ckt->CKTstates[i], ckt->CKTnumStates);
+        /* (#741) the grown tail is not initialised by the realloc; the last double of a block is padding no model writes,
+         * and a periodic steady-state restart copies these slots around: start them at 0 */
+        memset(ckt->CKTstates[i] + ckt->CKTnumStates - doubles_needed, 0, (size_t) doubles_needed * sizeof(double));
     }
 }
 

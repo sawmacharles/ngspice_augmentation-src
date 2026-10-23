@@ -1509,6 +1509,9 @@ estimate:
 static int g_replay_mode = -1;   /* -1 = read env */
 static int g_pss_has_switch;      /* defined (with its comment) further down */
 static int g_replay_auto_used;    /* card #505: the automatic replay rung ran in this analysis */
+/* (#741) the state at the end of the current pre-stabilization transient (x0_stage_start of PSSshootDriven, every native state),
+ * NULL outside the staged warm-up; the all-off guard of pss_newton_run() reads it */
+static const double *g_warm_end = NULL;
 static int
 pss_replay_enabled(void)
 {
@@ -5246,6 +5249,21 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
             int all_at_floor = 1;
             for (k = 0; k < n; k++)
                 if (scale[k] > ripple_floor * (1.0 + 1e-9)) { all_at_floor = 0; break; }
+            /* (#741) the guard is about Newton STEPPING onto the all-off point from a switching warm-up.  When the residual is below
+             * tol at iteration 0 of an attempt that starts exactly at the end of the pre-stabilization transient, no Newton step was
+             * taken: the plain transient of the deck itself is periodic there, i.e. the circuit does not switch in steady state (a
+             * latch whose set edge always meets an active reset, an enable that is off).  That is the true orbit; accept it.
+             * PSS_ALLOFF_ACCEPT_OFF=1 restores the unconditional rejection (red proof). */
+            int at_warm_end = (iter == 0 && g_warm_end && !getenv("PSS_ALLOFF_ACCEPT_OFF"));
+            for (k = 0; at_warm_end && k < n; k++)   /* the Newton unknowns (eliminated states are carried, see above) */
+                if (x0[k] != g_warm_end[slow_idx[k]]) at_warm_end = 0;
+            if (all_at_floor && at_warm_end) {
+                fprintf(stderr, "PSS-SHOOT: %s every Newton-unknown state is at/under the %.3g ripple-floor, and the "
+                        "pre-stabilization transient itself already ends periodic there (residual %.3e before any Newton "
+                        "step): the circuit does not switch in steady state; accepting this all-off orbit.\n",
+                        stage_label, ripple_floor, residual);
+                all_at_floor = 0;
+            }
             if (all_at_floor) {
                 fprintf(stderr, "PSS-SHOOT: %s converged (residual=%.3e) "
                         "but EVERY Newton-unknown state is at/under the "
@@ -6925,6 +6943,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
             double cumulative = 0.0;
             double *x0_stage_start = TMALLOC(double, n);
             int stage = 0;
+            g_warm_end = x0_stage_start;   /* (#741) */
             /* card #458 SIXTH pass, speed task, idea 1: offer the detection
              * seed to every stage's Newton attempt (not just stage 1's)
              * until one of them actually consumes it (pss_newton_run()'s
@@ -7053,6 +7072,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                             "stabilization transient (stage %d, %.6g s) did "
                             "not complete (ngspice error %d).\n", stage,
                             stage_len, err);
+                    g_warm_end = NULL;
                     tfree(x0_stage_start);
                     goto shoot_cleanup;
                 }
@@ -7357,6 +7377,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 fflush(stdout);
                 stage_len *= warmup_growth;
             }
+            g_warm_end = NULL;
             tfree(x0_stage_start);
         }
 
