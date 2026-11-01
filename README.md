@@ -296,8 +296,10 @@ Each release was run through the full set of test suites (57 at `s152`: stabilit
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
-fail there. These suites and the analysis tools built around the fork live in a separate repository
-that is not public yet.
+fail there. These suites, the analysis tools built around the fork (FRA, Monte Carlo, yield, loss),
+the reference decks and the analysis notes are public in
+[ngspice_augmentation-tests](https://github.com/sawmacharles/ngspice_augmentation-tests) (a snapshot at
+`s152`); its README says how to run them against a release binary.
 
 Not tested: Windows and macOS builds (Linux only); comparison with a commercial simulator;
 an analytic reference for plain transient.
