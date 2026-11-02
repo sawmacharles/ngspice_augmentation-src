@@ -191,15 +191,16 @@ Each of these gives a wrong result in stock ngspice 45.2 without an error messag
 
 ## Measured results
 
-Summary measured on 2026-10-08 on one 32-thread Linux workstation. The fork build was `s125`, compared
-with stock ngspice 45.2; the transient table below was re-measured on `s140`. Two threads per run, median of 5 runs (3 for the periodic part).
+Summary measured on one 32-thread Linux workstation, compared with stock ngspice 45.2. The periodic rows
+(steady state, transfer function, loop gain) were re-measured on 2026-11-02 with `s152`, median of 3 runs;
+the transient row comes from the table below (`s140`, 2026-10-18, median of 5). Two threads per run.
 
 | Task | Stock ngspice | Fork | Gain |
 |---|---|---|---|
 | Plain transient, 11 decks (see the table below, re-measured on s140) | — | same deck, same settings | 1.06x – 1.71x faster (s140: 1.02x – 1.80x) |
-| Steady state of a switching converter (versus a transient long enough to settle) | 1.1 – 109 s | 0.3 – 37 s | 3x – 62x |
-| Control-to-output transfer function, 8 frequencies (stock: injected-tone transient sweep) | 31 – 838 s | 0.1 – 28 s | 30x – 275x |
-| Loop gain of a closed-loop buck, 14 frequencies | 144 s | 0.32 s | 450x. Same crossover (33.5 kHz) and phase margin (38.4° vs 38.45°) |
+| Steady state of a switching converter (versus a transient long enough to settle) | 1.1 – 104 s | 0.3 – 36 s | 2.9x – 58x |
+| Control-to-output transfer function, 8 frequencies (stock: injected-tone transient sweep) | 30 – 817 s | 0.1 – 32 s | 26x – 266x |
+| Loop gain of a closed-loop buck, 14 frequencies | 141 s | 0.31 s | 450x. Same crossover (33.45 vs 33.46 kHz) and phase margin (38.46° vs 38.45°) |
 
 ### Transient speed: stock ngspice vs this fork
 
