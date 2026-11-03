@@ -431,6 +431,14 @@ static int g_pac_xinit_n = 0;
  * <= 1e-7) is retried at the next one, with a note. PAC_RECORD_RELTOL_AUTO=0 restores the inherited value. */
 static double g_pac_auto_reltol = 0.0;
 static int g_pac_rec_tstep = 0;   /* card #625: a recording run of this attempt stopped with E_TIMESTEP */
+/* card #753: a run that stops with "timestep too small" while a later rung remains is retried by the ladder, which
+ * prints its own note: the detection/prepass failure messages are then not printed (they are on the last rung). */
+static int g_pac_ladder_more = 0;
+/* card #753: whether the circuit has device-model charge does not depend on the recording reltol: the detection
+ * period runs once per pac_pstb_run_ex() call, at the inherited reltol (the 1e-8 rung stopped there on a BSIM4
+ * buck), and its answer (-1 not known, 0 none, 1 found) is kept for the retries and the other analyses.
+ * PAC_DETECT_EACH_RUNG=1: the old behaviour (a detection period at the rung reltol on every attempt). */
+static int g_pp_detect_known = -1;
 /* card #625: the tighter recording reltol is for circuits without switch events. On ideal-switch decks the event
  * corrections (#559-#586: saltation, charge jumps, fast nodes, routed jumps) were derived and validated against the
  * perturbed-PSS references on the grid of the inherited reltol; on the 1e-8 grid two of them moved from 0.018 to
@@ -4864,18 +4872,26 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
          * legacy native path, which is bit-identical to before and supports saltation / free-running */
         /* The detection period must leave no trace on the legacy flow that follows (its first recorded period starts
          * from whatever vectors and device states are left in the circuit): snapshot and restore them. */
-        PACsnap snap;
-        pac_snap_take(ckt, &snap);
-        pac_state_set_ic(map, x0);
-        g_pp_detect = 1; g_pp_detect_hit = 0; g_pp_active = 1; PSSpacActive = 1;
-        err = pac_run_period(ckt, job, T, "TD-shoot model-charge detection (card #542)");
-        PSSpacActive = 0; g_pp_active = 0; g_pp_detect = 0;
-        pac_snap_restore(ckt, &snap, g_pp_detect_hit ? 0 : 1);
-        if (err) {
-            fprintf(stderr, "%s: model-charge detection run failed (err=%d)\n", who, err);
-            return E_INTERN;
+        int each = getenv("PAC_DETECT_EACH_RUNG") != NULL;   /* card #753 */
+        if (each || g_pp_detect_known < 0) {
+            PACsnap snap;
+            double save_auto = g_pac_auto_reltol;
+            pac_snap_take(ckt, &snap);
+            pac_state_set_ic(map, x0);
+            if (!each) g_pac_auto_reltol = 0.0;   /* card #753: inherited reltol (an explicit pacreltol= still applies) */
+            g_pp_detect = 1; g_pp_detect_hit = 0; g_pp_active = 1; PSSpacActive = 1;
+            err = pac_run_period(ckt, job, T, "TD-shoot model-charge detection (card #542)");
+            PSSpacActive = 0; g_pp_active = 0; g_pp_detect = 0;
+            g_pac_auto_reltol = save_auto;
+            pac_snap_restore(ckt, &snap, g_pp_detect_hit ? 0 : 1);
+            if (err) {
+                if (!(err == E_TIMESTEP && g_pac_ladder_more))   /* card #753: the ladder retries and says so */
+                    fprintf(stderr, "%s: model-charge detection run failed (err=%d)\n", who, err);
+                return E_INTERN;
+            }
+            g_pp_detect_known = g_pp_detect_hit ? 1 : 0;
         }
-        if (!g_pp_detect_hit)
+        if (!g_pp_detect_known)
             return 0;   /* no device-model charge anywhere on the orbit: native C/L history is exact */
     }
     /* card #544: free-running (trigger=) orbits with device-model charges are accepted. Their .pac/.pstb is the fixed-period
@@ -4943,7 +4959,8 @@ pac_generic_prepare(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double 
         return E_UNSUPP;
     }
     if (err || g_pac_gen_bad < 0 || g_pp_steps < 1) {
-        fprintf(stderr, "%s: charge-state prepass failed (err=%d steps=%d)\n", who, err, g_pp_steps);
+        if (!(err == E_TIMESTEP && g_pac_ladder_more))   /* card #753: the ladder retries and says so */
+            fprintf(stderr, "%s: charge-state prepass failed (err=%d steps=%d)\n", who, err, g_pp_steps);
         tfree(g_pp_col); g_pp_col = NULL;
         tfree(g_pp_xend); g_pp_xend = NULL;
         pac_init_free();
@@ -7914,6 +7931,7 @@ pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
 
     /* card #625: each analysis runs at the first rung that completes; plots are only begun after its engine
      * runs succeed, so a retry leaves no partial plot. The prepass state is redone at the new rung. */
+    g_pp_detect_known = -1;   /* card #753: one detection per call (same circuit, same orbit) */
     for (a = 0; a < 4; a++) {
         int on = (a == 0) ? (job->PSSdoPAC && job->PACsolver == PAC_SOLVER_TD)
                : (a == 1) ? job->PSSdoPSTB
@@ -7925,6 +7943,7 @@ pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         for (r = 0; r < nr; r++) {
             g_pac_auto_reltol = (nr > 1) ? rungs[r] : 0.0;
             g_pac_rec_tstep = 0;
+            g_pac_ladder_more = r + 1 < nr && !(rungs[r + 1] == 0.0 && ckt->CKTreltol <= rungs[r]);   /* card #753 */
             if (a == 0)      e = pac_td_pac(ckt, job, x0, n, T, fT, trig_node_num);
             else if (a == 1) e = pac_td_pstb(ckt, job, x0, n, T, fT, trig_node_num);
             else if (a == 2) e = pac_td_pxf(ckt, job, x0, n, T, fT, trig_node_num);
@@ -7940,8 +7959,10 @@ pac_pstb_run_ex(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
 #endif
         }
         g_pac_auto_reltol = 0.0;
+        g_pac_ladder_more = 0;
         if (e) err = e;
     }
+    g_pp_detect_known = -1;
     pac_init_free();   /* card #542 */
 #ifdef XSPICE
     pac_hid_free();    /* card #557 */
