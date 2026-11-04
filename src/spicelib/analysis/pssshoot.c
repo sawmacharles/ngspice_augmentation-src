@@ -6552,6 +6552,209 @@ pss_tl_newton(CKTcircuit *ckt, PSSstateMap *map, double T, double *x0, double to
     return ok;
 }
 
+/* card #751: a d_pwm whose control moves along the orbit is self-timed.  cm_d_pwm keeps the time of its last transition and decides
+ * the next one from the control it reads late in the half period in progress: high for T d(c_h), low for T (1 - d(c_l)).  With a
+ * constant control (open loop) the two halves add up to the clock period; in a closed loop the control carries ripple, c_h != c_l and
+ * the PWM period is T (1 + d(c_h) - d(c_l)) -- an output of the circuit, not 1/Fguess (the r6 buck: 2.008651 us against 2 us, the same
+ * in a 10 ms transient on the stock simulator).  No orbit with period 1/Fguess exists then: every period run ends at another point of
+ * the PWM cycle, the carried edge time drifts by the same amount each period and the hidden-state check refuses (card #712).
+ * The phase of the PWM at a period boundary, p = (model time) - (time of its last decided transition), is read from the carried
+ * XSPICE snapshots; a converged native orbit at period T gives the drift g(T) = p_end - p_start of one more latching period (dg/dT ~ 1).
+ * The period is solved for g = 0 by a secant iteration, the native Newton re-converged at each T from the previous orbit.  The period
+ * boundary is first moved into the quiet part of a PWM half period (between 0.1 and 0.6 of it; the PWM decides at 0.75-0.8), so the
+ * phase is a smooth function of T and of the state.  Only when no V/I time function or driven=1 fixes the period (dcpss.c sets
+ * PSSpwmLockAllowed on the card #712 clock path) and the circuit has exactly one d_pwm.  PSS_PWM_LOCK_OFF=1 restores the s153
+ * behaviour; PSS_PWM_LOCK_TOL (default 1e-6) is the drift tolerance relative to T; PSS_PWM_LOCK_TRACE=1 prints each step. */
+int PSSpwmLockAllowed = 0;
+int PSSpwmLocked = 0;   /* set on a converged lock; read by the td small-signal analyses (pacshoot.c) */
+#ifdef XSPICE
+typedef struct { int idx; double fpwm; const char *name; } PSSpwmInst;
+
+static int
+pss_pwm_find(CKTcircuit *ckt, PSSpwmInst *pw)
+{
+    int i, cnt = 0;
+    for (i = 0; i < DEVmaxnum; i++) {
+        GENmodel *m;
+        if (!DEVices[i] || !DEVices[i]->DEVpublic.cm_func || !ckt->CKThead[i] || !DEVices[i]->DEVpublic.name ||
+            strcmp(DEVices[i]->DEVpublic.name, "d_pwm"))
+            continue;
+        for (m = ckt->CKThead[i]; m; m = m->GENnextModel) {
+            GENinstance *g;
+            for (g = m->GENinstances; g; g = g->GENnextInstance) {
+                MIFinstance *mi = (MIFinstance *) g;
+                if (cnt == 0) {
+                    pw->idx = mi->inst_index;
+                    pw->name = (const char *) mi->MIFname;
+                    pw->fpwm = (mi->num_param > 2 && mi->param[2] && !mi->param[2]->is_null) ? mi->param[2]->element[0].rvalue : 1e6;
+                }
+                cnt++;
+            }
+        }
+    }
+    return cnt;
+}
+
+/* The PWM phase at a snapshot: time since the last decided transition (negative while it is still pending), the level it goes to, and
+ * the length of the half period in progress (cm_d_pwm queues its next call at last_time + 0.8 half; -1 when no call is queued). */
+static int
+pss_pwm_phase(const XSsnap *s, int idx, double *p, int *level, double *half)
+{
+    int sz = 0, lv;
+    const char *blk = (const char *) XSsnapStateBlock(s, idx, &sz);
+    double lt, q;
+    if (!blk || sz < (int) (sizeof(double) + sizeof(int)))
+        return 1;
+    memcpy(&lt, blk, sizeof lt);                     /* struct state { double last_time; Digital_State_t last; } (d_pwm/cfunc.mod) */
+    memcpy(&lv, blk + sizeof(double), sizeof lv);
+    *p = XSsnapToff(s) - lt;
+    *level = lv;
+    q = XSsnapNextInstEvent(s, idx);
+    *half = (q < 1e299) ? (*p + q) / 0.8 : -1.0;
+    return 0;
+}
+
+static int pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T, int n_slow, const int *slow_idx, double *x_full,
+                          int maxiter_this, double tol, double eps, double trust_radius, int broyden_enabled, int broyden_period,
+                          const char *stage_label, int *iter_out, double *residual_out, double *Phi_out,
+                          int use_analytic, const double *M_init, int *seed_used_out);
+
+/* Accept the period: *Tio, the frequency the analysis reports, the flag the td small-signal analyses read. */
+static void
+pss_pwm_lock_accept(CKTcircuit *ckt, const PSSpwmInst *pw, double *Tio, double T, double T0, double g, int nstep, int nshift, const char *how)
+{
+    *Tio = T;
+    if (T > 0.0) ckt->CKTguessedFreq = 1.0 / T;
+    PSSpwmLocked = 1;
+    fprintf(stdout, "PSS-SHOOT: d_pwm '%s' period lock converged%s: T = %.12g s (f = %.9g Hz; 1/Fguess = %.9g s, %+.4f %%), "
+            "transition drift %.3e s per period, %d lock step(s), %d boundary move(s) -- card #751\n", pw->name, how, T, 1.0 / T, T0,
+            100.0 * (T - T0) / T0, g, nstep, nshift);
+    fflush(stdout);
+}
+
+/* Returns 0 (nothing to do, or the period now follows the PWM: *Tio updated), 1 after printing why it failed.
+ * cm_d_pwm decides on an accepted time point (the first one past 0.75 of the half period), so the drift is a slightly rough function of
+ * T: a change of T moves the time grid against the PWM edges and the decision instant by up to a step, the edge by c' T d'(c) h (10 ps at
+ * a 1 ns step on a closed-loop buck).  When the secant iteration cannot reach the tolerance on that roughness (a Newton attempt stalls, or
+ * the steps run out), the converged iterate with the smallest drift is taken if that drift is below PSS_PWM_LOCK_ACCEPT (1e-4 of T);
+ * the hidden-state periodicity check that follows still judges the orbit. */
+static int
+pss_pwm_lock(CKTcircuit *ckt, PSSstateMap *map, double *Tio, double *x0, int n_slow, const int *slow_idx,
+             int maxiter, double tol, double eps, int broyden_enabled, int broyden_period, int use_analytic,
+             int *iter, double *residual, double *Phi)
+{
+    PSSpwmInst pw;
+    double T = *Tio, T0 = *Tio, p0, p1, h0, half, g = 0.0, Tprev = 0.0, gprev = 0.0, tolg, tola, Tbest = 0.0, gbest = 1e300;
+    double *xbest = NULL, rbest = 0.0;
+    int ibest = 0, l0, l1, it, have_prev = 0, maxit = 20, nshift = 0, k, trace = getenv("PSS_PWM_LOCK_TRACE") != NULL;
+    const char *why = NULL;
+
+    PSSpwmLocked = 0;
+    if (!g_xs_on || !PSSpwmLockAllowed || getenv("PSS_PWM_LOCK_OFF"))
+        return 0;
+    if (pss_pwm_find(ckt, &pw) != 1 || pw.fpwm <= 0.0)
+        return 0;
+    if (!XSsnapValid(g_xs_snap) || !XSsnapValid(g_xs_prev) ||
+        pss_pwm_phase(g_xs_prev, pw.idx, &p0, &l0, &h0) || pss_pwm_phase(g_xs_snap, pw.idx, &p1, &l1, &half))
+        return 0;
+    tolg = (getenv("PSS_PWM_LOCK_TOL") ? atof(getenv("PSS_PWM_LOCK_TOL")) : 1e-6) * T;
+    tola = (getenv("PSS_PWM_LOCK_ACCEPT") ? atof(getenv("PSS_PWM_LOCK_ACCEPT")) : 1e-4) * T;
+    if (l0 == l1 && fabs(p1 - p0) <= tolg)
+        return 0;   /* the edges keep their place over a period: a fixed clock (constant control) */
+
+    fprintf(stdout, "PSS-SHOOT: d_pwm '%s' is self-timed: its transitions move %.4g s per period against T = %.9g s (its control moves "
+            "along the orbit); the period follows the PWM (card #751)\n", pw.name, (l0 == l1) ? p1 - p0 : 0.0, T);
+    fflush(stdout);
+    xbest = TMALLOC(double, map->n);
+
+    for (it = 0; it < maxit; it++) {
+        int err;
+        if (it > 0) {
+            char lab[64];
+            int sd = 0, conv;
+            snprintf(lab, sizeof lab, "[pwm lock %d]", it);
+            conv = pss_newton_run(ckt, map, T, n_slow, slow_idx, x0, maxiter, tol, eps, -1.0, broyden_enabled, broyden_period, lab,
+                                  iter, residual, Phi, use_analytic, NULL, &sd);
+            if (!conv) {
+                why = "the Newton iteration did not converge";
+                break;
+            }
+        }
+        pss_state_set_ic(map, x0);
+        err = pss_run_period_ex_safe(ckt, T, "PSS shoot (d_pwm period lock)", 1, 0);
+        if (err || pss_pwm_phase(g_xs_prev, pw.idx, &p0, &l0, &h0) || pss_pwm_phase(g_xs_snap, pw.idx, &p1, &l1, &half)) {
+            why = "a period run failed";
+            break;
+        }
+        g = p1 - p0;
+        if (trace)
+            fprintf(stderr, "PWM-LOCK it=%d T=%.15g level %d->%d phase %.6e->%.6e half %.6e drift %.6e\n", it, T, l0, l1, p0, p1, half, g);
+        if (l1 != l0 || half <= 0.0 || p1 < 0.1 * half || p1 > 0.6 * half) {
+            /* move the boundary into the quiet part of a half period: a short latching run, then Newton again at the same T */
+            double s, full = 1.0 / pw.fpwm;
+            if (half <= 0.0) half = 0.5 * full;
+            if (p1 < 0.1 * half)
+                s = 0.35 * half - p1;
+            else
+                s = (half - p1) + 0.35 * fmax(full - half, 0.05 * full);
+            if (++nshift > 4 || !(s > 0.0)) {
+                fprintf(stderr, "PSS-SHOOT: FAILED -- d_pwm '%s' period lock: the period boundary does not stay in the quiet part of the "
+                        "PWM cycle (phase %.4g s of a %.4g s half period) -- card #751.\n", pw.name, p1, half);
+                tfree(xbest);
+                return 1;
+            }
+            if (trace)
+                fprintf(stderr, "PWM-LOCK boundary moved by %.6e s\n", s);
+            pss_state_set_ic(map, x0);
+            if (pss_run_period(ckt, s, "PSS shoot (d_pwm phase shift)")) {
+                why = "the phase-shift run failed";
+                break;
+            }
+            pss_state_get(map, ckt, x0);
+            have_prev = 0;
+            gbest = 1e300;   /* earlier iterates belong to another boundary phase */
+            continue;
+        }
+        if (it > 0 && fabs(g) < gbest && xbest) {
+            gbest = fabs(g); Tbest = T; rbest = *residual; ibest = *iter;
+            for (k = 0; k < map->n; k++) xbest[k] = x0[k];
+        }
+        if (fabs(g) <= tolg) {
+            pss_pwm_lock_accept(ckt, &pw, Tio, T, T0, g, it, nshift, "");
+            tfree(xbest);
+            return 0;
+        }
+        {
+            double dT = (have_prev && fabs(g - gprev) > 1e-30) ? -g * (T - Tprev) / (g - gprev) : -g;
+            if (dT > 0.02 * T) dT = 0.02 * T;
+            if (dT < -0.02 * T) dT = -0.02 * T;
+            Tprev = T; gprev = g; have_prev = 1;
+            T += dT;
+        }
+    }
+    if (!why)
+        why = "the steps ran out";
+    if (xbest && gbest <= tola) {   /* the best converged iterate, re-latched */
+        for (k = 0; k < map->n; k++) x0[k] = xbest[k];
+        pss_state_set_ic(map, x0);
+        if (!pss_run_period_ex_safe(ckt, Tbest, "PSS shoot (d_pwm period lock)", 1, 0) &&
+            !pss_pwm_phase(g_xs_prev, pw.idx, &p0, &l0, &h0) && !pss_pwm_phase(g_xs_snap, pw.idx, &p1, &l1, &half) &&
+            l0 == l1 && fabs(p1 - p0) <= tola) {
+            if (trace)
+                fprintf(stderr, "PWM-LOCK %s at T=%.15g; best iterate T=%.15g drift %.6e re-latched: drift %.6e\n", why, T, Tbest, gbest, p1 - p0);
+            *residual = rbest; *iter = ibest;
+            pss_pwm_lock_accept(ckt, &pw, Tio, Tbest, T0, p1 - p0, it, nshift, " at the time-grid limit");
+            tfree(xbest);
+            return 0;
+        }
+    }
+    fprintf(stderr, "PSS-SHOOT: FAILED -- d_pwm '%s' period lock: %s (drift %.3e s per period at T = %.12g s, best %.3e s, tolerance %.3e s) "
+            "-- card #751.\n", pw.name, why, g, T, gbest < 1e299 ? gbest : -1.0, tolg);
+    tfree(xbest);
+    return 1;
+}
+#endif
+
 int
 PSSshootDriven(CKTcircuit *ckt, PSSan *job)
 {
@@ -6577,6 +6780,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
     int *slow_idx = NULL;
     int kry_requested = 0, kry_fellback = 0;   /* card #537 */
     int kry_explicit = 0, kry_auto_blocked = 0;   /* card #538 */
+    int pwm_lock_failed = 0;   /* card #751 */
 
     t_wall_start = SPfrontEnd->IFseconds();
 
@@ -7413,6 +7617,12 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                          "not converge (residual %.3e) -- card #716.\n", res_j);
         }
 
+#ifdef XSPICE
+        if (converged_flag && g_tl_n == 0 &&   /* card #751: a self-timed d_pwm sets the period */
+            pss_pwm_lock(ckt, &map, &T, x0, n_slow, slow_idx, maxiter, tol, eps, broyden_enabled, broyden_period, use_analytic,
+                         &iter, &residual, Phi))
+            pwm_lock_failed = 1;
+#endif
         if (phi_full_detect) tfree(phi_full_detect);
         if (M_init) tfree(M_init);
     }
@@ -7423,6 +7633,8 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
                 "a steady state.\n", maxiter, residual, tol);
         goto shoot_fail;
     }
+    if (pwm_lock_failed)   /* card #751 */
+        goto shoot_fail;
 
 #ifdef XSPICE
     if (g_xs_on) {   /* card #551: is the HIDDEN state (digital nodes, analog node vector) periodic with T at the converged orbit? */
@@ -7738,6 +7950,12 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
      * the FD Floquet of a noisy deck can also read spuriously > 1. Neither
      * is accepted as a steady state (the classic path never reported them
      * either: it plateaued). */
+    if (PSSpwmLocked && floq.valid) {   /* card #751 */
+        fprintf(stdout, "PSS-SHOOT: the Floquet estimate holds the carried d_pwm transition time fixed (spectral radius %.6f of that map); the "
+                "self-timed orbit's own multipliers include the PWM phase (one of them is 1) and are not computed here -- card #751.\n",
+                floq.spectral_radius);
+        floq.valid = 0;
+    }
     if (g_replay_auto_used && floq.valid && floq.unstable) {
         fprintf(stderr, "PSS-SHOOT: the replay rung reached a fixed point with spectral radius %.4f >= 1 "
                 "(residual %.3e); not accepted as a steady state (card #505).\n",
@@ -7755,7 +7973,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
         char vbuf[64];
         const char *verdict;
         if (!floq.valid)
-            verdict = g_pss_krylov ? "UNKNOWN(not-computed)" : "UNKNOWN(eigensolve-failed)";
+            verdict = PSSpwmLocked ? "UNKNOWN(self-timed-pwm)" : g_pss_krylov ? "UNKNOWN(not-computed)" : "UNKNOWN(eigensolve-failed)";
         else {
             const char *base = floq.unstable ? (floq.period_doubling ? "UNSTABLE(period-doubling)" :
                                                  floq.oscillation ? "UNSTABLE(oscillation)" : "UNSTABLE")
@@ -7830,6 +8048,7 @@ PSSshootDriven(CKTcircuit *ckt, PSSan *job)
 
  shoot_cleanup:
     pss_hid_free();   /* card #546 */
+    PSSpwmLocked = 0;   /* card #751 */
     ckt->CKTreltol  = save_reltol;
     ckt->CKTabstol  = save_abstol;
     ckt->CKTvoltTol = save_volttol;

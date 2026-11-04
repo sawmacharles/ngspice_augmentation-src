@@ -1154,6 +1154,38 @@ XSsnapAnalogDiff(const XSsnap *a, const XSsnap *b)
     return m;
 }
 
+/* card #751: read access for the periodic analyses.  The event state block of instance inst_index as the snapshot holds it (NULL when the
+ * instance has none; *size its byte count), the model time the snapshot stands at (g_xs_toff of a run started from it), and the earliest
+ * pending call the instance has queued for itself, relative to the snapshot instant (1e300 when none). */
+const void *
+XSsnapStateBlock(const XSsnap *s, int inst_index, int *size)
+{
+    *size = 0;
+    if (!s || !s->valid || !s->st_blk || inst_index < 0 || inst_index >= s->num_insts || !s->st_blk[inst_index])
+        return NULL;
+    *size = s->st_size[inst_index];
+    return s->st_blk[inst_index];
+}
+
+double
+XSsnapToff(const XSsnap *s)
+{
+    return (s && s->valid) ? s->toff : 0.0;
+}
+
+double
+XSsnapNextInstEvent(const XSsnap *s, int inst_index)
+{
+    double t = 1e300;
+    int k;
+    if (!s || !s->valid)
+        return t;
+    for (k = 0; k < s->n_ie; k++)
+        if (s->ie_inst[k] == inst_index && s->ie_t[k] < t)
+            t = s->ie_t[k];
+    return t;
+}
+
 /* ------------------------------------------------------------------------------------------------------------------------------- */
 /* card #714: EXACT LOCATION OF adc_bridge THRESHOLD CROSSINGS.
  *

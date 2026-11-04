@@ -2317,6 +2317,7 @@ typedef struct {
     double t, L;         /* time of the cause, level crossed */
     int pwm;             /* kind 1 from a d_pwm decision: dt = shift of last_time + k dc (pwm_k), computed at the decision's point */
     double pwm_k;
+    int pwm_free;        /* card #751: the d_pwm is self-timed (period locked to it): the decision instant moves with last_time */
     PACc *dt;            /* [M] edge shift per column */
     char why[240];
 } PACdigRec;
@@ -2337,6 +2338,7 @@ typedef struct {         /* a dac_bridge output port (non-multi mode) */
     int port, type, pos, neg, br, innode, ok;
     double lo, hi, und, srise, sfall;
     int last_state;      /* digital input state last seen (0, 1, 2 = unknown) */
+    int ininv;           /* card #751: the input port is inverted (~node): the level follows the complement of the node */
     double vprev, vcur, tprev, tcur;
     int have;            /* number of accepted points seen (vcur valid if >= 1) */
 } PACdigOut;
@@ -2495,6 +2497,7 @@ pac_dig_collect(CKTcircuit *ckt)
                 o->inst = inst; o->port = j; o->type = po->type;
                 o->pos = po->smp_data.pos_node; o->neg = po->smp_data.neg_node; o->br = po->smp_data.branch;
                 o->innode = cin->port[j]->is_null ? -1 : cin->port[j]->evt_data.node_index;
+                o->ininv = !cin->port[j]->is_null && cin->port[j]->invert && !getenv("PAC_DIG_INVERT_OFF");
                 o->ok = !multi && !po->is_null &&
                         (po->type == MIF_VOLTAGE || po->type == MIF_DIFF_VOLTAGE || po->type == MIF_CURRENT || po->type == MIF_DIFF_CURRENT);
                 o->lo = lo; o->hi = hi; o->und = und;
@@ -2517,6 +2520,19 @@ static double
 pac_dig_level(const PACdigOut *o, int st)
 {
     return st == 1 ? o->hi : st == 0 ? o->lo : o->und;
+}
+
+/* card #751: the digital state a dac_bridge output follows (the node state, complemented on an inverted input port such as [~d d]: up to
+ * s153 the level of such an output was taken from the node itself, so its moved ramp was injected with the wrong sign and the two halves
+ * of a complementary pair cancelled -- the td .pac gain through a d_pwm driving a complementary switch pair was 13 dB low;
+ * PAC_DIG_INVERT_OFF=1 restores that, red proof) */
+static int
+pac_dig_out_state(CKTcircuit *ckt, const PACdigOut *o)
+{
+    int st = pac_dig_state(ckt, o->innode);
+    if (o->ininv && (st == 0 || st == 1))
+        st = 1 - st;
+    return st;
 }
 
 static int pac_dig_hook(void *vckt, void *vinst, int what, int conn, int port, int intag, double t);
@@ -2729,11 +2745,21 @@ pac_dig_rec_compute(PACdigRec *r)
         return;   /* not yet */
     r->pending = 0;
     if (r->pwm) {   /* card #714 case (b): the control as cm_d_pwm read it (the latest accepted point) */
-        static int nostate = -1;
+        static int nostate = -1, nocdot = -1;
+        double cdot = 0.0;
         if (nostate < 0) nostate = getenv("PAC_DIG_PWM_NOSTATE") != NULL;   /* red proof: each transition moved by k dc alone */
+        if (nocdot < 0) nocdot = getenv("PAC_PWM_NO_CDOT") != NULL;           /* card #751 red proof: no decision-instant term */
+        /* card #751: a self-timed d_pwm decides late in each half period, at an instant that moves with its last transition (tau); the
+         * control it reads there then moves by y + c'(t) tau as well (c' the orbit slope of the control).  Without this term a time
+         * translation of the whole orbit would not be a neutral (multiplier 1) mode of the boundary problem. */
+        if (r->pwm_free && !nocdot && w->t[1] > -1e299 && w->t[2] > w->t[1])
+            cdot = (w->v[2] - w->v[1]) / (w->t[2] - w->t[1]);
         for (m = 0; m < g_dig_M; m++) {
             if (nostate) { w->tau[m].re = 0.0; w->tau[m].im = 0.0; }
-            w->tau[m] = pc_add(w->tau[m], pc_scale(w->y1[m], r->pwm_k));
+            if (cdot != 0.0)
+                w->tau[m] = pc_add(w->tau[m], pc_scale(pc_add(w->y1[m], pc_scale(w->tau[m], cdot)), r->pwm_k));
+            else
+                w->tau[m] = pc_add(w->tau[m], pc_scale(w->y1[m], r->pwm_k));
             r->dt[m] = w->tau[m];
         }
         return;
@@ -2793,7 +2819,7 @@ pac_dig_hook(void *vckt, void *vinst, int what, int conn, int port, int intag, d
             int st, k;
             if (o->inst != inst || o->port != port)
                 continue;
-            st = pac_dig_state(ckt, o->innode);
+            st = pac_dig_out_state(ckt, o);
             if (intag > 0 && !g_dig_noshift) {
                 PACdigRec *r = &g_dig_rec[intag - 1];
                 PACdigInj *q = NULL;
@@ -2889,7 +2915,8 @@ pac_dig_hook(void *vckt, void *vinst, int what, int conn, int port, int intag, d
                 double d, s, k;
                 if (w->t[2] < -1e299)
                     return pac_dig_unmodelled(t, "d_pwm %s: a transition decided before the first recorded point of the period%s", (char *) inst->MIFname, "");
-                if (w->t[1] > -1e299 && fabs(w->v[2] - w->v[1]) > 1e-9 * (fabs(w->v[2]) + 1e-3))
+                int moving = w->t[1] > -1e299 && fabs(w->v[2] - w->v[1]) > 1e-9 * (fabs(w->v[2]) + 1e-3);
+                if (moving && !PSSpwmLocked)
                     return pac_dig_unmodelled(t, "d_pwm %s: its control moves along the orbit (a closed loop or a periodic control): the PWM period then "
                                               "depends on the control%s and the steady state is not periodic with the analysis period", (char *) inst->MIFname, "");
                 if (n != 0 && n != 1)
@@ -2900,6 +2927,7 @@ pac_dig_hook(void *vckt, void *vinst, int what, int conn, int port, int intag, d
                 g_dig_rec[tag - 1].win = i;
                 g_dig_rec[tag - 1].pwm = 1;
                 g_dig_rec[tag - 1].pwm_k = k;
+                g_dig_rec[tag - 1].pwm_free = moving;   /* card #751 (only reached with the period locked to this d_pwm) */
                 g_dig_rec[tag - 1].pending = 1;
                 pac_dig_rec_compute(&g_dig_rec[tag - 1]);   /* now, or at the accepted point the decision belongs to (a hybrid step call) */
                 w->last_tag = tag;
@@ -2931,7 +2959,7 @@ pac_dig_prestep(CKTcircuit *ckt, double t_new, double h)
         return;
     for (i = 0; i < g_dig_nout; i++) {
         PACdigOut *o = &g_dig_out[i];
-        if (o->last_state < 0) o->last_state = pac_dig_state(ckt, o->innode);
+        if (o->last_state < 0) o->last_state = pac_dig_out_state(ckt, o);
         o->vprev = o->vcur; o->tprev = o->tcur;
         o->vcur = pac_dig_out_value(o, ckt->CKTrhs);
         o->tcur = t_new;

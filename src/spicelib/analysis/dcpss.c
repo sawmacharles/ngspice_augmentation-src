@@ -103,6 +103,7 @@ extern char* eng(double value, int digits, bool numeric, bool bytes);
 /* card #458: shooting-Newton driven PSS, implemented in pssshoot.c */
 extern int PSSshootDriven(CKTcircuit *ckt, PSSan *job);
 extern int PSSshootFreerun(CKTcircuit *ckt, PSSan *job);   /* card #489 */
+extern int PSSpwmLockAllowed;   /* card #751: pssshoot.c, the period may follow a self-timed d_pwm */
 extern int ENVenvelopeRun(CKTcircuit *ckt, PSSan *job);    /* card #513: pssenv.c */
 
 #define INIT_STATS() \
@@ -3597,12 +3598,14 @@ DCpss(CKTcircuit *ckt,
                     ckt->CKTguessedFreq);
         }
 #ifdef XSPICE
+        PSSpwmLockAllowed = 0;   /* card #751 */
         /* card #712: no V/I time function, no driven=1: a fixed-frequency XSPICE d_osc / d_pwm running at a whole multiple of Fguess is the clock. */
         if (!pss_driven && job->PSSmethod == PSS_METHOD_SHOOT && !job->PSStrigNode) {
             double fclk = 0.0, flast = 0.0;
             int nclk = 0;
             if (pss_xspice_clock_scan(ckt, ckt->CKTguessedFreq, &fclk, &nclk, &flast)) {
                 pss_driven = 1;
+                PSSpwmLockAllowed = 1;   /* card #751: no other time function fixes the period */
                 fprintf(stderr, "PSS: no V/I source with a time function; the XSPICE digital clock (d_osc / d_pwm, %g Hz = %g x Fguess) "
                         "sets the period 1/Fguess = %g s (card #712).\n", fclk, fclk / ckt->CKTguessedFreq, 1.0 / ckt->CKTguessedFreq);
             } else if (nclk > 0) {

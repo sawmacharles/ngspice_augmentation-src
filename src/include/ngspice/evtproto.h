@@ -77,6 +77,9 @@ void    XSsnapTake(CKTcircuit *ckt, XSsnap *s, double L, double base_toff);
 void    XSsnapPut(CKTcircuit *ckt, const XSsnap *s, int values);
 int     XSsnapDigitalDiff(CKTcircuit *ckt, const XSsnap *a, const XSsnap *b);
 double  XSsnapAnalogDiff(const XSsnap *a, const XSsnap *b);
+const void *XSsnapStateBlock(const XSsnap *s, int inst_index, int *size);   /* card #751 */
+double  XSsnapToff(const XSsnap *s);
+double  XSsnapNextInstEvent(const XSsnap *s, int inst_index);
 
 int EVTdest(Evt_Ckt_Data_t *evt);
 

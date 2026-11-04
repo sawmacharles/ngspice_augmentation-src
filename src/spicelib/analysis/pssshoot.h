@@ -135,6 +135,7 @@ void PSSsensRecordStep(CKTcircuit *ckt);    /* called right after CKTaccept(), s
 
 extern int PSSrippleRecordActive;
 extern int PSShidActive;           /* card #546 */
+extern int PSSpwmLocked;           /* card #751: the converged .pss period follows a self-timed d_pwm */
 extern int PSSxsTdStateful(const char *nm);   /* card #557 */
 extern int PSSxsPacBegin(CKTcircuit *ckt);   /* card #557: put the carried XSPICE state back before a td recording run */
 extern void PSSxsPacEnd(void);
