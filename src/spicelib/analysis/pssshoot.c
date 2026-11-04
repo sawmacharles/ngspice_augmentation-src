@@ -4965,6 +4965,10 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
     int *is_slow = NULL;
     int baseline_loose = 0;
     int have_baseline = 0;   /* do x0/x1/F already hold a valid, just-run point? */
+    /* (#768) does the baseline come from a recording run at THIS x0 (1), or is it the accepted damped-step trial of the previous
+     * iteration (0), i.e. P(x0) evaluated on the grid recorded at an EARLIER x0? */
+    int baseline_fresh = 0;
+    int rebase_off = getenv("PSS_REBASE_OFF") != NULL;
     int recompute = 1;       /* does THIS iteration's Jacobian need a fresh FD sweep? */
     int since_recompute = 0;
     int result = 0;
@@ -5199,6 +5203,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                 if (!is_slow[i]) x_full[i] = outbuf[i];
 
             have_baseline = 1;
+            baseline_fresh = 1;
         }
 
         fprintf(stdout, "PSS-SHOOT: %s iter=%d residual=%.6e%s\n", stage_label,
@@ -5734,6 +5739,24 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
                     iter--;
                     continue;
                 }
+                /* (#768) a fresh Jacobian did not help either, and F(x0) is the free result of the previous iteration's accepted
+                 * trial: that trial ran on the grid recorded at the previous x0. After a long step the switching edges have moved
+                 * off that grid, and its P(x0) can be much more favourable than P(x0) on a grid of its own (r3d buck, r2 +3 %:
+                 * accepted at 1.17e-3, the trials at alpha -> 0 tend to 9.77e-3, a fresh recording run gives 8.5e-3), so no step
+                 * can beat it. Re-evaluate the baseline at x0 (recording run + forced rerun, fresh FD Jacobian on that grid) and
+                 * retry this iteration once; a failure from a fresh baseline ends the attempt as before. Not in the matrix-free
+                 * (GMRES) mode: there a failed step hands the attempt to the dense path, which then re-evaluates as here (with
+                 * the re-evaluation the GMRES mode wandered for 20+ iterations far from the orbit before handing over).
+                 * PSS_REBASE_OFF=1 restores the old behaviour. */
+                if (!baseline_fresh && !rebase_off && !use_analytic && !kry) {
+                    fprintf(stdout, "PSS-SHOOT: %s iter=%d the damped Newton step did not reduce a residual taken on an "
+                            "earlier iterate's grid; re-evaluating the baseline at this iterate.\n", stage_label, iter);
+                    fflush(stdout);
+                    have_baseline = 0;
+                    recompute = 1;
+                    iter--;
+                    continue;
+                }
                 fprintf(stderr, "PSS-SHOOT: %s the damped Newton step did "
                         "not reduce the orbit residual at iteration %d "
                         "this attempt.\n", stage_label, iter);
@@ -5819,6 +5842,7 @@ pss_newton_run(CKTcircuit *ckt, PSSstateMap *map, double T,
              * can ONLY come from a run with PSSsensActive set, and this
              * damped-trial run above did not have it active. */
             have_baseline = use_analytic ? 0 : 1;
+            baseline_fresh = 0;
 
             since_recompute++;
             recompute = (!broyden_enabled) ||
