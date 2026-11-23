@@ -1010,8 +1010,19 @@ XSsnapPut(CKTcircuit *ckt, const XSsnap *s, int values)
         int ni = ckt->evt->counts.num_nodes, ns = ckt->evt->counts.num_insts;
         char *was_init = TMALLOC(char, ns);
 
-        for (i = 0; i < ns; i++)
+        /* #1192: clear the flags before EVTsetup_load_ptrs(): since upstream e3ec74f2b it calls the code model's
+           MIF_CB_DESTROY for every initialized instance (a new analysis), which frees locally allocated data
+           (d_pwm's PWL table) that the carried state still needs, while the restored flag keeps INIT from
+           rebuilding it (d_pwm then returns at once and its last transition time goes stale).
+           XS_SNAP_DESTROY_ON=1 keeps the flags set (red proof). */
+        static int destroy_on = -1;
+        if (destroy_on < 0)
+            destroy_on = getenv("XS_SNAP_DESTROY_ON") ? 1 : 0;
+        for (i = 0; i < ns; i++) {
             was_init[i] = ckt->evt->info.inst_table[i]->inst_ptr->initialized ? 1 : 0;
+            if (!destroy_on)
+                ckt->evt->info.inst_table[i]->inst_ptr->initialized = MIF_FALSE;
+        }
 
         EVTsetup_queues(ckt);
         EVTsetup_load_ptrs(ckt);
