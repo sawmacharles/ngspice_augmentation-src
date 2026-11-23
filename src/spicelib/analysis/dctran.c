@@ -1010,18 +1010,17 @@ resume:
                predictor read CKTrhsOld directly: an iterate that ran
                away, to NaN or far off, would poison every retry, down
                to "timestep too small". */
-            /* #1192: alternate. The first retry after a rejection restarts from the accepted
-               solution as above; a retry that fails again restarts from its own last iterate
-               (the pre-NEWRETRY rule), the next one from the accepted solution, and so on.
-               At a sharp edge (a latch in B sources, R4d's reset_sig) Newton from the accepted
-               point diverges the same way at every smaller step, down to "timestep too small",
-               while the failed iterate is already past the edge. DCTRAN_RETRY_ALT_OFF=1 restores
-               the accepted solution on every retry (upstream, red proof). */
+            /* #1192: alternate. The first retry after a rejection restarts from the failed attempt's last
+               iterate (the pre-NEWRETRY rule), a retry that fails again from the accepted solution as above,
+               and so on. Restarting every retry from the accepted point diverges the same way at every
+               smaller step at a sharp edge (a latch in B sources, R4d's reset_sig: down to "timestep too
+               small"), and starting with it lost a perturbed R3d .pss (pstbsens) that converges with the old
+               rule. DCTRAN_RETRY_ALT_OFF=1 restores the accepted solution on every retry (upstream, red proof). */
             if (ckt->CKTrhsAccepted) {
                 static int retry_alt_off = -1;
                 if (retry_alt_off < 0)
                     retry_alt_off = getenv("DCTRAN_RETRY_ALT_OFF") ? 1 : 0;
-                if (retry_alt_off || (retries_since_accept++ % 2) == 0)
+                if (retry_alt_off || (retries_since_accept++ % 2) == 1)
                     memcpy(ckt->CKTrhsOld, ckt->CKTrhsAccepted,
                            (size_t) (ckt->CKTrhsSize + 1) * sizeof(double));
             }
