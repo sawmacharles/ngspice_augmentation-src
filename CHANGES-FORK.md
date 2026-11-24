@@ -409,3 +409,18 @@ When the `.pac`/`.pstb`/`.pxf`/`.pnoise` card sets no `pacpoints=`, a free-runni
 
 - `318dc3d0d` pacshoot (#1757): free-running .pac/.pstb warns once per run that the phase mode is not treated, and per point below 4.7 % of fsw
 - `4157ab650` pacshoot (#1758): free-running .pac/.pstb records on at least 4000 points per period by default
+
+
+## s157 — MOS binning: bin edges are reported, `.option binlegacy` restores the older choice
+
+1 commit.
+
+Since s155 (upstream 03ef19244, 2026-10-30) a size is binned by the standard rule min <= size < max, as in other simulators. Before, a size within 1e-9 of a limit was in the bin and the first card found won, so a device exactly on a bin edge got whichever card came first (in hs/spe mode the subcircuit expander first kept only the cards with min <= size < max in float, on w/nf). The choice matters: a synchronous buck of sky130 5 V devices, all six exactly on a bin edge, finished on s154 and stopped on s155/s156 with "Timestep too small" at a gate edge. Both cards give the same answer when the run gets through (with `.option rshunt=1e12`), so the stop is a convergence weakness that the other card exposes, not a wrong device.
+
+- A warning for the first 5 instances per circuit that sit on a bin edge where the two rules take different cards, naming the card used and the other one.
+- `.option binlegacy` (or `set binlegacy`) bins by the older rule, including its card pruning in hs/spe mode; that buck then finishes with the s154 results to all printed digits.
+- The default stays the standard rule. New test suite: `test_binedge` (60 suites).
+
+Tried and left out: a transient rescue that retries a would-be "Timestep too small" with a temporary shunt on every node. On that buck it never got past the failing instant.
+
+- `689a8c6d2` binning (#1766): .option binlegacy restores the bin choice before 2026-10-30; warn at bin edges where the rules differ

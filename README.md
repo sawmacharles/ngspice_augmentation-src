@@ -10,8 +10,8 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Since `s155`
   every later upstream commit up to `47eb8ad02` (2026-11-21) is picked on top, unchanged.
-- **This fork:** 245 commits on top of that base (87 of them upstream), the branch `main`.
-  Releases are the tags `s125` … `s156`; `s156` is the latest.
+- **This fork:** 246 commits on top of that base (87 of them upstream), the branch `main`.
+  Releases are the tags `s125` … `s157`; `s157` is the latest.
 - **Size of the change** (against upstream `47eb8ad02`): 92 files, about 27 000 lines added, 267 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
@@ -295,7 +295,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (59 at `s156`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (60 at `s157`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -309,7 +309,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s156` is attached to the [s156 release](../../releases/tag/s156)
+A Linux x86-64 binary of `s157` is attached to the [s157 release](../../releases/tag/s157)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -356,3 +356,4 @@ change on its own. The tags are:
 | s154 | `.pss` and td `.pac` on a closed loop through an XSPICE `d_pwm` (the period follows the self-timed PWM; was not converged); inverted `dac_bridge` inputs in td small signal (was 12.9 dB low); a stale Newton baseline is re-evaluated before `.pss` gives up |
 | s155 | upstream sync to `pre-master-48` of 2026-11-21 (device-model, binning, seeding, `.param agauss` drawn once, KLU 7.14.1, breakpoint fixes); two regressions it caused in `.pss` fixed (retry after a rejected step, XSPICE state restore) |
 | s156 | free-running `.pac`/`.pstb` (`trigger=`): recording passes on at least 4000 points per period; line-to-output of a hysteretic buck was up to 10 dB off a transient, now within 0.07 dB |
+| s157 | MOS binning: a warning when a device sits exactly on a bin edge where the standard rule (since s155) and the older rule pick different cards; `.option binlegacy` restores the older choice |
