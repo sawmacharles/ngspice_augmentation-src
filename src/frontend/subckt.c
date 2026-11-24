@@ -577,6 +577,7 @@ doit(struct card *deck, wordlist *modnames) {
     if (!cp_getvar("scale", CP_REAL, &scale, 0))
         scale = 1;
     bool outermax = INPbinOuterMax();
+    bool binlegacy = INPbinLegacy();
 
     /* as in INPgetModBin(): bin on w/nf (1) or on the total w (0) */
     int wnflag = INPgetWnflag();
@@ -725,10 +726,20 @@ doit(struct card *deck, wordlist *modnames) {
                             double csw = scale * c->w / (wnflag ? c->nf : 1.);
                             /* the other width, if wnflag is given on the instance */
                             double csw2 = scale * c->w / (wnflag ? 1. : c->nf);
-                            /* keep the card if INPgetModBin() may choose it */
-                            if (INPbinMatch(csl, flmin, flmax, csw, fwmin, fwmax, outermax) > 0 ||
+                            /* keep the card if INPgetModBin() may choose it, by the standard or by the
+                               legacy rule: it looks at both for its bin-edge warning (#1766).
+                               With binlegacy, keep what ngspice kept before 2026-10-30: min <= size < max
+                               in float, on w/nf whatever wnflag says. */
+                            if (binlegacy
+                                ? ((float) ((float) scale * c->l) >= (float) flmin &&
+                                   (float) ((float) scale * c->l) < (float) flmax &&
+                                   (float) ((float) scale * c->w / c->nf) >= (float) fwmin &&
+                                   (float) ((float) scale * c->w / c->nf) < (float) fwmax)
+                                : (INPbinMatch(csl, flmin, flmax, csw, fwmin, fwmax, outermax) > 0 ||
+                                INPbinMatchLegacy(csl, flmin, flmax, csw, fwmin, fwmax) > 0 ||
                                 (inst_wnflag &&
-                                 INPbinMatch(csl, flmin, flmax, csw2, fwmin, fwmax, outermax) > 0)) {
+                                 (INPbinMatch(csl, flmin, flmax, csw2, fwmin, fwmax, outermax) > 0 ||
+                                  INPbinMatchLegacy(csl, flmin, flmax, csw2, fwmin, fwmax) > 0)))) {
                                 /* use the current .model card */
                                 prev = su_deck;
                                 su_deck = su_deck->nextcard;

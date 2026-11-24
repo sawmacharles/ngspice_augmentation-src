@@ -60,6 +60,7 @@ static void recifeval(struct card *pdeck);
 static char *upper(register char *string);
 static void inp_set_wnflag(const char *line);
 static void inp_set_binoutermax(const char *line);
+static void inp_set_binlegacy(const char *line);
 #ifdef REM_UNUSED
 static void rem_unused_mos_models(struct card* deck);
 #endif
@@ -993,6 +994,7 @@ inp_spsource(FILE *fp, bool comfile, char *filename, bool intfile)
                     }
                     inp_set_wnflag(scan->line);
                     inp_set_binoutermax(scan->line);
+                    inp_set_binlegacy(scan->line);
                 }
                 /* from .options (will override the previous settings) */
                 for (scan = options; scan; scan = scan->nextcard) {
@@ -1022,6 +1024,7 @@ inp_spsource(FILE *fp, bool comfile, char *filename, bool intfile)
                     }
                     inp_set_wnflag(scan->line);
                     inp_set_binoutermax(scan->line);
+                    inp_set_binlegacy(scan->line);
                 }
             }
 
@@ -2809,6 +2812,18 @@ static void inp_set_binoutermax(const char *line)
         (s[11] == '\0' || isspace_c(s[11]))) {
         bool t = TRUE;
         cp_vset("binoutermax", CP_BOOL, &t);
+    }
+}
+
+/* .option binlegacy (#1766): bin by the rule of ngspice before 2026-10-30 (see INPbinLegacy()).
+   Set here like binoutermax; the variable then stays set for the following circuits. */
+static void inp_set_binlegacy(const char *line)
+{
+    const char *s = strstr(line, "binlegacy");
+    if (s && s > line && isspace_c(s[-1]) &&
+        (s[9] == '\0' || isspace_c(s[9]))) {
+        bool t = TRUE;
+        cp_vset("binlegacy", CP_BOOL, &t);
     }
 }
 

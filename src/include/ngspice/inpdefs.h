@@ -133,6 +133,9 @@ int INPgetWnflag(void);
 bool INPbinOuterMax(void);
 int INPbinMatch(double l, double lmin, double lmax,
                 double w, double wmin, double wmax, bool outermax);
+int INPbinMatchLegacy(double l, double lmin, double lmax,
+                      double w, double wmin, double wmax);
+bool INPbinLegacy(void);
 int INPgetTok(char **, char **, int);
 int INPgetNetTok(char **, char **, int);
 void INPgetTree(char **, INPparseTree **, CKTcircuit *, INPtables *);

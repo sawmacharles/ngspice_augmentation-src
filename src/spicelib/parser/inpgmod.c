@@ -365,17 +365,118 @@ INPbinMatch(double l, double lmin, double lmax,
 }
 
 
+/* The bin rule of ngspice before upstream commit 03ef19244 (2026-10-30, "Correct the limits for binning
+   of MOS model"): a size within an absolute 1e-9 of lmin, lmax, wmin or wmax, or strictly inside, is in the
+   bin, and the first card found wins. At an exact bin edge two cards hold the size and the card order
+   decides; the standard rule (min <= size < max) takes the card that starts at the edge. */
+static bool
+legacy_in_range(double value, double min, double max)
+{
+    return fabs(value - min) < 1e-9 || fabs(value - max) < 1e-9 || (min < value && value < max);
+}
+
+
+int
+INPbinMatchLegacy(double l, double lmin, double lmax, double w, double wmin, double wmax)
+{
+    return (legacy_in_range(l, lmin, lmax) && legacy_in_range(w, wmin, wmax)) ? 1 : 0;
+}
+
+
+/* Is binlegacy set (set binlegacy, or .option binlegacy)? Then INPgetModBin() bins by the old rule. */
+bool
+INPbinLegacy(void)
+{
+    return cp_getvar("binlegacy", CP_BOOL, NULL, 0);
+}
+
+
+static bool
+binnable_type(int type)
+{
+    if (type == INPtypelook("BSIM3") || type == INPtypelook("BSIM3v32") || type == INPtypelook("BSIM3v0") ||
+        type == INPtypelook("BSIM3v1") || type == INPtypelook("BSIM4") || type == INPtypelook("BSIM4v5") ||
+        type == INPtypelook("BSIM4v6") || type == INPtypelook("BSIM4v7") || type == INPtypelook("HiSIM2") ||
+        type == INPtypelook("HiSIMHV1") || type == INPtypelook("HiSIMHV2"))
+        return TRUE;
+#ifdef OSDI
+    /* Verilog-A modules: bins by lmin, lmax, wmin, wmax of the card */
+    if (type >= 0 && ft_sim->devices[type]->registry_entry)
+        return TRUE;
+#endif
+    return FALSE;
+}
+
+
+/* The card for sizes l and w among the binned cards of model name: by the standard rule (with outermax as
+   given), or by the legacy rule. *err is set for a card of unknown device type. */
+static INPmodel *
+bin_select(char *name, double l, double w, double w_nf, bool outermax, bool legacy, char **err)
+{
+    /* With binlegacy in hs or spe compatibility, the subcircuit expander kept only the cards of a
+       subcircuit-local model (name x...:model) with min <= size < max in float on l and w/nf (subckt.c);
+       the legacy rule then chose among those. */
+    bool hs_pruned = legacy && (newcompat.hs || newcompat.spe) && strchr(name, ':');
+
+    INPmodel    *modtmp, *best = NULL;
+    int          best_match = 0;
+    double       parse_values[4];
+    bool         parse_found[4];
+    static char *model_tokens[] = { "lmin", "lmax", "wmin", "wmax" };
+
+    for (modtmp = modtab; modtmp; modtmp = modtmp->INPnextModel) {
+
+        if (model_name_match(name, modtmp->INPmodName) < 2)
+            continue;
+
+        /* skip if not binnable */
+        if (!binnable_type(modtmp->INPmodType))
+            continue;
+
+        /* if illegal device type */
+        if (modtmp->INPmodType < 0) {
+            *err = tprintf("Unknown device type for model %s\n", name);
+            return NULL;
+        }
+
+        if (!parse_line(modtmp->INPmodLine->line, model_tokens, 4, parse_values, parse_found))
+            continue;
+
+        if (hs_pruned &&
+            !((float) l >= (float) parse_values[0] && (float) l < (float) parse_values[1] &&
+              (float) w_nf >= (float) parse_values[2] && (float) w_nf < (float) parse_values[3]))
+            continue;
+
+        int match = legacy
+            ? INPbinMatchLegacy(l, parse_values[0], parse_values[1], w, parse_values[2], parse_values[3])
+            : INPbinMatch(l, parse_values[0], parse_values[1], w, parse_values[2], parse_values[3], outermax);
+        if (match == 0)
+            continue;
+        if (!best || match < best_match) {
+            best = modtmp;
+            best_match = match;
+        }
+        /* the standard rule holds: take the first card found, as before */
+        if (match == 1)
+            break;
+    }
+    return best;
+}
+
+
 char *
 INPgetModBin(CKTcircuit *ckt, char *name, INPmodel **model, INPtables *tab, char *line)
 {
-    INPmodel    *modtmp, *best = NULL;
-    int          best_match = 0;
+    INPmodel    *best, *other;
     bool         outermax = INPbinOuterMax();
-    double       l, w, lmin, lmax, wmin, wmax;
+    bool         legacy = INPbinLegacy();
+    char        *err = NULL;
+    double       l, w, w_nf, nf_raw;
     double       parse_values[4];
     bool         parse_found[4];
     static char *instance_tokens[] = { "l", "w", "nf", "wnflag" };
-    static char *model_tokens[]    = { "lmin", "lmax", "wmin", "wmax" };
+    static CKTcircuit *warned_ckt = NULL;
+    static int   n_edge_warned = 0;
     double       scale;
     int          wnflag = INPgetWnflag();
 
@@ -387,6 +488,11 @@ INPgetModBin(CKTcircuit *ckt, char *name, INPmodel **model, INPtables *tab, char
     /* read W and L. If not on the instance line, leave */
     if (!parse_line(line, instance_tokens, 2, parse_values, parse_found))
         return NULL;
+
+    /* nf as given (1 if not), for the w/nf of the legacy subcircuit card filter */
+    nf_raw = parse_line(line, instance_tokens, 3, parse_values, parse_found) ? parse_values[2] : 1.;
+    if (nf_raw <= 0.)
+        nf_raw = 1.;
 
     /* This is for reading nf. If nf is not available, set to 1 if in HSPICE or Spectre compatibility mode */
     if (!parse_line(line, instance_tokens, 3, parse_values, parse_found)) {
@@ -410,56 +516,36 @@ INPgetModBin(CKTcircuit *ckt, char *name, INPmodel **model, INPtables *tab, char
 
     l = parse_values[0] * scale;
     w = parse_values[1] / parse_values[2] * scale;
+    w_nf = (float) scale * parse_values[1] / nf_raw;
 
-    for (modtmp = modtab; modtmp; modtmp = modtmp->INPnextModel) {
+    best = bin_select(name, l, w, w_nf, outermax, legacy, &err);
+    if (err) {
+        *model = NULL;
+        return err;
+    }
 
-        if (model_name_match(name, modtmp->INPmodName) < 2)
-            continue;
-
-        /* skip if not binnable */
-        if (modtmp->INPmodType != INPtypelook("BSIM3") &&
-            modtmp->INPmodType != INPtypelook("BSIM3v32") &&
-            modtmp->INPmodType != INPtypelook("BSIM3v0") &&
-            modtmp->INPmodType != INPtypelook("BSIM3v1") &&
-            modtmp->INPmodType != INPtypelook("BSIM4") &&
-            modtmp->INPmodType != INPtypelook("BSIM4v5") &&
-            modtmp->INPmodType != INPtypelook("BSIM4v6") &&
-            modtmp->INPmodType != INPtypelook("BSIM4v7") &&
-            modtmp->INPmodType != INPtypelook("HiSIM2") &&
-            modtmp->INPmodType != INPtypelook("HiSIMHV1") &&
-            modtmp->INPmodType != INPtypelook("HiSIMHV2")
-#ifdef OSDI
-            /* Verilog-A modules: bins by lmin, lmax, wmin, wmax of the card */
-            && !(modtmp->INPmodType >= 0 &&
-                 ft_sim->devices[modtmp->INPmodType]->registry_entry)
-#endif
-            )
-        {
-            continue;
+    /* #1766: a size exactly on a bin edge is held by two cards; the standard rule and the legacy rule
+       (ngspice before 2026-10-30) may take different ones, and the two cards may simulate differently
+       (a sync buck of sky130 5 V devices finished with one and stopped with "timestep too small" with the other).
+       Say so, for the first instances of each circuit. */
+    other = bin_select(name, l, w, w_nf, outermax, !legacy, &err);
+    if (best && other && best != other) {
+        if (warned_ckt != ckt) {
+            warned_ckt = ckt;
+            n_edge_warned = 0;
         }
-
-        /* if illegal device type */
-        if (modtmp->INPmodType < 0) {
-            *model = NULL;
-            return tprintf("Unknown device type for model %s\n", name);
+        if (n_edge_warned < 5) {
+            fprintf(stderr,
+                    "Warning: model %s, l=%g w=%g%s: on a bin edge; card %s is used (%s rule), "
+                    "the %s rule takes %s (%s)\n",
+                    name, l, w, (parse_values[2] != 1.) ? " per finger" : "",
+                    best->INPmodName, legacy ? "binlegacy" : "min <= size < max",
+                    legacy ? "standard" : "pre-2026-10 ngspice", other->INPmodName,
+                    legacy ? "without .option binlegacy" : ".option binlegacy");
+        } else if (n_edge_warned == 5) {
+            fprintf(stderr, "Warning: further instances on a bin edge are not listed\n");
         }
-
-        if (!parse_line(modtmp->INPmodLine->line, model_tokens, 4, parse_values, parse_found))
-            continue;
-
-        lmin = parse_values[0]; lmax = parse_values[1];
-        wmin = parse_values[2]; wmax = parse_values[3];
-
-        int match = INPbinMatch(l, lmin, lmax, w, wmin, wmax, outermax);
-        if (match == 0)
-            continue;
-        if (!best || match < best_match) {
-            best = modtmp;
-            best_match = match;
-        }
-        /* the standard rule holds: take the first card found, as before */
-        if (match == 1)
-            break;
+        n_edge_warned++;
     }
 
     if (best) {
