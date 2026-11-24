@@ -289,3 +289,111 @@ Since s134, td `.pac/.pstb/.pxf/.pnoise` on a circuit without ideal switches or 
 A `d_pwm` code model times each output edge from its previous edge, so in a closed loop its period follows the ripple on its control input. On a voltage-mode buck switching nominally at 500 kHz the period is 2.00865 µs, not 2 µs; stock ngspice 45.2 and s153 transients agree, and the waveform repeats every switching period (no subharmonic). A shooting `.pss` at 2 µs therefore had no steady state to find and reported "does not settle". When the circuit holds exactly one `d_pwm`, `.pss` now solves for the PWM's own period alongside the states (period lock; `PSS_PWM_LOCK_OFF=1` restores the fixed period). The period agrees with a 10 ms settled transient to 1.7e-5 relative, and the ripple to 0.001 %. Time-domain `.pac` on that orbit includes the edge-time dependence on the control input (`PAC_PWM_NO_CDOT=1` removes it); against stock ngspice's injected-tone response it agrees within 0.016 dB up to 21.5 kHz and within 0.163 dB above. A second fault, present since s150: a `dac_bridge` with an inverted input (`[~dout dout]`) took its small-signal level from the uninverted node, so td small signal through such a stage came out 12.9 dB low even in open loop; fixed (`PAC_DIG_INVERT_OFF=1` restores the old reading). The stability verdict on a period-locked orbit reads `UNKNOWN(self-timed-pwm)`: the multipliers the solver computes hold the PWM edge time fixed, so they are not the orbit's own. Not done: circuits with several `d_pwm`; `.pstb`, `.pxf` and `.pnoise` on these circuits. Not explained: on the open-loop deck at 100 kHz the injected-tone response differs from `.pac` by 2.9 dB (suspected: ringing in the tone's short measurement window, not checked).
 
 The second commit: when a damped Newton step fails to reduce a residual that was taken on an earlier iterate's time grid, `.pss` now re-evaluates the residual at the current iterate before giving up the attempt (`PSS_REBASE_OFF=1` restores the old path). On a voltage-mode buck with a perturbed compensator, s153 accepted an orbit whose two compensator states were 0.345 mV high (3.2 % of the ripple), and the result depended on the system's math library; the orbit is now found in 7 iterations with two different math libraries. Plain transient output is byte-identical to s153 on seven decks; an AddressSanitizer build is clean on the new paths. Not done: a new deck that triggers the refusal one sensitivity test relied on (that check now skips).
+
+## s155 — upstream sync to pre-master-48 of 2026-11-21; two regressions it would have caused fixed
+
+86 commits: 82 upstream, 4 of this fork.
+
+The ngspice development branch moved on from the 2026-10-07 commit this fork had picked up to. Every new upstream commit up to `47eb8ad02` (2026-11-21) is now on `main`, unchanged and with its original author, plus the bug 873 seed fix from 2026-10-05 that the earlier pick had left out. One was not taken because the fork already had the same fix (the `klu_memgrow_factor` option stored a comparison, not the value). Upstream changes that alter results:
+
+- Diode level 1: derivative of the recombination current, generation current in reverse and breakdown, `IBV` scaled with area and `m`. BJT: quasi-saturation epi charge continuous, no division by `VO`, quasi-saturation scaled with area; `ISE`/`ISC` kept as given. BSIM4: STI stress and WPE mobility restored. MOS binning limits as in other simulators, `wnflag` handling, optional size on the outermost `lmax`/`wmax`.
+- A top-level `.param` with `agauss`, `gauss`, `aunif`, `unif` or `limit` is drawn once per circuit load, as the ngspice manual documents (it was redrawn at every reference). The fork's `once()` form still works and now gives the same result as without it.
+- Seeding: `setseed`, `option seed` and `.option seed` refill the transient-noise Gaussian pools in upstream's own way, so the fork's s139 helper for this is removed; seeded `agauss`/`unif` values are now upstream's (they differ from s138..s154).
+- `ITL1`, `ITL2` and `ITL4` are honoured below 100 (defaults 100); breakpoint fixes (bugs 887, 888, a breakpoint at the final time); memristor `rinit` in `.ac`/`.dc`; `.save none`; `.lib` sections and nested includes; the bundled KLU is SuiteSparse 7.14.1 (was 3.7.0), or an installed SuiteSparse's KLU when one is found; OSDI header v0.5 and `osdi_bind`; CMake build next to autotools; several memory leaks and crashes.
+- After a rejected time step, a retry starts again from the last accepted solution (bug 879).
+
+Two of these broke fork features, and are fixed here:
+
+- The retry rule above. In R4d's (peak-current-mode buck with dead time) `.pss` warm-up, every retry restarted from the accepted point at a latch edge built from B sources and diverged the same way down to "timestep too small"; a perturbed R3d `.pss` stopped converging. Retries now alternate: the first from the failed iterate (the old rule), the second from the accepted solution, and so on. Both decks converge again; the perturbed R3d gives s154's result exactly. Also, at the first point of a `uic` run upstream stored the loaded right-hand side instead of the solution as the accepted one (up to 11 apart on R4d); corrected. `DCTRAN_RETRY_ALT_OFF=1` and `DCTRAN_UIC_ACCEPT_OFF=1` restore upstream's behaviour.
+- Upstream now calls each XSPICE code model's destroy callback when an analysis is set up again. Shooting `.pss` with XSPICE blocks restores the event state before every restarted period through the same setup routine, so the `d_pwm` code model lost its duty-cycle table and the `d_pwm` period lock failed. Restoring the state no longer triggers the callback; `.pac` through `d_pwm` is again byte-identical to s154. `XS_SNAP_DESTROY_ON=1` shows the failure.
+
+Results that moved, all explained: R4d's compensation-node orbit at the default tolerance is 0.31 % of its 1.3 mV ripple from a settled transient (0.06 % on s154; at reltol 1e-5 it is within 0.10 %); the radius of an unstable orbit (R4 at duty 0.55, about 1.3) moves within the spread its own finite-difference variants already had (2.6 %); plain transients move at tolerance level (up to 0.9 % in cycle averages of a converter soft-start); checkpoint chaining against the same build's plain transient: 81 % of periods within 0.5 % (100 % on s154).
+
+Also explained since s154: on the open-loop `d_pwm` buck at 100 kHz the injected-tone response differed from `.pac` by 2.9 dB because the tone was measured over only 5 of its periods, while the output filter (5 kHz, Q about 10) still rang from the tone's start. The difference falls as the window grows (1.0 dB at 25 periods, 0.27 dB at 100, 0.08 dB / 0.45° at 400): the `.pac` value was right.
+
+- `22682ca62` Fix bug 873 main.c: initialise rndseed to 1 and and get random numbers by initw(). inp.c: extract options seed=val|random in netlist and script files. wallace.c: if initw is called a second time, re-allocate memory, not just overwrite it (memory leak!). *(upstream)*
+- `ed6ef2159` Fix previous commit: Re-enable options in comfiles. *(upstream)*
+- `e961e4d1f` Enable setting the seed by command 'setseed' also for tranoise etc. *(upstream)*
+- `a8a776367` Update long comment to sharedsync() to better reflect the dctran.c code. Add similar to sharedspice.h. *(upstream)*
+- `5fc25bd4c` Add prompting for new delta and return value to sync callback and fix errors in shared library example. *(upstream)*
+- `2a1045b20` Fix bug #875 - ".save none sticks ...".  Using the shared library, after "save none", no vectors could be saved. Also make "save none" work in the program and fix memory leaks, dead code and simplify memory allocation. *(upstream)*
+- `68b3a7375` Fix bug #874 "OPtran never finishes when a GetSyncData callback               is registered (shared library)" by removing the check for over-run in sharedsync().  That has also been seen to cause failure in transient simulation.  Make stopping more robust in the analysis code. *(upstream)*
+- `e83b83f1c` Initialise random generator as in main.c *(upstream)*
+- `47a67a08c` Fixes bug 876 *(upstream)*
+- `f1a096277` Fixing bugs no. 877 and 878, reported by Mattia Fiumara: Enable true reverse and forward bias calculations. *(upstream)*
+- `eaac23e28` dense: solve conflict of norm() definition collision for MSVS, workaround because norm() function is not used in source tree. *(upstream)*
+- `f5f50907a` Add a CMake build system alongside autotools *(upstream)*
+- `4aee08ea9` E-573: BJT: keep ISE/ISC as given, resolve multiplier form in BJTtemp *(upstream)*
+- `f12e03748` .gitignore: extend to cmake generated files *(upstream)*
+- `ab96c5c59` cmake: assume ELF on Linux (fixes Ninja install RPATH error with icx) *(upstream)*
+- `23e324255` inpcom.c: evaluate .param with agauss etc. once, as documented *(upstream)*
+- `e2bd0b069` Remove bug: really use rinit for ac/dc *(upstream)*
+- `999ec837d` Remove linker warnins *(upstream)*
+- `c9044943f` Fix blank default output file name (reported by Diarmuid Collins) and scan for .sv files as well as .s. *(upstream)*
+- `49c76373a` Fix handling of missing file names in ghnggen. *(upstream)*
+- `d9d71fe47` Response to bug report 879: Upon a rejected time point resort to the last accepted CKTrhs *(upstream)*
+- `fe4cfd229` Remove the floor of 100 for the iteration count, so the user may select ITL1, ITL2, and ITL4. The defaults are set to 100. Reported in bug 879 by d b *(upstream)*
+- `babbedd6b` typo *(upstream)*
+- `8cb1dcf21` Diode level 1: breakdown current IBV is now scaled with area and m, consistent with level 3 *(upstream)*
+- `291c6181b` typo *(upstream)*
+- `597f7f6c8` If .option rshunt is found in the netlist, it overrides the spinit, .spceinit given values. If another netlist is sourced without .option rshunt, the global variable is removed, or reset to the spinit, .spiceinit value, if available. Same for cshunt. *(upstream)*
+- `f6f1aa17f` path for circuit netlist is found automatically. *(upstream)*
+- `01440fe7c` Remove unphysical ac gain: Set derivatives to 0 if limits are exceeded. Normalize the derivative in the logarithmic transition region. Add ac tests for xspice to make check. *(upstream)*
+- `b1aba521e` dioload.c: fix derivative of the recombination current *(upstream)*
+- `dd5148ea7` dioload.c: generation current (isr) in reverse and breakdown region *(upstream)*
+- `caf262e03` Missing files for make check *(upstream)*
+- `384bcda5d` bjt: make the quasi-saturation epi charge continuous in vrci *(upstream)*
+- `86b9180e2` BJT: remove the division by VO in the quasi-saturation epi current *(upstream)*
+- `5cdfdb1a3` BJT: scale the quasi-saturation block with the instance area *(upstream)*
+- `7d6e95198` This repairs commit 50bfc21 "bsim4: reimplement mobility and binning extension" by applying STI stress and WPE reduced mobility instead only size dependent mobility. Credit to Vilem - see Discussion https://sourceforge.net/p/ngspice/discussion/127605/thread/56ed12d6f3/ *(upstream)*
+- `d9aaf40c8` typo *(upstream)*
+- `fc7cd0185` Correct the limits for binning of MOS model Make results equal to other simulators. Patch provided by Vilem Kledrowetz. *(upstream)*
+- `600fe0788` Fixes bug 885 on option handling, improves code for bug 873. and replaces patch 136 by - Separating option handling, command 'option' in com_option.c,   command '.option seed = val' in inp.c - Adding a warning when '.option seed=xx' and 'option seed=yy' are given together with 'reset' - Resetting seed to .spiceinit values or 1, if circuits without .option seed= are loaded. *(upstream)*
+- `42e6908fc` Fixes bugs 887 and 888 by setting a default 1e-15 for minBreak, reported by Andrew Sterian *(upstream)*
+- `c0d697d65` Don't modify breakpoint which is at CKTfinalTime Patch 128 *(upstream)*
+- `659f0611f` Catches the core dump situation when the CPL model exceeds 8 conductors and prints an error message. Provided by Rick Walker Support request 89 *(upstream)*
+- `1a5e00980` Remove generated tests/xspice/analog/Makefile.in from git, it is created by autogen.sh *(upstream)*
+- `cc34597b3` Add missing headers for make dist *(upstream)*
+- `75102712c` When two plots are employed with different x-coordinates, the prev_xval corresponds to the second line, while it is compared with an xval of the first line. So even with monotonic plots, the direction-reversal will be triggered and an extra \n will be inserted. Fixes bug 864 *(upstream)*
+- `c0189133b` CMake: no ctest with the Windows GUI binary, document it *(upstream)*
+- `0f44fbf03` cmake: build without X11 if Xaw, Xmu, Xt or Xext are missing *(upstream)*
+- `e7938d16e` Streamline seeding of random number generator *(upstream)*
+- `13409893b` cmake: separate TMP per winflexbison run (parallel builds corrupted the parsers) *(upstream)*
+- `ff52eeeb3` subckt.c: bin in double, with the same test as INPgetModBin() *(upstream)*
+- `2cbbc59a8` Remove memory leak *(upstream)*
+- `8d2786eda` Set the default values to 100, as the lower limit in niiter.c has been removed by commit d7e64e28d ("Remove the floor of 100 for the iteration count, so the user may select ITL1, ITL2, and ITL4. The defaults are set to 100. Reported in bug 879 by d b", 2026-10-23) *(upstream)*
+- `9d3e9fd4c` Partial integration of Patch #132 by Sourceforge user George -   "Shared library: memory leak in ngGet_Evt_NodeInfo result cleanup." Also test code and a little tidying. *(upstream)*
+- `2747447c2` Fix bug reported with Patch #133 -  "XSPICE: reused plot names after destroy all can reconnect stale event data." Also disable the undocumented behaviour of saving XSPICE node history for multiple simulations, unless variable "keepxs" is set. Tidy a bit. *(upstream)*
+- `908e16112` Remove traces of nutmeg to improve code flavour and make "plot alle" work on non-VisualC builds. *(upstream)*
+- `9e57b341e` Fix warnings from gcc 14.2. *(upstream)*
+- `479d13ae2` Improve a warning message in d_cosim. *(upstream)*
+- `e6c9cd0e5` In a library file, ngspice expands .include lines only inside the requested section. Nested .lib references work as before. Within one load, ngspice reuses a library file it has already read. It now reuses the file only for the same section, because a read for one section skips the includes of the others. If the library file itself lacks the requested section, ngspice rereads the library with every .include expanded, because an included file may define the section. The manual (chapt. 2.10) places each section inside the library file. The hs compatibility mode exists to read PDK libraries written for commercial simulators (chapt. 12.11), and commercial simulators reject a section inside an included file. ngspice keeps accepting one, but now prints a warning: *(upstream)*
+- `3b7d2e2a9` INPgetModBin: wnflag without a value is wnflag=1 *(upstream)*
+- `85b664222` subckt.c: apply wnflag when dropping binned model cards *(upstream)*
+- `20a6942e7` Binning: optionally accept a size on the outermost lmax, wmax *(upstream)*
+- `27b9fb697` KLU: separate the bundled SuiteSparse headers from the ngspice extensions *(upstream)*
+- `f955ba55a` KLU: use the KLU of an installed SuiteSparse if available *(upstream)*
+- `763093769` KLU: update the bundled SuiteSparse from 3.7.0 to 7.14.1 *(upstream)*
+- `ccd106d8b` CMake: SuiteSparse package next to ngspice on Windows, install its DLLs *(upstream)*
+- `89b0c0173` Remove MSVC declarations of scalbn and logb *(upstream)*
+- `546f5ef1b` cmake: use Xft if available, as configure does (rotated plot text) *(upstream)*
+- `3f4d262df` inpcom.c: diode with an unlabeled area: count the nodes correctly *(upstream)*
+- `bc0803104` inpfindv.c: read double-quoted versions without overflow *(upstream)*
+- `2a68b36e8` inpcom.c: diode node count: a value after a value is a node *(upstream)*
+- `37a5f44fa` dev.c: grow the device lists of existing circuits *(upstream)*
+- `da059bcac` dev.c: warn about OSDI modules with the same name *(upstream)*
+- `a9be3d471` dev.c: show the .osdi file of an OSDI device *(upstream)*
+- `263172a15` Revert the commits 8e03f9570 and f14a632a5, reapplied in the following commits *(upstream)*
+- `98089a649` dev.c: warn about OSDI modules with the same name *(upstream)*
+- `cacadb730` dev.c: show the .osdi file of an OSDI device *(upstream)*
+- `d135fdb49` dev.c: same-named OSDI modules: the warning says what is affected *(upstream)*
+- `c47224988` Fix three XSPICE memory leaks: cc9be5b3f mistakenly activated dead code in the ngspice program.  The bug was alreay in the shared library. Code in runcoms2.c and evtsetup.c is now removed.  Other ancient bugs: on a second or later analysis run of a circuit, event values left in output queues were lost; and code models with event nodes were reinitialied, losing previously allocated memory.  Check on variable "keepxs" moved to a more logical location. *(upstream)*
+- `8e8258038` Optimize code sequence of the fourier command. Add a warning if no vector/expression is given. *(upstream)*
+- `7e194a5ad`   In logicexp.c, fix lexer_scan which missed tokens, and extract_delay   could be stuck in an endless while loop.   In udevices.c, diagnostic messages could be mixed confusingly with   error messages.   In cktdest.c, CKTdestroy was missing FREE(ckt->CKTrhsAccepted) which   caused a memory leak. *(upstream)*
+- `1eeeb48ca` OSDI: update osdi.h to v0.5, keep loading v0.3/v0.4 models *(upstream)*
+- `d5a331825` osdi_bind: bind model levels to Verilog-A OSDI modules *(upstream)*
+- `b38611c94` tests/osdi: build the dummy modules as DLL on Cygwin/MinGW *(upstream)*
+- `f8f5e3cbe` trnoise: drop the #668 Wallace refill helper, superseded by upstream (com_sseed now calls initw on every seed path)
+- `c0d6cb32a` dctran (#1192): retry after a rejected step -- alternate the accepted solution and the failed iterate; correct accepted solution at the first point of a uic run
+- `afb999c32` xspice, pss shoot (#1192): restoring the carried event state no longer calls the code models' destroy callback
+- `3af96aaae` dctran (#1192): retry order -- the failed iterate first, then the accepted solution
