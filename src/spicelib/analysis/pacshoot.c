@@ -475,6 +475,7 @@ pac_ckt_has_events(CKTcircuit *ckt)
 }
 
 static int g_hid_nc, g_hid_nhy;   /* card #557, defined below with the hidden-state machinery */
+static int g_pac_freerun_rec = 0;   /* #1758: set by the pac_td_* entry points for a free-running (trigger=) orbit */
 static int pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname);
 static int
 pac_run_period(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
@@ -517,6 +518,38 @@ pac_run_period_inner(CKTcircuit *ckt, PSSan *job, double T, const char *jobname)
             }
         } else {
             recPoints = job->PSSpoints;
+            /* #1758: a free-running (trigger=) orbit records on at least PAC_FREERUN_POINTS (default 4000) points per
+               period when the card sets no pacpoints=. The orbit's phase mode (Floquet multiplier 1) amplifies the
+               recording passes' discretisation error about fsw/(2 pi f) times: R5 line-to-output at the deck's 200
+               points was 10.3 dB / 126 deg off a brute-force transient at 1.3 kHz and 0.6 dB / 7 deg at 56 kHz; at
+               4000 points within 0.07 dB / 0.2 deg from 1.3 to 56 kHz, for 0.02 s more. PAC_FREERUN_POINTS=0 keeps
+               PSS's own points= (red proof). */
+            if (g_pac_freerun_rec) {
+                static long frp = -1;
+                if (frp < 0) {
+                    const char *e = getenv("PAC_FREERUN_POINTS");
+                    frp = e ? atol(e) : 4000;
+                    if (frp < 0) frp = 0;
+                }
+                if (frp > recPoints) {
+                    static int noted = 0;
+                    if (!noted) {
+                        noted = 1;
+                        fprintf(stdout, "PAC-TD: free-running orbit: recording passes on %ld points per period (PSS points=%ld; "
+                                "set pacpoints= to choose; PAC_FREERUN_POINTS=0 keeps points=)\n", frp, job->PSSpoints);
+                    }
+                    recPoints = frp;
+                }
+            }
+        }
+    }
+    if (g_pac_freerun_rec && recPoints > 0 && recPoints < 4000) {   /* #1758 */
+        static int warned_coarse = 0;
+        if (!warned_coarse) {
+            warned_coarse = 1;
+            fprintf(stderr, "PAC-TD: WARNING -- free-running orbit recorded on only %ld points per period: the phase mode amplifies "
+                    "the discretisation error about fsw/(2 pi f) times (R5 line-to-output at 200 points: 10 dB off at 0.3 %% of fsw, "
+                    "0.6 dB at 13 %%); 4000 or more recommended.\n", recPoints);
         }
     }
     overriding = (recPoints > 0);
@@ -5353,24 +5386,11 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         if (trig_idx >= 0 && T > 0.0) {
             double fsw = 1.0 / T;
             double ratio = freqs[f] / fsw;
-            /* #1757: once per run, and below the lowest validated point. Line-to-output on R5 measured against a
-               brute-force transient is off at EVERY frequency checked (0.6 dB / 7 deg at 13 % of fsw, 1.8 dB /
-               40 deg at 2.4 %, 10 dB / 126 deg at 0.3 %): the period follows the line strongly, and the driven
-               boundary solve near the orbit's phase mode (Floquet multiplier 1, amplitude ~1/(wT)) is not
-               treated. Control-to-output was within 0.5 dB / 3 deg at 4.7 % and 14 % of fsw. */
-            static int freerun_noted = 0;
-            if (!freerun_noted && f == 0) {
-                freerun_noted = 1;
-                fprintf(stderr, "PAC-TD: WARNING -- free-running (trigger=) .pac/.pstb: the orbit's phase mode is "
-                        "not treated; validated only for control-to-output between 4.7 %% and 14 %% of fsw on one "
-                        "converter (within 0.5 dB / 3 deg). An input that moves the switching period (line-to-output "
-                        "on a hysteretic buck) was measured 0.6 to 10 dB and up to 126 deg off, worst at low "
-                        "frequency -- check against a transient before using the numbers.\n");
-            }
-            if (ratio < 0.047)
+            /* #1757/#1758: below the lowest point checked against a transient (R5 line-to-output, 0.32 % of fsw). */
+            if (ratio < 0.003)
                 fprintf(stderr, "PAC-TD: WARNING -- free-running (trigger=) .pac/.pstb result at f=%.6g Hz is "
-                        "below the validated band (f/fsw=%.4f < 0.047, fsw=%.6g Hz): near the orbit's phase mode "
-                        "the error grows as fsw/f (R5 line-to-output 10 dB off at 0.3 %% of fsw).\n",
+                        "below the lowest frequency checked against a transient (f/fsw=%.5f < 0.003, fsw=%.6g Hz); "
+                        "near the orbit's phase mode the discretisation error grows as fsw/f.\n",
                         freqs[f], ratio, fsw);
             if (ratio >= 0.10)
                 fprintf(stderr, "PAC-TD: WARNING -- free-running (trigger=) "
@@ -7058,6 +7078,7 @@ pac_td_pnoise(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         if (perr) { pac_map_free(&map); return perr; }
     }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    g_pac_freerun_rec = (trig_idx >= 0);   /* #1758: every pass of this analysis (detection, forward, adjoint, noise) on one grid */
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PNOISE-TD: REFUSED -- the trigger= node (free-running orbit) is not one of the circuit's state "
                 "rows (a capacitor / inductor state or a column of the charge matrix); pick a state node as trigger (card #557) -- "
@@ -7194,6 +7215,7 @@ pac_td_pac(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         if (perr) { pac_map_free(&map); return perr; }
     }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    g_pac_freerun_rec = (trig_idx >= 0);   /* #1758: every pass of this analysis (detection, forward, adjoint, noise) on one grid */
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PAC-TD: REFUSED -- the trigger= node (free-running "
                 "orbit, card #489) is not a native capacitor's own positive "
@@ -7408,6 +7430,7 @@ pac_td_pstb(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         if (perr) { pac_map_free(&map); return perr; }
     }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    g_pac_freerun_rec = (trig_idx >= 0);   /* #1758: every pass of this analysis (detection, forward, adjoint, noise) on one grid */
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PSTB: REFUSED -- the trigger= node (free-running "
                 "orbit, card #489) is not a native capacitor's own positive "
@@ -7762,6 +7785,7 @@ pac_td_pxf(CKTcircuit *ckt, PSSan *job, const double *x0, int n, double T,
         if (perr) { pac_map_free(&map); return perr; }
     }
     trig_idx = pac_find_trig_idx(&map, trig_node_num);
+    g_pac_freerun_rec = (trig_idx >= 0);   /* #1758: every pass of this analysis (detection, forward, adjoint, noise) on one grid */
     if (trig_node_num >= 0 && trig_idx < 0) {
         fprintf(stderr, "PXF-TD: REFUSED -- the trigger= node (free-running "
                 "orbit, card #489) is not a native capacitor's own positive "
