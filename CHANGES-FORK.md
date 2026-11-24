@@ -397,3 +397,15 @@ Also explained since s154: on the open-loop `d_pwm` buck at 100 kHz the injected
 - `c0d6cb32a` dctran (#1192): retry after a rejected step -- alternate the accepted solution and the failed iterate; correct accepted solution at the first point of a uic run
 - `afb999c32` xspice, pss shoot (#1192): restoring the carried event state no longer calls the code models' destroy callback
 - `3af96aaae` dctran (#1192): retry order -- the failed iterate first, then the accepted solution
+
+
+## s156 — free-running `.pac`/`.pstb`: line-to-output was up to 10 dB off; now within 0.07 dB of a transient
+
+2 commits.
+
+On a free-running converter (a hysteretic buck, `.pac ... trigger=`), td small-signal results depend on the time grid of the recording passes far more than on a clocked one: the orbit's phase (Floquet multiplier 1) amplifies their discretisation error by about f_sw/(2πf). Recorded on the deck's own 200 points per period, line-to-output on a 422 kHz hysteretic buck was 10.3 dB / 126° off a brute-force transient at 1.3 kHz, 1.8 dB / 40° at 10 kHz and still 0.6 dB / 7° at 56 kHz. The transient reference: the same circuit with a 1 V and a 0.5 V sine on the 12 V input, reltol 1e-7, a Hann-windowed Fourier component of the output; the two amplitudes agree within 0.05 dB.
+
+When the `.pac`/`.pstb`/`.pxf`/`.pnoise` card sets no `pacpoints=`, a free-running orbit's recording passes now use at least 4000 points per period (`PAC_FREERUN_POINTS`, a notice says so; the shooting PSS keeps its own `points=`). Line-to-output is then within 0.07 dB / 0.2° of the transient from 1.3 to 56 kHz, for about 0.02 s more per sweep; control-to-output, validated before at 20 and 60 kHz, moves slightly closer to its reference (0.04 dB / 0.47° and 0.002 dB / 0.05°). A free-running grid below 4000 points prints a warning, and so does a frequency below 0.3 % of f_sw (lower than anything checked). `PAC_FREERUN_POINTS=0` restores the old grid. New test suite: `test_freerun_pac` (59 suites).
+
+- `318dc3d0d` pacshoot (#1757): free-running .pac/.pstb warns once per run that the phase mode is not treated, and per point below 4.7 % of fsw
+- `4157ab650` pacshoot (#1758): free-running .pac/.pstb records on at least 4000 points per period by default
