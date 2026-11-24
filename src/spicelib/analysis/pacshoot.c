@@ -5353,6 +5353,25 @@ pac_engine_run(CKTcircuit *ckt, PSSan *job, PACstateMap *map, const double *x0, 
         if (trig_idx >= 0 && T > 0.0) {
             double fsw = 1.0 / T;
             double ratio = freqs[f] / fsw;
+            /* #1757: once per run, and below the lowest validated point. Line-to-output on R5 measured against a
+               brute-force transient is off at EVERY frequency checked (0.6 dB / 7 deg at 13 % of fsw, 1.8 dB /
+               40 deg at 2.4 %, 10 dB / 126 deg at 0.3 %): the period follows the line strongly, and the driven
+               boundary solve near the orbit's phase mode (Floquet multiplier 1, amplitude ~1/(wT)) is not
+               treated. Control-to-output was within 0.5 dB / 3 deg at 4.7 % and 14 % of fsw. */
+            static int freerun_noted = 0;
+            if (!freerun_noted && f == 0) {
+                freerun_noted = 1;
+                fprintf(stderr, "PAC-TD: WARNING -- free-running (trigger=) .pac/.pstb: the orbit's phase mode is "
+                        "not treated; validated only for control-to-output between 4.7 %% and 14 %% of fsw on one "
+                        "converter (within 0.5 dB / 3 deg). An input that moves the switching period (line-to-output "
+                        "on a hysteretic buck) was measured 0.6 to 10 dB and up to 126 deg off, worst at low "
+                        "frequency -- check against a transient before using the numbers.\n");
+            }
+            if (ratio < 0.047)
+                fprintf(stderr, "PAC-TD: WARNING -- free-running (trigger=) .pac/.pstb result at f=%.6g Hz is "
+                        "below the validated band (f/fsw=%.4f < 0.047, fsw=%.6g Hz): near the orbit's phase mode "
+                        "the error grows as fsw/f (R5 line-to-output 10 dB off at 0.3 %% of fsw).\n",
+                        freqs[f], ratio, fsw);
             if (ratio >= 0.10)
                 fprintf(stderr, "PAC-TD: WARNING -- free-running (trigger=) "
                         ".pac/.pstb result at f=%.6g Hz is inside the "
