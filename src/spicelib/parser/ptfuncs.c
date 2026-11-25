@@ -16,6 +16,7 @@ Author: 1987 Wayne A. Christopher, U. C. Berkeley CAD Group
 #include "ngspice/cktdefs.h"
 #include "inpxx.h"
 #include "ngspice/compatmode.h"
+#include "ngspice/cpextern.h"
 
 double PTfudge_factor;
 
@@ -424,13 +425,14 @@ PTnint(double arg1)
 }
 
 
-/* Calculate the derivative during a transient simulation.
+/* ddt() until s158 (set ddtlegacy): evaluated once per new time point, at its first
+   iteration, as (y_n - y_n-1) / (t_n-1 - t_n-2).
    If time == 0, return 0.
    If not transient sim, return 0.
    The derivative is then (y2-y1)/(t2-t1).
    */
-double
-PTddt(double arg, void* data)
+static double
+PTddt_legacy(double arg, void* data)
 {
     struct ddtdata { int n; double* vals; } *thing = (struct ddtdata*)data;
     double y, time;
@@ -473,4 +475,130 @@ PTddt(double arg, void* data)
     y = thing->vals[6];
 
     return y;
+}
+
+
+/* ddt(): the derivative of the converged waveform, by the circuit's own
+   integration formula (the one capacitors use, NIintegrate), so that
+   C * ddt(v(a,b)) equals the current of a capacitor C between a and b.
+
+   vals[0..6] is the state of ddt() as until s158 (PTddt_legacy, selected by
+   vals[DDT_LEGACY]); this one uses
+     vals[8]  time of the latest evaluation       vals[9]  its argument
+     vals[10] last accepted time                   vals[19] latest result
+     vals[11..17] arguments at the last 7 accepted points (newest first)
+     vals[18] result at the last accepted point    vals[20] accepted points held
+   A transient time point is t = t_acc + CKTdelta. When the time changes and
+   the latest evaluation was made at t - CKTdelta, that point was accepted
+   and its last (converged) argument and result enter the history; a
+   rejected point leaves it alone. The result is computed at every
+   iteration, with its Jacobian CKTag[0] (PTddt_derivative). */
+
+#define DDT_T    8
+#define DDT_X    9
+#define DDT_TACC 10
+#define DDT_XH   11   /* 11 .. 17 */
+#define DDT_YACC 18
+#define DDT_Y    19
+#define DDT_NH   20
+
+static void
+ddt_history(double *v, CKTcircuit *ckt)
+{
+    double t = ckt->CKTtime;
+
+    if (t != v[DDT_T]) {
+        double tacc = t - ckt->CKTdelta;
+        if (fabs(v[DDT_T] - tacc) <= 1e-6 * ckt->CKTdelta) {
+            int i;
+            for (i = 6; i > 0; i--)
+                v[DDT_XH + i] = v[DDT_XH + i - 1];
+            v[DDT_XH] = v[DDT_X];
+            v[DDT_YACC] = v[DDT_Y];
+            v[DDT_TACC] = v[DDT_T];
+            if (v[DDT_NH] < 7)
+                v[DDT_NH] += 1;
+        }
+    }
+}
+
+/* result and Jacobian at the present time point; returns 0 when the history
+   does not reach back to this point's previous accepted one */
+static int
+ddt_eval(double *v, CKTcircuit *ckt, double arg, double *y, double *dy)
+{
+    double *ag = ckt->CKTag;
+    int order = ckt->CKTorder, i;
+
+    ddt_history(v, ckt);
+    if (v[DDT_NH] < 1 || fabs(v[DDT_TACC] - (ckt->CKTtime - ckt->CKTdelta)) > 1e-6 * ckt->CKTdelta)
+        return 0;
+
+    if (ckt->CKTintegrateMethod == GEAR && order > 1 && v[DDT_NH] >= order) {
+        *y = ag[0] * arg;
+        for (i = 1; i <= order; i++)
+            *y += ag[i] * v[DDT_XH + i - 1];
+        *dy = ag[0];
+    } else if (ckt->CKTintegrateMethod == TRAPEZOIDAL && order == 2) {
+        *y = ag[0] * (arg - v[DDT_XH]) - ag[1] * v[DDT_YACC];
+        *dy = ag[0];
+    } else {        /* first order (also gear without enough history yet) */
+        *y = (arg - v[DDT_XH]) / ckt->CKTdelta;
+        *dy = 1 / ckt->CKTdelta;
+    }
+    return 1;
+}
+
+double
+PTddt(double arg, void* data)
+{
+    struct ddtdata { int n; double* vals; } *thing = (struct ddtdata*)data;
+    double *v = thing->vals;
+    CKTcircuit* ckt = ft_curckt->ci_ckt;
+    double t, y, dy;
+
+    t = ckt->CKTtime;
+
+    /* operating point, and the first point of a transient: the start of the
+       history; `.option ddtlegacy' or `set ddtlegacy' selects ddt() as
+       until s158 */
+    if (t == 0 || !(ckt->CKTmode & MODETRAN)) {
+        v[DDT_LEGACY] = cp_getvar("ddtlegacy", CP_BOOL, NULL, 0) ? 1 : 0;
+        if (v[DDT_LEGACY] != 0)
+            return PTddt_legacy(arg, data);
+        v[DDT_T] = t;
+        v[DDT_X] = arg;
+        v[DDT_Y] = 0;
+        v[DDT_NH] = 0;
+        return 0;
+    }
+
+    if (v[DDT_LEGACY] != 0)
+        return PTddt_legacy(arg, data);
+
+    if (!ddt_eval(v, ckt, arg, &y, &dy))
+        y = v[DDT_Y];   /* time went back past the history (a periodic
+                           analysis restarting its period): keep the latest
+                           result until a point is accepted again */
+
+    v[DDT_T] = t;
+    v[DDT_X] = arg;
+    v[DDT_Y] = y;
+    return y;
+}
+
+/* d ddt(arg) / d arg, for the Jacobian */
+double
+PTddt_derivative(double arg, void* data)
+{
+    struct ddtdata { int n; double* vals; } *thing = (struct ddtdata*)data;
+    double *v = thing->vals;
+    CKTcircuit* ckt = ft_curckt->ci_ckt;
+    double y, dy;
+
+    if (v[DDT_LEGACY] != 0)
+        return 0;
+    if (ckt->CKTtime == 0 || !(ckt->CKTmode & MODETRAN))
+        return 0;
+    return ddt_eval(v, ckt, arg, &y, &dy) ? dy : 0;
 }

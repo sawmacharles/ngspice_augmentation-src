@@ -175,6 +175,7 @@ static struct func {
     { "min",    PTF_MIN,    (void(*)(void)) PTmin},
     { "max",    PTF_MAX,    (void(*)(void)) PTmax},
     { "ddt",    PTF_DDT,    (void(*)(void)) PTddt},
+    { "ddt_derivative", PTF_DDT_DERIVATIVE, (void(*)(void)) PTddt_derivative},
 } ;
 
 #define NUM_FUNCS (int)NUMELEMS(funcs)
@@ -588,9 +589,17 @@ static INPparseNode *PTdifferentiate(INPparseNode * p, int varnum)
             arg1 = mkcon(0.0);
             break;
 
-        case PTF_DDT:
+        case PTF_DDT: /* d/dvar ddt(var): CKTag[0] (PTddt_derivative) */
+            if (p->left->type == PT_CONSTANT) {
+                arg1 = mkcon(0.0);
+            } else {
+                arg1 = mkf(PTF_DDT_DERIVATIVE, p->left);
+                arg1->data = p->data;
+            }
+            break;
+
+        case PTF_DDT_DERIVATIVE:
             arg1 = mkcon(0.0);
-            arg1->data = p->data;
             break;
 
         case PTF_MIN:
@@ -1143,12 +1152,14 @@ static INPparseNode *prepare_PTF_PWL(INPparseNode *p)
 static INPparseNode* prepare_PTF_DDT(INPparseNode* p)
 {
     struct ddtdata { int n; double* vals; } *data;
-    int i, ii;
-    /* store 3 recent times and 3 recent values in pairs t0, v0, t1, v1, t2, v2  */
-    i = 0;
+    int ii;
+    /* state of PTddt (ptfuncs.c): vals[0..6] for ddt() as until s158,
+       vals[8..20] for the current one, vals[DDT_LEGACY] selects (read at
+       the start of each transient, PTddt) */
     data = TMALLOC(struct ddtdata, 1);
-    data->vals = TMALLOC(double, 7);
-    for (ii = 0; ii < 7; ii++) {
+    data->n = 0;
+    data->vals = TMALLOC(double, DDT_NVALS);
+    for (ii = 0; ii < DDT_NVALS; ii++) {
         data->vals[ii] = 0;
     }
     p->data = (void*)data;

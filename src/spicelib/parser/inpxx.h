@@ -105,5 +105,8 @@ double PTceil(double arg);
 double PTfloor(double arg);
 double PTnint(double arg);
 double PTddt(double arg, void* data);
+double PTddt_derivative(double arg, void* data);
+#define DDT_LEGACY 23   /* vals[] index: 1 = ddt() as until s158 (set ddtlegacy) */
+#define DDT_NVALS  24
 
 #endif
