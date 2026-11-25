@@ -178,7 +178,7 @@ DIOnoise(int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt,
                                     inst->DIOnVar[LNLSTDENS][i], data);
                                 tempInoise = Nintegrate(noizDens[i] * data->GainSqInv,
                                     lnNdens[i] + data->lnGainInv,
-                                    inst->DIOnVar[LNLSTDENS][i] + data->lnGainInv,
+                                    inst->DIOnVar[LNLSTDENS][i] + data->lnGainInvLst,
                                     data);
                                 inst->DIOnVar[LNLSTDENS][i] = lnNdens[i];
                                 data->outNoiz += tempOnoise;

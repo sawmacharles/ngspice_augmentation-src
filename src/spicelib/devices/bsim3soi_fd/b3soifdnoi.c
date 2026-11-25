@@ -295,7 +295,7 @@ int i;
 						* data->GainSqInv, lnNdens[i]
 						+ data->lnGainInv,
 				                here->B3SOIFDnVar[LNLSTDENS][i]
-						+ data->lnGainInv, data);
+						+ data->lnGainInvLst, data);
 				           here->B3SOIFDnVar[LNLSTDENS][i] =
 						lnNdens[i];
 				           data->outNoiz += tempOnoise;

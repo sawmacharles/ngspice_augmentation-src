@@ -134,7 +134,7 @@ MESnoise (int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt, Ndata *d
 				      inst->MESnVar[LNLSTDENS][i], data);
 				tempInoise = Nintegrate(noizDens[i] * data->GainSqInv ,
 				      lnNdens[i] + data->lnGainInv,
-				      inst->MESnVar[LNLSTDENS][i] + data->lnGainInv,
+				      inst->MESnVar[LNLSTDENS][i] + data->lnGainInvLst,
 				      data);
 				inst->MESnVar[LNLSTDENS][i] = lnNdens[i];
 				data->outNoiz += tempOnoise;

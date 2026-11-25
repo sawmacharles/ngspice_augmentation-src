@@ -84,7 +84,7 @@ CSWnoise(int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt, Ndata *da
                                                   inst->CSWnVar[LNLSTDENS], data);
                         tempInNoise = Nintegrate(noizDens *
                                                  data->GainSqInv, lnNdens + data->lnGainInv,
-                                                 inst->CSWnVar[LNLSTDENS] + data->lnGainInv,
+                                                 inst->CSWnVar[LNLSTDENS] + data->lnGainInvLst,
                                                  data);
                         inst->CSWnVar[OUTNOIZ] += tempOutNoise;
                         inst->CSWnVar[INNOIZ] += tempInNoise;

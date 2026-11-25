@@ -197,7 +197,7 @@ int HSMHVnoise (
 		tempInoise = 
 		  Nintegrate(noizDens[i] * data->GainSqInv, 
 			     lnNdens[i] + data->lnGainInv,
-			     here->HSMHVnVar[LNLSTDENS][i] + data->lnGainInv,
+			     here->HSMHVnVar[LNLSTDENS][i] + data->lnGainInvLst,
 			     data);
 		here->HSMHVnVar[LNLSTDENS][i] = lnNdens[i];
 		data->outNoiz += tempOnoise;

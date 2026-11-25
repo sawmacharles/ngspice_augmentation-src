@@ -227,7 +227,7 @@ int OSDInoise(int mode, int operation, GENmodel *inModel, CKTcircuit *ckt,
               tempInoise =
                   Nintegrate(noise_dens[i] * data->GainSqInv,
                              noise_dens_ln[i] + data->lnGainInv,
-                             nVar(LNLSTDENS, i) + data->lnGainInv, data);
+                             nVar(LNLSTDENS, i) + data->lnGainInvLst, data);
               nVar(LNLSTDENS, i) = noise_dens_ln[i];
               data->outNoiz += tempOnoise;
               data->inNoise += tempInoise;

@@ -146,7 +146,7 @@ RESnoise(int mode, int operation, GENmodel*genmodel, CKTcircuit *ckt,
                                     data->GainSqInv, lnNdens[i] +
                                     data->lnGainInv,
                                     inst->RESnVar[LNLSTDENS][i] +
-                                    data->lnGainInv,
+                                    data->lnGainInvLst,
                                     data);
                                 inst->RESnVar[LNLSTDENS][i] = lnNdens[i];
                                 data->outNoiz += tempOutNoise;

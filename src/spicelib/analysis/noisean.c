@@ -327,6 +327,8 @@ NOISEan(CKTcircuit* ckt, int restart)
 
     data->lstFreq = data->freq;
 
+    data->lnGainInvLst = 0.0; /* set after each point; unused at the first */
+
 #ifdef XSPICE
     /* gtri - add - wbk - 12/19/90 - Set anal_init and anal_type */
 
@@ -475,6 +477,8 @@ NOISEan(CKTcircuit* ckt, int restart)
         error = CKTnoise(ckt, N_DENS, N_CALC, data);
         if (error) return(error);
         data->lstFreq = data->freq;
+
+        data->lnGainInvLst = data->lnGainInv; /* for the input-noise integral */
 
         /* update the frequency */
 

@@ -151,7 +151,7 @@ VDMOSnoise (int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt,
                       inst->VDMOSnVar[LNLSTDENS][i], data);
                 tempInoise = Nintegrate(noizDens[i] * data->GainSqInv ,
                       lnNdens[i] + data->lnGainInv,
-                      inst->VDMOSnVar[LNLSTDENS][i] + data->lnGainInv,
+                      inst->VDMOSnVar[LNLSTDENS][i] + data->lnGainInvLst,
                       data);
                 inst->VDMOSnVar[LNLSTDENS][i] = lnNdens[i];
                 data->outNoiz += tempOnoise;

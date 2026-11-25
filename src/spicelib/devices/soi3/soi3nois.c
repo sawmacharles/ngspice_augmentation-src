@@ -204,7 +204,7 @@ SOI3noise (int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt,
 				      inst->SOI3nVar[LNLSTDENS][i], data);
 				tempInoise = Nintegrate(noizDens[i] * data->GainSqInv ,
 				      lnNdens[i] + data->lnGainInv,
-				      inst->SOI3nVar[LNLSTDENS][i] + data->lnGainInv,
+				      inst->SOI3nVar[LNLSTDENS][i] + data->lnGainInvLst,
 				      data);
 				inst->SOI3nVar[LNLSTDENS][i] = lnNdens[i];
 				data->outNoiz += tempOnoise;

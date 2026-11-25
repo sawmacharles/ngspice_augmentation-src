@@ -562,7 +562,7 @@ double m;
                                                 * data->GainSqInv, lnNdens[i]
                                                 + data->lnGainInv,
                                                 here->BSIM4v7nVar[LNLSTDENS][i]
-                                                + data->lnGainInv, data);
+                                                + data->lnGainInvLst, data);
                                            here->BSIM4v7nVar[LNLSTDENS][i] =
                                                 lnNdens[i];
                                            data->outNoiz += tempOnoise;

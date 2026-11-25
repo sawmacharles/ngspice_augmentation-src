@@ -41,6 +41,7 @@ typedef struct {
     double inNoise;        /* integrated input noise as of the last frequency point */
     double GainSqInv;
     double lnGainInv;
+    double lnGainInvLst;   /* lnGainInv at lstFreq, for the input-noise integral */
     double lnFreq;
     double lnLastFreq;
     double delLnFreq;

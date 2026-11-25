@@ -220,7 +220,7 @@ VBICnoise (int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt, Ndata *
                                       inst->VBICnVar[LNLSTDENS][i], data);
                                 tempInoise = Nintegrate(noizDens[i] * data->GainSqInv ,
                                       lnNdens[i] + data->lnGainInv,
-                                      inst->VBICnVar[LNLSTDENS][i] + data->lnGainInv,
+                                      inst->VBICnVar[LNLSTDENS][i] + data->lnGainInvLst,
                                       data);
                                 inst->VBICnVar[LNLSTDENS][i] = lnNdens[i];
                                 data->outNoiz += tempOnoise;

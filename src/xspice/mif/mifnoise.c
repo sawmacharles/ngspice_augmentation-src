@@ -387,7 +387,7 @@ eval_declarative_group(MIFinstance *here, CKTcircuit *ckt, Ndata *data,
                 here->MIFnVar[LNLSTDENS * nsrcs + src_base + i], data);
             tempInNoise = Nintegrate(noizDens[i] * data->GainSqInv,
                 lnNdens[i] + data->lnGainInv,
-                here->MIFnVar[LNLSTDENS * nsrcs + src_base + i] + data->lnGainInv,
+                here->MIFnVar[LNLSTDENS * nsrcs + src_base + i] + data->lnGainInvLst,
                 data);
 
             here->MIFnVar[LNLSTDENS * nsrcs + src_base + i] = lnNdens[i];
@@ -670,7 +670,7 @@ MIFnoise(int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt,
                                 tempInNoise = Nintegrate(
                                     noizDens_p * data->GainSqInv,
                                     lnNdens_p + data->lnGainInv,
-                                    here->MIFnVar[LNLSTDENS * nsrcs + si] + data->lnGainInv,
+                                    here->MIFnVar[LNLSTDENS * nsrcs + si] + data->lnGainInvLst,
                                     data);
 
                                 here->MIFnVar[LNLSTDENS * nsrcs + si] = lnNdens_p;

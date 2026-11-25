@@ -208,7 +208,7 @@ MOS2noise(int mode, int operation, GENmodel * genmodel, CKTcircuit * ckt,
                                     inst->MOS2nVar[LNLSTDENS][i], data);
                                 tempInoise = Nintegrate(noizDens[i] * data->GainSqInv,
                                     lnNdens[i] + data->lnGainInv,
-                                    inst->MOS2nVar[LNLSTDENS][i] + data->lnGainInv,
+                                    inst->MOS2nVar[LNLSTDENS][i] + data->lnGainInvLst,
                                     data);
                                 inst->MOS2nVar[LNLSTDENS][i] = lnNdens[i];
                                 data->outNoiz += tempOnoise;

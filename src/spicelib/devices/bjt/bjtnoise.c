@@ -171,7 +171,7 @@ BJTnoise(int mode, int operation, GENmodel*genmodel, CKTcircuit *ckt,
                                     inst->BJTnVar[LNLSTDENS][i], data);
                                 tempInoise = Nintegrate(noizDens[i] * data->GainSqInv,
                                     lnNdens[i] + data->lnGainInv,
-                                    inst->BJTnVar[LNLSTDENS][i] + data->lnGainInv,
+                                    inst->BJTnVar[LNLSTDENS][i] + data->lnGainInvLst,
                                     data);
                                 inst->BJTnVar[LNLSTDENS][i] = lnNdens[i];
                                 data->outNoiz += tempOnoise;

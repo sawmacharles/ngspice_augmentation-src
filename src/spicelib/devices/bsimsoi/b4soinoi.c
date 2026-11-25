@@ -546,7 +546,7 @@ double m;
                                                 * data->GainSqInv, lnNdens[i]
                                                 + data->lnGainInv,
                                                 here->B4SOInVar[LNLSTDENS][i]
-                                                + data->lnGainInv, data);
+                                                + data->lnGainInvLst, data);
                                            here->B4SOInVar[LNLSTDENS][i] =
                                                 lnNdens[i];
                                            data->outNoiz += tempOnoise;

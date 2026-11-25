@@ -161,7 +161,7 @@ JFETnoise(int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt, Ndata *d
                                     inst->JFETnVar[LNLSTDENS][i], data);
                                 tempInoise = Nintegrate(noizDens[i] * data->GainSqInv,
                                     lnNdens[i] + data->lnGainInv,
-                                    inst->JFETnVar[LNLSTDENS][i] + data->lnGainInv,
+                                    inst->JFETnVar[LNLSTDENS][i] + data->lnGainInvLst,
                                     data);
                                 inst->JFETnVar[LNLSTDENS][i] = lnNdens[i];
                                 data->outNoiz += tempOnoise;

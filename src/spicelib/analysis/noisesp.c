@@ -240,6 +240,8 @@ NOISEsp (CKTcircuit *ckt, int restart)
 
     data->lstFreq = data->freq;
 
+    data->lnGainInvLst = 0.0; /* set after each point; unused at the first */
+
     /* do the noise analysis over all frequencies */
 
     while (data->freq <= job->NstopFreq + freqTol) {
@@ -300,6 +302,8 @@ NOISEsp (CKTcircuit *ckt, int restart)
         error = CKTnoise(ckt,N_DENS,N_CALC,data);
         if (error) return(error);
         data->lstFreq = data->freq;
+
+        data->lnGainInvLst = data->lnGainInv; /* for the input-noise integral */
 
         /* update the frequency */
 

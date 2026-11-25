@@ -137,7 +137,7 @@ MOS9noise (int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt,
 				      inst->MOS9nVar[LNLSTDENS][i], data);
 				tempInoise = Nintegrate(noizDens[i] * data->GainSqInv ,
 				      lnNdens[i] + data->lnGainInv,
-				      inst->MOS9nVar[LNLSTDENS][i] + data->lnGainInv,
+				      inst->MOS9nVar[LNLSTDENS][i] + data->lnGainInvLst,
 				      data);
 				inst->MOS9nVar[LNLSTDENS][i] = lnNdens[i];
 				data->outNoiz += tempOnoise;

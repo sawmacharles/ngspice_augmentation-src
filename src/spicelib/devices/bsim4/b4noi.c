@@ -627,7 +627,7 @@ double mult_i, mult_fn;
                         * data->GainSqInv, lnNdens[i]
                         + data->lnGainInv,
                                 here->BSIM4nVar[LNLSTDENS][i]
-                        + data->lnGainInv, data);
+                        + data->lnGainInvLst, data);
                            here->BSIM4nVar[LNLSTDENS][i] =
                         lnNdens[i];
                            data->outNoiz += tempOnoise;
