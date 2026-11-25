@@ -10,8 +10,8 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Since `s155`
   every later upstream commit up to `47eb8ad02` (2026-11-21) is picked on top, unchanged.
-- **This fork:** 248 commits on top of that base (87 of them upstream), the branch `main`.
-  Releases are the tags `s125` … `s158`; `s158` is the latest.
+- **This fork:** 250 commits on top of that base (87 of them upstream), the branch `main`.
+  Releases are the tags `s125` … `s159`; `s159` is the latest.
 - **Size of the change** (against upstream `47eb8ad02`): 92 files, about 27 000 lines added, 267 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
@@ -295,7 +295,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (61 at `s158`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (63 at `s159`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -309,7 +309,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s158` is attached to the [s158 release](../../releases/tag/s158)
+A Linux x86-64 binary of `s159` is attached to the [s159 release](../../releases/tag/s159)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -358,3 +358,4 @@ change on its own. The tags are:
 | s156 | free-running `.pac`/`.pstb` (`trigger=`): recording passes on at least 4000 points per period; line-to-output of a hysteretic buck was up to 10 dB off a transient, now within 0.07 dB |
 | s157 | MOS binning: a warning when a device sits exactly on a bin edge where the standard rule (since s155) and the older rule pick different cards; `.option binlegacy` restores the older choice |
 | s158 | `.noise`: `inoise_total` right where the gain changes across a frequency interval (a divider with a filter read 12 % high); `trrandom` on a current source no longer freezes after two values |
+| s159 | `ddt()` in B sources: the derivative of the converged waveform by the circuit's integration formula, with its Jacobian (was one step late; a B-source capacitor did not run); TXL/CPL lossy lines: history times no longer truncated to whole picoseconds, convolution slope per term (settled values were off by up to 10 % and moved with the step size); a warning for lossy TXL models |

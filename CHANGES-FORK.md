@@ -438,3 +438,17 @@ New test suite: `test_inoise_trrandom` (61 suites).
 
 - `ed57bcb2a` noise (#1830): integrate the input-referred noise with the gain of each end point
 - `8077f46d2` isrc (#1830): trrandom draws a new sample every TS, as the voltage source does
+
+
+## s159 — `ddt()`; TXL and CPL lossy lines
+
+2 commits.
+
+`ddt()` in B sources was evaluated once per new time point, at the first Newton iteration, as (y_n - y_n-1) / (t_n-1 - t_n-2), with a zero Jacobian: the values were not converged, the step was the previous one, a rejected point stayed in the history, and the result lagged one step (1.05 V at the 2 V edges of examples/ddt/ddt-test3.cir, where ddt(v(2))/1000 must equal v(1)-v(2)). A B-source capacitor `i = C*ddt(v)` behind a diode stopped with "Timestep too small". Now the history holds the converged argument at accepted points, the result is computed at every iteration by the formula capacitors use (trapezoidal order 1 and 2, gear up to 6), and its Jacobian goes into the matrix, so `C*ddt(v(a,b))` equals the current of a capacitor C: ddt-test3 to 5e-9 V with trapezoidal and gear; the B-source capacitor runs and matches a real one within 0.01 % of the peak with rejected steps, also in `.pss` shooting (the `ddt()` history is not a shooting state, so `.pss` takes one retry there). `.option ddtlegacy` (or `set ddtlegacy`) restores the old `ddt()`.
+
+The TXL and CPL lines kept their history times in whole picoseconds: a step that did not advance a whole ps skipped the history update, slopes used the truncated step, and the time overflowed after 2.1 ms. The convolution update also multiplied each term's c/x into the slope, so later terms used the product of all earlier ones. A step into an open TXL line settled to 1.00036 instead of 1 and drifted with the step size; a `txl` model with R/L above 1.6e9 (which runs as a single CPL line) settled 10 % low at 1 ps steps and 2.5 % high at 10 ps; the late tail of examples/TransmissionLines/cpl3_4_line.sp was 18 times a 400-section coupled ladder's. Now: exactly 1, within 0.3 %, within 8 %. The three-pole fit of both lines loses accuracy as the loss R*length/(2*Z0) grows (txl1_1_line.sp, an exact line as reference: 1 % at 0.23, 4 % at 0.35, 19 % at 0.72); a `txl` model above 0.2 now gets a warning that names the O element (LTRA), exact for an RLC line. Still open: cpl3_4_line.sp at steps of 5 ps and below (about 10 % off, as before).
+
+New test suites: `test_ddt`, `test_txl_cpl` (63 suites).
+
+- `2b934a7eb` ddt (#1831): derivative of the converged waveform by the circuit's integration formula, with its Jacobian
+- `ff152499d` txl, cpl (#1832): history times as doubles, per-term slope in the convolution update; warn for lossy TXL models
