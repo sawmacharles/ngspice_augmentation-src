@@ -511,7 +511,7 @@ char *INPdomodel(CKTcircuit *ckt, struct card *image, INPtables * tab)
     char *err = NULL;
     char *line;
     char *val;
-    double rval=0, lval=0;
+    double rval=0, lval=0, cval=0, lenval=0;
 
     NG_IGNORE(ckt);
 
@@ -935,8 +935,31 @@ char *INPdomodel(CKTcircuit *ckt, struct card *image, INPtables * tab)
 				  INPgetTok(&line,&val,1);
 				  lval = INPevaluate(&val, &error1, 1);
 				}
+				if ((strcmp(val,"C") == 0)  || (strcmp(val,"c") == 0)) {
+				  INPgetTok(&line,&val,1);
+				  cval = INPevaluate(&val, &error1, 1);
+				}
+				if (strcmp(val,"length") == 0) {
+				  INPgetTok(&line,&val,1);
+				  lenval = INPevaluate(&val, &error1, 1);
+				}
 				INPgetTok(&line,&val,1);
 			}
+		  /* #1832: the TXL and CPL lines fit the line's response with three
+		     poles; the fit loses accuracy as the loss R*length/(2*Z0) grows
+		     (examples/TransmissionLines/txl1_1_line.sp against an exact line:
+		     1 % at 0.23, 4 % at 0.35, 19 % at 0.72). The O element (LTRA) is
+		     exact for an RLC line. */
+		  if (rval > 0 && lval > 0 && cval > 0 && lenval > 0) {
+			  double alpha = rval * lenval / (2.0 * sqrt(lval / cval));
+			  if (alpha > 0.2)
+				  fprintf(stderr,
+					  "Warning: model %s (txl): loss R*length/(2*Z0) = %.3g; "
+					  "above 0.2 the TXL/CPL approximation can be off by several "
+					  "percent (19 %% at 0.72). The O element (ltra) with the same "
+					  "R, L, C, len is exact for an RLC line.\n",
+					  modname, alpha);
+		  }
 		  if(lval)
 			  rval = rval/lval;
 		  if (rval > 1.6e10) {

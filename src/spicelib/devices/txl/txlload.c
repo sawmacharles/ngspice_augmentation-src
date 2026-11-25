@@ -12,13 +12,16 @@ Author:	1992 Charles Hough
 
 
 static double ratio[MAX_CP_TX_LINES];
+
+/* tolerance for comparing history times (ps) */
+#define TXL_TEPS(t) (1.0e-6 + 1.0e-12 * fabs(t))
 static int update_cnv_txl(TXLine*, double);
 static VI_list_txl *new_vi_txl(void);
 static void free_vi_txl(VI_list_txl*);
-static int add_new_vi_txl(TXLinstance*,	CKTcircuit*, int);
-static int get_pvs_vi_txl(int, int, TXLine*, double*, double*, double*,	double*, double*, 
+static int add_new_vi_txl(TXLinstance*,	CKTcircuit*, double);
+static int get_pvs_vi_txl(double, double, TXLine*, double*, double*, double*,	double*, double*, 
 			  double*, double*, double*);
-static int right_consts_txl(TXLine*, int, int, double, double, int, int, CKTcircuit*);
+static int right_consts_txl(TXLine*, double, double, double, double, int, int, CKTcircuit*);
 static int update_delayed_cnv_txl(TXLine*, double);
 static int multC(double, double, double, double, double*, double*);
 static int expC(double,	double,	double, double*,	double*);
@@ -32,16 +35,17 @@ TXLload(GENmodel *inModel, CKTcircuit *ckt)
 	TXLinstance *here;
 	TXLine *tx, *tx2;
 	int k, l;
-	int time, time2;
+	double time, time2;   /* ps */
 	double h, h1, f;
-	int hint;
+	double hint;
 	double hf;
 	NODE *nd;
 	double v, v1, g;
 	int cond1;
 	CKTnode	*node;
 	VI_list_txl *vi, *vi_before;
-	int i, before, delta;
+	int i;
+	double before, delta;
 
 	double gmin;	 /* dc solution	*/
 
@@ -52,10 +56,13 @@ TXLload(GENmodel *inModel, CKTcircuit *ckt)
 
 	h = ckt->CKTdelta;
 	h1 = 0.5 * h;
-	time2 =	(int) (ckt->CKTtime * 1e12);
-	hint = (int)(h * 1e12);
+	/* times in ps, as doubles (they were truncated to whole ps, so a step
+	   that did not advance a whole ps skipped the history update and the
+	   slopes used the truncated step) */
+	time2 =	ckt->CKTtime * 1e12;
+	hint = h * 1e12;
 	hf = h * 1e12;
-	time = (int) ((ckt->CKTtime - ckt->CKTdelta) * 1e12);
+	time = (ckt->CKTtime - ckt->CKTdelta) * 1e12;
 
 	cond1= ckt->CKTmode & MODEDC;
 
@@ -82,7 +89,7 @@ TXLload(GENmodel *inModel, CKTcircuit *ckt)
 			vi_before = tx->vi_tail;
 			before = tx->vi_tail->time;
 
-			if (time > tx->vi_tail->time) {
+			if (time > tx->vi_tail->time + TXL_TEPS(time)) {
 
 				copy_tx(tx, here->txline2);
 				add_new_vi_txl(here, ckt, time);
@@ -314,7 +321,7 @@ update_cnv_txl(TXLine *tx, double h)
 {
    int i;
 
-   double ai, bi, ao, bo;
+   double ai, bi, ao, bo, bti, bto;
    double e, t;
 
    ai =	tx->in_node->V;
@@ -329,11 +336,13 @@ update_cnv_txl(TXLine *tx, double h)
       e	= tx->h1e[i];
     
       t	= tm->c	/ tm->x;
-      bi *= t;
-      bo *= t;
+      /* slope times this term's c/x (was multiplied into bi/bo, so the
+         second and third terms got the product of all earlier c/x) */
+      bti = bi * t;
+      bto = bo * t;
 
-      tm->cnv_i	= (tm->cnv_i - bi*h) * e + (e -	1.0)*(ai*t + 1.0e+12*bi/tm->x);
-      tm->cnv_o	= (tm->cnv_o - bo*h) * e + (e -	1.0)*(ao*t + 1.0e+12*bo/tm->x);
+      tm->cnv_i	= (tm->cnv_i - bti*h) * e + (e - 1.0)*(ai*t + 1.0e+12*bti/tm->x);
+      tm->cnv_o	= (tm->cnv_o - bto*h) * e + (e - 1.0)*(ao*t + 1.0e+12*bto/tm->x);
    }
    return (1);
 }
@@ -361,7 +370,7 @@ free_vi_txl(VI_list_txl	*q)
 
 
 static int 
-add_new_vi_txl(TXLinstance *here, CKTcircuit *ckt, int time)
+add_new_vi_txl(TXLinstance *here, CKTcircuit *ckt, double time)
 {
    VI_list_txl *vi;
    TXLine *tx, *tx2;
@@ -386,7 +395,7 @@ add_new_vi_txl(TXLinstance *here, CKTcircuit *ckt, int time)
 
 
 static int 
-get_pvs_vi_txl(int t1, int t2, TXLine *tx, double *v1_i, double	*v2_i, double *i1_i, double *i2_i, 
+get_pvs_vi_txl(double t1, double t2, TXLine *tx, double *v1_i, double	*v2_i, double *i1_i, double *i2_i, 
 	       double *v1_o, double *v2_o, double *i1_o, double	*i2_o)
 {
    double ta, tb; 
@@ -445,10 +454,11 @@ get_pvs_vi_txl(int t1, int t2, TXLine *tx, double *v1_i, double	*v2_i, double *i
       }
        */
       ratio[0] = f = (tb - t1) / (t2 - t1);
-      if (vi)
-	 for (;	vi->time != t1;	vi = vi->next)
-	    ;
-      else 
+      /* the history point at t1 (the last accepted time) */
+      if (vi) {
+	 while (vi->next && fabs(vi->time - t1) > TXL_TEPS(t1))
+	    vi = vi->next;
+      } else
 	 vi = vi1;
       f	= 1 - f;
       *v2_i = vi->v_i *	f;
@@ -471,7 +481,7 @@ get_pvs_vi_txl(int t1, int t2, TXLine *tx, double *v1_i, double	*v2_i, double *i
 
 
 static int
-right_consts_txl(TXLine	*tx, int t, int	time, double h,	double h1, int l1, int l2, CKTcircuit *ckt)
+right_consts_txl(TXLine	*tx, double t, double time, double h,	double h1, int l1, int l2, CKTcircuit *ckt)
 /***  h1 = 0.5 * h  ***/
 {
    int i;

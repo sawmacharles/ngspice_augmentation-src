@@ -280,7 +280,7 @@ struct rline {
 typedef struct linked_lists_of_vi_txl{
    struct linked_lists_of_vi_txl *next;
    struct linked_lists_of_vi_txl *pool;
-   int time;
+   double time;   /* in ps; was int: truncated each step, overflowed at 2.1 ms */
    /* charles 2,2 
    float v_i, v_o;
    float i_i, i_o;  
@@ -292,7 +292,7 @@ typedef struct linked_lists_of_vi_txl{
 typedef struct linked_lists_of_vi{
    struct linked_lists_of_vi *next;
    struct linked_lists_of_vi *pool;
-   int time;
+   double time;   /* in ps; was int: truncated each step, overflowed at 2.1 ms */
    double v_i[MAX_CP_TX_LINES], v_o[MAX_CP_TX_LINES];
    double i_i[MAX_CP_TX_LINES], i_o[MAX_CP_TX_LINES];  
 } VI_list;

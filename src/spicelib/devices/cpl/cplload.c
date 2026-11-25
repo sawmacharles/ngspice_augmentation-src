@@ -13,9 +13,12 @@ Author:	1992 Charles Hough
 
 VI_list	*pool_vi;
 static double ratio[MAX_CP_TX_LINES];
+
+/* tolerance for comparing history times (ps) */
+#define CPL_TEPS(t) (1.0e-6 + 1.0e-12 * fabs(t))
 static VI_list *new_vi(void);
 static void free_vi(VI_list*);
-static int get_pvs_vi(int t1, int t2,
+static int get_pvs_vi(double t1, double t2,
                       CPLine *cp,
                       double  v1_i[MAX_CP_TX_LINES][MAX_CP_TX_LINES],
                       double  v2_i[MAX_CP_TX_LINES][MAX_CP_TX_LINES],
@@ -26,8 +29,8 @@ static int get_pvs_vi(int t1, int t2,
                       double  i1_o[MAX_CP_TX_LINES][MAX_CP_TX_LINES],
                       double  i2_o[MAX_CP_TX_LINES][MAX_CP_TX_LINES]);
 static int update_cnv(CPLine*, double);
-static int add_new_vi(CPLinstance*, CKTcircuit*, int);
-static int right_consts(CPLinstance*, CPLine*, int, int, double, double, int*, int*, CKTcircuit*);
+static int add_new_vi(CPLinstance*, CKTcircuit*, double);
+static int right_consts(CPLinstance*, CPLine*, double, double, double, double, int*, int*, CKTcircuit*);
 static int update_delayed_cnv(CPLine*, double);
 static int multC(double, double, double, double, double*, double*);
 static int expC(double,	double,	double,	double*, double*);
@@ -43,7 +46,7 @@ CPLload(GENmodel *inModel, CKTcircuit *ckt)
 	CPLinstance *here;
 	CPLine *cp, *cp2;
 	int *k_p, *l_p;
-	int time, time2;
+	double time, time2;   /* ps */
 	double h, h1, f;
 /*	int hint; never used */
 	double hf;
@@ -54,17 +57,20 @@ CPLload(GENmodel *inModel, CKTcircuit *ckt)
 	int noL, m, p, q;
 	CKTnode	*node;
 	VI_list	*vi, *vi_before;
-	int before, delta;
+	double before, delta;
 	int resindex;
 
 	double gmin;	 /* dc solution	*/
 
 	h = ckt->CKTdelta;
 	h1 = 0.5 * h;
-	time2 =	(int) (ckt->CKTtime * 1e12);
+	/* times in ps, as doubles (they were truncated to whole ps, so a step
+	   that did not advance a whole ps skipped the history update and the
+	   slopes used the truncated step) */
+	time2 =	ckt->CKTtime * 1e12;
 /*	hint = (int)(h * 1e12); never used */
 	hf = h * 1e12;
-	time = (int) ((ckt->CKTtime - ckt->CKTdelta) * 1e12);
+	time = (ckt->CKTtime - ckt->CKTdelta) * 1e12;
 
 	cond1= ckt->CKTmode & MODEDC;
 
@@ -96,7 +102,7 @@ CPLload(GENmodel *inModel, CKTcircuit *ckt)
 			before = cp->vi_tail->time;
 			vi_before = cp->vi_tail;
 
-			if (time > cp->vi_tail->time) {
+			if (time > cp->vi_tail->time + CPL_TEPS(time)) {
 
 				copy_cp(cp, here->cplines2);
 				add_new_vi(here, ckt, time);
@@ -414,7 +420,7 @@ copy_cp(CPLine *new, CPLine *old)
 
 
 static int
-right_consts(CPLinstance *here,	CPLine *cp, int	t, int time, double h, double h1,
+right_consts(CPLinstance *here,	CPLine *cp, double t, double time, double h, double h1,
 	     int *l1, int *l2, CKTcircuit *ckt)
 {
    int i, j, k,	l;
@@ -589,7 +595,7 @@ update_cnv(CPLine *cp, double h)
 {
    int i, j, k;
    int noL;
-   double ai, bi, ao, bo;
+   double ai, bi, ao, bo, bti, bto;
    double e, t;
    TMS *tms;
    TERM	*tm;
@@ -625,11 +631,13 @@ update_cnv(CPLine *cp, double h)
 	  e = cp->h1e[j][k][i];
 
 	  t = tm->c / tm->x;
-	  bi *=	t;
-	  bo *=	t;
+	  /* slope times this term's c/x (was multiplied into bi/bo, so the
+	     second and third terms got the product of all earlier c/x) */
+	  bti = bi * t;
+	  bto = bo * t;
 
-	  tm->cnv_i = (tm->cnv_i - bi*h) * e + (e - 1.0)*(ai*t + 1.0e+12*bi/tm->x);
-	  tm->cnv_o = (tm->cnv_o - bo*h) * e + (e - 1.0)*(ao*t + 1.0e+12*bo/tm->x);
+	  tm->cnv_i = (tm->cnv_i - bti*h) * e + (e - 1.0)*(ai*t + 1.0e+12*bti/tm->x);
+	  tm->cnv_o = (tm->cnv_o - bto*h) * e + (e - 1.0)*(ao*t + 1.0e+12*bto/tm->x);
 	   }
      }
       }
@@ -662,7 +670,7 @@ free_vi(VI_list	*q)
 
 
 static int
-add_new_vi(CPLinstance *here, CKTcircuit *ckt, int time)
+add_new_vi(CPLinstance *here, CKTcircuit *ckt, double time)
 {
    VI_list *vi;
    int i, noL;
@@ -695,7 +703,7 @@ add_new_vi(CPLinstance *here, CKTcircuit *ckt, int time)
 
 
 static int
-get_pvs_vi(int t1, int t2,
+get_pvs_vi(double t1, double t2,
    CPLine *cp,
    double v1_i[MAX_CP_TX_LINES][MAX_CP_TX_LINES],
    double v2_i[MAX_CP_TX_LINES][MAX_CP_TX_LINES],

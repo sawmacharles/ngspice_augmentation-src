@@ -20,7 +20,7 @@ TXLaccept(CKTcircuit *ckt, GENmodel *inModel)
 {
      TXLmodel *model = (TXLmodel *)inModel;
      TXLinstance *here;
-	int hint;
+	double hint;   /* ps */
 	double h, v, v1;
 	NODE *nd;
 	TXLine *tx;
@@ -33,8 +33,8 @@ TXLaccept(CKTcircuit *ckt, GENmodel *inModel)
                 here=TXLnextInstance(here)) {
             
 			h = ckt->CKTdelta;
-			hint = (int) (h * 1e12);
-			if (hint != 0) {
+			hint = h * 1e12;
+			if (hint > 0) {
 				tx = here->txline;
 				nd = tx->in_node;
 				if (nd->dvtag == 0) {
