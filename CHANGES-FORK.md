@@ -424,3 +424,17 @@ Since s155 (upstream 03ef19244, 2026-10-30) a size is binned by the standard rul
 Tried and left out: a transient rescue that retries a would-be "Timestep too small" with a temporary shunt on every node. On that buck it never got past the failing instant.
 
 - `689a8c6d2` binning (#1766): .option binlegacy restores the bin choice before 2026-10-30; warn at bin edges where the rules differ
+
+
+## s158 — `.noise` input-referred total; `trrandom` on current sources
+
+2 commits.
+
+`inoise_total` is the integral over frequency of the output noise divided by the gain. Every noise source integrated each frequency interval with the gain of the interval's upper end at both ends, so the total was wrong wherever the gain changes over an interval, and it depended on the number of points per decade. A resistive divider with a filter capacitor, whose input-referred density is flat, read 6.459960e-06 instead of the plain divider's 5.757760e-06 (examples/noise/resdiv.cir); examples/various/bjtnoise.cir read 4.701227e-06 against 4.384e-06 by hand. Each point now keeps its gain and the lower end of the interval uses it: 5.757760e-06 and 4.384172e-06, the same at 10 and at 1000 points per decade. `onoise` and the spectra do not change. This covers every device's noise code (34 files) and the noise of `.sp`.
+
+A current source with `trrandom` drew a new value only when a time point fell within 3 ulps of a multiple of TS while a breakpoint was taken, and never set its first breakpoint; next to a voltage source with the same TS (whose breakpoints drift by the minimum break per period) it stopped after two values and stayed constant. It now keeps the time of the next value and sets a breakpoint at each one, like the voltage source; with a seed, a current source alone gives the voltage source's sequence.
+
+New test suite: `test_inoise_trrandom` (61 suites).
+
+- `ed57bcb2a` noise (#1830): integrate the input-referred noise with the gain of each end point
+- `8077f46d2` isrc (#1830): trrandom draws a new sample every TS, as the voltage source does
