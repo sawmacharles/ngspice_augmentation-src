@@ -47,9 +47,9 @@
 #define GMIN 1e-12
 
 // Functions
-#define sqr(x) (x*x)
-#define cubic(x) (x*x*x)
-#define quadr(x) (x*x*x*x)
+#define sqr(x) ((x)*(x))
+#define cubic(x) ((x)*(x)*(x))
+#define quadr(x) ((x)*(x)*(x)*(x))
 
 #define coth(x) (1.0/tanh(x))
 #define sech(x) (1.0/cosh(x))

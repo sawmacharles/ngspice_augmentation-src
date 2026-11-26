@@ -536,7 +536,7 @@ void cpmslineAnalyseDispersion (double W, double h, double s,
     double fn = frequency * h * 1e-6;
 
     // even relative dielectric constant dispersion
-    p1 = 0.27488 * (0.6315 + 0.525 / pow (1 + 0.0157 * fn, 20.)) * ue -
+    p1 = 0.27488 + (0.6315 + 0.525 / pow (1 + 0.0157 * fn, 20.)) * ue -
       0.065683 * exp (-8.7513 * ue);
     p2 = 0.33622 * (1 - exp (-0.03442 * er));
     p3 = 0.0363 * exp (-4.6 * ue) * (1 - exp (- pow (fn / 38.7, 4.97)));
@@ -550,7 +550,7 @@ void cpmslineAnalyseDispersion (double W, double h, double s,
 
     // odd relative dielectric constant dispersion
     double p8, p9, p10, p11, p12, p13, p14, p15, Fo;
-    p1 = 0.27488 * (0.6315 + 0.525 / pow (1 + 0.0157 * fn, 20.)) * uo -
+    p1 = 0.27488 + (0.6315 + 0.525 / pow (1 + 0.0157 * fn, 20.)) * uo -
       0.065683 * exp (-8.7513 * uo);
     p3 = 0.0363 * exp (-4.6 * uo) * (1 - exp (- pow (fn / 38.7, 4.97)));
     p8 = 0.7168 * (1 + 1.076 / (1 + 0.0576 * (er - 1)));
