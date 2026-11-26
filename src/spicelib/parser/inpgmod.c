@@ -408,6 +408,69 @@ binnable_type(int type)
 }
 
 
+/* #1191: index of the binned cards by base name (the name without its trailing ".<digits>"), in modtab order.
+   Subcircuits that carry their own binned .model cards (sky130 and other PDKs) give every instance its own copy
+   of the cards, so modtab grows with the circuit, and scanning all of it for every instance was quadratic: a
+   5120-transistor sky130 netlist spent 12 minutes here. The index is rebuilt when modtab changes (models are
+   prepended, so its head pointer changes) and lists exactly the cards model_name_match(name, card) == 2 selects,
+   in the same order. BINSEL_SCAN=1 keeps the old full scan (red proof). */
+typedef struct { INPmodel **v; int n, cap; } bin_list;
+static NGHASHPTR  bin_index = NULL;
+static INPmodel  *bin_index_head = NULL;
+static NGHASHPTR  bin_index_modhash = NULL;
+
+static void
+bin_list_free(void *p)
+{
+    bin_list *b = (bin_list *) p;
+    tfree(b->v);
+    tfree(b);
+}
+
+static void
+bin_key_free(void *p)
+{
+    tfree(p);
+}
+
+static void
+bin_index_build(void)
+{
+    INPmodel *m;
+    if (bin_index)
+        nghash_free(bin_index, bin_list_free, bin_key_free);
+    bin_index = nghash_init(NGHASH_MIN_SIZE);
+    nghash_unique(bin_index, TRUE);
+    for (m = modtab; m; m = m->INPnextModel) {
+        const char *name = m->INPmodName, *dot = strrchr(name, '.'), *p;
+        bin_list *b;
+        char *key;
+        if (!dot || dot == name || dot[1] == '\0')
+            continue;
+        for (p = dot + 1; *p; p++)
+            if (!isdigit_c(*p))
+                break;
+        if (*p)
+            continue;
+        key = copy_substring(name, dot);
+        b = (bin_list *) nghash_find(bin_index, key);
+        if (!b) {
+            b = TMALLOC(bin_list, 1);
+            nghash_insert(bin_index, key, b);   /* the table keeps key */
+        } else {
+            tfree(key);
+        }
+        if (b->n == b->cap) {
+            b->cap = b->cap ? 2 * b->cap : 8;
+            b->v = TREALLOC(INPmodel *, b->v, b->cap);
+        }
+        b->v[b->n++] = m;
+    }
+    bin_index_head = modtab;
+    bin_index_modhash = modtabhash;
+}
+
+
 /* The card for sizes l and w among the binned cards of model name: by the standard rule (with outermax as
    given), or by the legacy rule. *err is set for a card of unknown device type. */
 static INPmodel *
@@ -424,9 +487,24 @@ bin_select(char *name, double l, double w, double w_nf, bool outermax, bool lega
     bool         parse_found[4];
     static char *model_tokens[] = { "lmin", "lmax", "wmin", "wmax" };
 
-    for (modtmp = modtab; modtmp; modtmp = modtmp->INPnextModel) {
+    static int scan = -1;
+    bin_list *cands = NULL;
+    int ci = 0;
 
-        if (model_name_match(name, modtmp->INPmodName) < 2)
+    if (scan < 0)
+        scan = getenv("BINSEL_SCAN") ? 1 : 0;
+    if (!scan) {
+        if (!bin_index || bin_index_head != modtab || bin_index_modhash != modtabhash)
+            bin_index_build();
+        cands = (bin_list *) nghash_find(bin_index, name);
+        if (!cands)
+            return NULL;
+    }
+
+    for (modtmp = scan ? modtab : cands->v[0]; modtmp;
+         modtmp = scan ? modtmp->INPnextModel : (++ci < cands->n ? cands->v[ci] : NULL)) {
+
+        if (scan && model_name_match(name, modtmp->INPmodName) < 2)
             continue;
 
         /* skip if not binnable */
