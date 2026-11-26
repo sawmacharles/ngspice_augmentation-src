@@ -1596,6 +1596,24 @@ int Size_Not_Found, i;
                                     pParam->BSIM4v5weffCJ, DMCGeff, DMCIeff, DMDGeff,
                                     &dumPs, &(here->BSIM4v5Pdeff), &dumAs, &dumAd);
 
+              /* #1793: a negative effective perimeter is set to zero, as BSIM 4.6.2 and later do (bsim4v6, bsim4).
+                 With PD = 0 given and permod = 1 (sky130's 5 V devices pass pd = 0), Pdeff was -Weff*nf: the
+                 sidewall junction capacitance czbdsw = cjswd*Pdeff < 0 was left out in reverse bias but added in
+                 forward bias, so the junction capacitance jumped at zero bias (forward bias could even give a
+                 negative capacitance) and Newton cycled across it ("timestep too small" when a switch node swings
+                 below ground). Reverse-bias charge is unchanged. BSIM4V5_PERIM_LEGACY=1 keeps the negative values
+                 (red proof). */
+              {   static int perim_legacy = -1;
+                  if (perim_legacy < 0)
+                      perim_legacy = getenv("BSIM4V5_PERIM_LEGACY") ? 1 : 0;
+                  if (!perim_legacy) {
+                      if (here->BSIM4v5Pseff < 0.0)
+                          here->BSIM4v5Pseff = 0.0;
+                      if (here->BSIM4v5Pdeff < 0.0)
+                          here->BSIM4v5Pdeff = 0.0;
+                  }
+              }
+
               if (here->BSIM4v5sourceAreaGiven)
                   here->BSIM4v5Aseff = here->BSIM4v5sourceArea;
               else
