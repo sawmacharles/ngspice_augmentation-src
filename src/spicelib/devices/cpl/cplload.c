@@ -630,14 +630,28 @@ update_cnv(CPLine *cp, double h)
 
 	  e = cp->h1e[j][k][i];
 
-	  t = tm->c / tm->x;
-	  /* slope times this term's c/x (was multiplied into bi/bo, so the
-	     second and third terms got the product of all earlier c/x) */
-	  bti = bi * t;
-	  bto = bo * t;
-
-	  tm->cnv_i = (tm->cnv_i - bti*h) * e + (e - 1.0)*(ai*t + 1.0e+12*bti/tm->x);
-	  tm->cnv_o = (tm->cnv_o - bto*h) * e + (e - 1.0)*(ao*t + 1.0e+12*bto/tm->x);
+	  /* #1850: the history is advanced with the same trapezoidal rule the load uses for the
+	     present step (right_consts: cnv*e + h/2*c*(e*v_prev + v_new)), so the two are
+	     consistent. s159-s161 used the exact piecewise-linear integral with the slope times
+	     each term's own c/x: mismatched with the trapezoidal load, coupled lines went
+	     unstable at steps of 10 ps and below (2 lines at 1 ps: 12 V from a 5 V source).
+	     The code before s159 multiplied every earlier term's c/x into the slope.
+	     CPL_HIST_S159=1 restores the s159-s161 update (red proof). */
+	  {   static int s159 = -1;
+	      if (s159 < 0)
+	          s159 = getenv("CPL_HIST_S159") ? 1 : 0;
+	      if (s159) {
+	          t = tm->c / tm->x;
+	          bti = bi * t;
+	          bto = bo * t;
+	          tm->cnv_i = (tm->cnv_i - bti*h) * e + (e - 1.0)*(ai*t + 1.0e+12*bti/tm->x);
+	          tm->cnv_o = (tm->cnv_o - bto*h) * e + (e - 1.0)*(ao*t + 1.0e+12*bto/tm->x);
+	      } else {
+	          double hs2 = 0.5e-12 * h;   /* h is in ps */
+	          tm->cnv_i = tm->cnv_i * e + hs2 * tm->c * (e * (ai - bi * h) + ai);
+	          tm->cnv_o = tm->cnv_o * e + hs2 * tm->c * (e * (ao - bo * h) + ao);
+	      }
+	  }
 	   }
      }
       }
