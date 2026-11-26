@@ -507,3 +507,14 @@ PDK subcircuits that carry their own binned `.model` cards (sky130's `sky130_fd_
 New test suite: `test_binsel_scale` (66 suites).
 
 - `a17e30be5` inpgmod (#1191): index the binned model cards by base name; binning no longer scans the whole model table for every instance
+
+
+## s165 — KLU by default for large circuits
+
+1 commit.
+
+`.options autoklu` (opt-in until now) is now on by default: a circuit whose node count reaches `autoklu_threshold` (2000) and that names no solver switches to KLU before the matrix is built, with a note. On the generated 5120-transistor sky130 netlist of s164 the default SPARSE solver spent 26 s factoring the matrix and KLU 1.8 s; the whole run went from 86 s to 47 s with the same measurements. `.options sparse`, `.options autoklu=0` or `NGSPICE_AUTOKLU=0` keep SPARSE; an explicit `.options klu` or `.options sparse` always wins; circuits below the threshold are unchanged.
+
+New test suite: `test_autoklu_default` (67 suites).
+
+- `ccd51733a` autoklu (#1907): on by default; a circuit of 2000 nodes or more that states no solver runs on KLU
