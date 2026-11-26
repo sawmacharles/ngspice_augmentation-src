@@ -452,3 +452,14 @@ New test suites: `test_ddt`, `test_txl_cpl` (63 suites).
 
 - `2b934a7eb` ddt (#1831): derivative of the converged waveform by the circuit's integration formula, with its Jacobian
 - `ff152499d` txl, cpl (#1832): history times as doubles, per-term slope in the convolution update; warn for lossy TXL models
+
+
+## s160 — XSPICE microstrip lines (`mlin`, `cpmlin`)
+
+1 commit.
+
+`src/xspice/tlines/tline_common.h` defined `sqr(x)` as `(x*x)` (also `cubic`, `quadr`) with no parentheses round x, so `sqr(er - 1)` evaluated to -1 whatever er was, and `sqr(1 + 2*log10(1 + W/h))` to 1 + 4*log10(1 + W/h). That hit the Hammerstad-Jensen coupled-line quasi-static model (the r term), the Kirschning-Jansen coupled-line impedance dispersion (q16, q25, q29) and the Yamashita single-line dispersion. The coupled-line Kirschning P1 also read 0.27488 * (...) where the single-line P1 in the same file and the published formula have 0.27488 + (...). On examples/xspice/transmission_lines/cpmline_ac.cir |S31| at 4.2 GHz moves from 0.254 to 0.290. Against the model equations written out with real squares (lossless lines, closed-form impedance matrix), s159 was 9.0 % off on `cpmlin` (model=0, disp=0) and 10.5 % on `mlin disp=2`; s160 agrees to 1e-12. The other `mlin` dispersion models did not change. Reported on the public example deck by a downstream user.
+
+New test suite: `test_tline_macros` (64 suites).
+
+- `8b6727717` tlines (#1885): parenthesise the sqr/cubic/quadr macros; coupled-line Kirschning P1 with +
