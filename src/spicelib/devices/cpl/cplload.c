@@ -618,12 +618,29 @@ update_cnv(CPLine *cp, double h)
 	   t = tm->c / tm->x;
 	   update_cnv_a(tms, h,	ai, ao,	ai - bi	* h, ao	- bo * h,
 	      cp->h1e[j][k][1],	cp->h1e[j][k][2]);
-	   bi *= t;
-	   bo *= t;
-	   tm->cnv_i = (tm->cnv_i - bi*h) * e +	(e - 1.0)*(ai*t	+
-	      1.0e+12*bi/tm->x);
-	   tm->cnv_o = (tm->cnv_o - bo*h) * e +	(e - 1.0)*(ao*t	+
-	      1.0e+12*bo/tm->x);
+	   /* #1850: the real pole of a complex-pole entry is advanced with the trapezoidal rule the
+	      load uses for it (right_consts), like the complex pair (update_cnv_a) and the real-pole
+	      entries (#1893). The exact piecewise-linear update used here before did not match, and
+	      lines with three or more conductors (whose fits have complex poles) settled to the
+	      wrong level at small steps: examples/TransmissionLines/cpl3_4_line.sp v(6) at 30 ns
+	      5.03 V at tmax 50 ps, 4.51 V at 5 ps, 3.72 V at 1 ps (stock ngspice the same), a
+	      400-section coupled ladder 4.985 V. CPL_IMG_EXACT=1 restores the old update (red proof). */
+	   {   static int img_exact = -1;
+	       if (img_exact < 0)
+	           img_exact = getenv("CPL_IMG_EXACT") ? 1 : 0;
+	       if (img_exact) {
+	           bi *= t;
+	           bo *= t;
+	           tm->cnv_i = (tm->cnv_i - bi*h) * e +	(e - 1.0)*(ai*t	+
+	              1.0e+12*bi/tm->x);
+	           tm->cnv_o = (tm->cnv_o - bo*h) * e +	(e - 1.0)*(ao*t	+
+	              1.0e+12*bo/tm->x);
+	       } else {
+	           double hs2 = 0.5e-12 * h;   /* h is in ps */
+	           tm->cnv_i = tm->cnv_i * e + hs2 * tm->c * (e * (ai - bi * h) + ai);
+	           tm->cnv_o = tm->cnv_o * e + hs2 * tm->c * (e * (ao - bo * h) + ao);
+	       }
+	   }
 	} else
 	   for (i = 0; i < 3; i++) {
 	  tm = &(cp->h1t[j][k]->tm[i]);
