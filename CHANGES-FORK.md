@@ -496,3 +496,14 @@ The CPL line predicts each step with the trapezoidal rule; s162 made the real-po
 Test suite `test_txl_cpl`: the coupled-line check now runs at 50, 5 and 1 ps with 0.1 % on the ladder; one red-proof check added.
 
 - `588873f58` cpl (#1850): advance the real pole of complex-pole entries with the load's trapezoidal rule; 3- and 4-line CPL no longer depend on the step
+
+
+## s164 — model binning without a full table scan per instance
+
+1 commit.
+
+PDK subcircuits that carry their own binned `.model` cards (sky130's `sky130_fd_pr__nfet_01v8` and the like) give every instance its own copy of the cards, so the model table grows with the circuit. The bin choice scanned the whole table for every instance (twice since the s157 bin-edge check), so set-up time grew with the square of the transistor count. A generated sky130 netlist of 64 chains of 40 inverters (5120 transistors) with RC parasitics and coupling capacitors took 730 s, 12 minutes of it before the transient started. The binned cards are now indexed by base name (the card name without its trailing `.<digits>`), in model-table order, so the same card is chosen; the index is rebuilt when the table changes. The same netlist now takes 86 s with identical results (52 s with `.option klu`). `BINSEL_SCAN=1` in the environment keeps the full scan.
+
+New test suite: `test_binsel_scale` (66 suites).
+
+- `a17e30be5` inpgmod (#1191): index the binned model cards by base name; binning no longer scans the whole model table for every instance
