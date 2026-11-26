@@ -10,8 +10,8 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Since `s155`
   every later upstream commit up to `47eb8ad02` (2026-11-21) is picked on top, unchanged.
-- **This fork:** 253 commits on top of that base (87 of them upstream), the branch `main`.
-  Releases are the tags `s125` … `s162`; `s162` is the latest.
+- **This fork:** 254 commits on top of that base (87 of them upstream), the branch `main`.
+  Releases are the tags `s125` … `s163`; `s163` is the latest.
 - **Size of the change** (against upstream `47eb8ad02`): 92 files, about 27 000 lines added, 267 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
@@ -309,7 +309,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s162` is attached to the [s162 release](../../releases/tag/s162)
+A Linux x86-64 binary of `s163` is attached to the [s163 release](../../releases/tag/s163)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -362,3 +362,4 @@ change on its own. The tags are:
 | s160 | XSPICE microstrip lines: the `sqr()` macro had no parentheses, so `sqr(er - 1)` was -1; coupled lines (`cpmlin`) were up to 14 % off in S and single lines with Yamashita dispersion (`mlin disp=2`) up to 10 % in Z; also the coupled-line Kirschning P1 term |
 | s161 | BSIM4 `version = 4.5`: a zero drain/source perimeter with `permod = 1` gave a negative sidewall junction capacitance (in forward bias only), a jump at zero bias and Newton cycling there (a sky130 5 V buck stopped in the dead time); now zero, as in BSIM 4.6.2 and later |
 | s162 | coupled CPL lines (`P` element with two or more lines): fixes a regression of s159-s161 that made them drift and go unstable as the step shrank (two coupled lines: 12.1 V at 1 ps from a 5 V source); re-run coupled-line results from s159-s161 |
+| s163 | CPL lines: the real pole of complex-pole entries now uses the line's own trapezoidal rule; lines with three or more conductors no longer settle to a step-dependent wrong level (cpl3_4_line.sp: 3.72 to 5.03 V before, 4.985 V at every step now; stock ngspice has the same fault), single lines settle exactly |

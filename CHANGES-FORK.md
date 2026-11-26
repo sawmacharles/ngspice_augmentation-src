@@ -485,3 +485,14 @@ s159 changed the CPL real-pole history update to the exact piecewise-linear conv
 Test suite `test_txl_cpl`: two new checks.
 
 - `be580ed80` cpl (#1850): advance the history with the load's trapezoidal rule; coupled lines no longer go unstable at small steps
+
+
+## s163 — CPL lines independent of the time step
+
+1 commit.
+
+The CPL line predicts each step with the trapezoidal rule; s162 made the real-pole entries' history follow that rule. The entries whose fit has complex poles kept one exception: their real pole was advanced with the exact piecewise-linear update (the complex pair already used the trapezoidal rule). Lines with three or more conductors, whose fits have complex poles, therefore settled to a wrong level that moved with the step: examples/TransmissionLines/cpl3_4_line.sp, v(6) at 30 ns, read 5.034 / 5.038 / 4.508 / 6.584 / 3.716 V at tmax 50 / 10 / 5 / 2 / 1 ps; stock ngspice gives the same. A 400-section coupled lumped ladder gives 4.985 V. That real pole now uses the trapezoidal rule as well: 4.9851 to 4.9855 V at all five steps, the late tail (49 ns) within 1.6 % of the ladder. Single CPL lines (and TXL models with R/L above 1.6e9, which run as one) now settle exactly. `CPL_IMG_EXACT=1` in the environment restores the old update.
+
+Test suite `test_txl_cpl`: the coupled-line check now runs at 50, 5 and 1 ps with 0.1 % on the ladder; one red-proof check added.
+
+- `588873f58` cpl (#1850): advance the real pole of complex-pole entries with the load's trapezoidal rule; 3- and 4-line CPL no longer depend on the step
