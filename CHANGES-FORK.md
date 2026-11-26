@@ -463,3 +463,14 @@ New test suites: `test_ddt`, `test_txl_cpl` (63 suites).
 New test suite: `test_tline_macros` (64 suites).
 
 - `8b6727717` tlines (#1885): parenthesise the sqr/cubic/quadr macros; coupled-line Kirschning P1 with +
+
+
+## s161 — BSIM4 version 4.5: negative effective junction perimeter
+
+1 commit.
+
+With `pd = 0` (or `ps = 0`) given and `permod = 1`, the BSIM4 4.5 code (`bsim4v5`) took the effective perimeter as PD - Weff*nf, which is negative. The sidewall junction capacitance cjswd*Pdeff was then negative; the charge code leaves a negative term out in reverse bias but adds it in forward bias, so the junction capacitance jumped at zero bias (with a large cjswd it went negative). sky130's 5 V subcircuits pass `pd = 0` and `ps = 0` with `permod = 1`. On a 5 V sky130 synchronous buck a step and Newton trace showed Newton cycling on the low-side switch's internal drain-body node, the junction voltage alternating between -0.030 and +0.013 V at every step size down to 1e-16 s, and the transient stopped with "timestep too small" in the dead time. The bin-edge card choice taken in at s155 only changed the trajectory: with either card, W moved 1 ppm off the edge also stopped, and a 1e12 ohm resistor on a node that already had 5 ohm to ground let it finish. BSIM 4.6.2 and later (ngspice's `bsim4v6`, `bsim4v7`, `bsim4`) set a negative effective perimeter to zero; `bsim4v5` now does the same. Reverse-bias junction charge is unchanged. `BSIM4V5_PERIM_LEGACY=1` in the environment keeps the old values.
+
+New test suite: `test_bsim4v5_perim` (65 suites).
+
+- `10dc5fa98` bsim4v5 (#1793): a negative effective junction perimeter is set to zero, as in BSIM 4.6.2 and later
