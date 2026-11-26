@@ -149,7 +149,11 @@ CKTnewTask(CKTcircuit *ckt, TSKtask **taskPtr, IFuid taskName, TSKtask **defPtr)
 #ifdef KLU
         tsk->TSKkluMODE         = CKTkluOFF;
         tsk->TSKkluMemGrowFactor = 1.2 ;
-        tsk->TSKautoklu         = 0; /* card #496: opt-in, off by default */
+        /* card #1907: on by default since s165 (was opt-in, #496): a circuit of autoklu_threshold (2000)
+           nodes or more that states no solver runs on KLU (5120-transistor sky130 netlist: matrix factor
+           26 s -> 1.8 s). .options sparse, .options autoklu=0 or NGSPICE_AUTOKLU=0 keep SPARSE. */
+        {   const char *e = getenv("NGSPICE_AUTOKLU");
+            tsk->TSKautoklu = (e && e[0] == '0') ? 0 : 1; }
         tsk->TSKkluExplicit     = 0;
         tsk->TSKautokluThreshold = 2000.0;
 #endif
