@@ -474,3 +474,14 @@ With `pd = 0` (or `ps = 0`) given and `permod = 1`, the BSIM4 4.5 code (`bsim4v5
 New test suite: `test_bsim4v5_perim` (65 suites).
 
 - `10dc5fa98` bsim4v5 (#1793): a negative effective junction perimeter is set to zero, as in BSIM 4.6.2 and later
+
+
+## s162 — coupled CPL lines (regression of s159-s161)
+
+1 commit.
+
+s159 changed the CPL real-pole history update to the exact piecewise-linear convolution with each term's own c/x. The line predicts the present step with the trapezoidal rule, so the two no longer matched, and coupled lines (two or more) drifted and went unstable as the step shrank: two coupled lines with the parameters of examples/TransmissionLines/cpl3_4_line.sp read 5.05 V at 30 ns at tmax 50 ps, 5.40 V at 5 ps and 12.1 V at 1 ps, from a 5 V source (s158 and stock ngspice 4.99 V, a 400-section coupled ladder 4.985 V). The history now uses the same trapezoidal rule as the present step: 4.9856 to 4.9930 V from 50 ps to 1 ps. Single CPL lines and TXL lines do not use this path and are unchanged; the s159 note that CPL settled values were "now right" held for single lines only. The 4-line deck itself still depends on the step below 10 ps, as in stock ngspice (a different path). `CPL_HIST_S159=1` in the environment restores the s159-s161 update. Coupled-line results from s159, s160 and s161 should be re-run.
+
+Test suite `test_txl_cpl`: two new checks.
+
+- `be580ed80` cpl (#1850): advance the history with the load's trapezoidal rule; coupled lines no longer go unstable at small steps

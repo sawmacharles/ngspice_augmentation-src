@@ -10,8 +10,8 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Since `s155`
   every later upstream commit up to `47eb8ad02` (2026-11-21) is picked on top, unchanged.
-- **This fork:** 252 commits on top of that base (87 of them upstream), the branch `main`.
-  Releases are the tags `s125` … `s161`; `s161` is the latest.
+- **This fork:** 253 commits on top of that base (87 of them upstream), the branch `main`.
+  Releases are the tags `s125` … `s162`; `s162` is the latest.
 - **Size of the change** (against upstream `47eb8ad02`): 92 files, about 27 000 lines added, 267 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
@@ -309,7 +309,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s161` is attached to the [s161 release](../../releases/tag/s161)
+A Linux x86-64 binary of `s162` is attached to the [s162 release](../../releases/tag/s162)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -361,3 +361,4 @@ change on its own. The tags are:
 | s159 | `ddt()` in B sources: the derivative of the converged waveform by the circuit's integration formula, with its Jacobian (was one step late; a B-source capacitor did not run); TXL/CPL lossy lines: history times no longer truncated to whole picoseconds, convolution slope per term (settled values were off by up to 10 % and moved with the step size); a warning for lossy TXL models |
 | s160 | XSPICE microstrip lines: the `sqr()` macro had no parentheses, so `sqr(er - 1)` was -1; coupled lines (`cpmlin`) were up to 14 % off in S and single lines with Yamashita dispersion (`mlin disp=2`) up to 10 % in Z; also the coupled-line Kirschning P1 term |
 | s161 | BSIM4 `version = 4.5`: a zero drain/source perimeter with `permod = 1` gave a negative sidewall junction capacitance (in forward bias only), a jump at zero bias and Newton cycling there (a sky130 5 V buck stopped in the dead time); now zero, as in BSIM 4.6.2 and later |
+| s162 | coupled CPL lines (`P` element with two or more lines): fixes a regression of s159-s161 that made them drift and go unstable as the step shrank (two coupled lines: 12.1 V at 1 ps from a 5 V source); re-run coupled-line results from s159-s161 |
