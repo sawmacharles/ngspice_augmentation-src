@@ -258,11 +258,43 @@ create_model(CKTcircuit *ckt, INPmodel *modtmp, INPtables *tab)
 }
 
 
+/* The next token of line as INPgetNetTok(&line, &token, 1) finds it, without copying it: *start and *len give
+   the token, line moves past it and the separators after it. Card #2060: parse_line ran INPgetNetTok (one
+   allocation and free per token) over every candidate card's whole parameter list for each instance. */
+static void
+next_net_tok(char **line, char **start, size_t *len)
+{
+    char *p = *line, *q;
+    while (*p == ' ' || *p == '\t' || *p == '=' || *p == '(' || *p == ')' || *p == ',')
+        p++;
+    for (q = p; *q && *q != ' ' && *q != '\t' && *q != '\r' && *q != '=' && *q != ',' && *q != '(' && *q != ')'; q++)
+        ;
+    if (q == p && *q)
+        q++;
+    *start = p;
+    *len = (size_t) (q - p);
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '=' || *q == ',')
+        q++;
+    *line = q;
+}
+
+
+static int
+binsel_nocache(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("BINSEL_NOCACHE") ? 1 : 0;
+    return v;
+}
+
+
 static bool
 parse_line(char *line, char *tokens[], int num_tokens, double values[], bool found[])
 {
     int get_index = -1;
     int i;
+    bool old = binsel_nocache();
 
     for (i = 0; i < num_tokens; i++)
         found[i] = FALSE;
@@ -277,14 +309,21 @@ parse_line(char *line, char *tokens[], int num_tokens, double values[], bool fou
             continue;
         }
 
-        char *token = NULL;
-        INPgetNetTok(&line, &token, 1);
-
-        for (i = 0; i < num_tokens; i++)
-            if (strcmp(tokens[i], token) == 0)
-                get_index = i;
-
-        txfree(token);
+        if (old) {
+            char *token = NULL;
+            INPgetNetTok(&line, &token, 1);
+            for (i = 0; i < num_tokens; i++)
+                if (strcmp(tokens[i], token) == 0)
+                    get_index = i;
+            txfree(token);
+        } else {
+            char *t;
+            size_t n;
+            next_net_tok(&line, &t, &n);
+            for (i = 0; i < num_tokens; i++)
+                if (strncmp(tokens[i], t, n) == 0 && tokens[i][n] == '\0')
+                    get_index = i;
+        }
     }
 
     for (i = 0; i < num_tokens; i++)
@@ -414,7 +453,10 @@ binnable_type(int type)
    5120-transistor sky130 netlist spent 12 minutes here. The index is rebuilt when modtab changes (models are
    prepended, so its head pointer changes) and lists exactly the cards model_name_match(name, card) == 2 selects,
    in the same order. BINSEL_SCAN=1 keeps the old full scan (red proof). */
-typedef struct { INPmodel **v; int n, cap; } bin_list;
+/* lim[k] caches parse_line's lmin, lmax, wmin, wmax of v[k] (card #2060): state[k] 0 not read yet, 1 read,
+   2 a size limit is missing; line[k] is the card text it was read from (read again if that changes). */
+typedef double bin_lim[4];
+typedef struct { INPmodel **v; bin_lim *lim; char *state; char **line; int n, cap; } bin_list;
 static NGHASHPTR  bin_index = NULL;
 static INPmodel  *bin_index_head = NULL;
 static NGHASHPTR  bin_index_modhash = NULL;
@@ -424,6 +466,9 @@ bin_list_free(void *p)
 {
     bin_list *b = (bin_list *) p;
     tfree(b->v);
+    tfree(b->lim);
+    tfree(b->state);
+    tfree(b->line);
     tfree(b);
 }
 
@@ -455,7 +500,7 @@ bin_index_build(void)
         key = copy_substring(name, dot);
         b = (bin_list *) nghash_find(bin_index, key);
         if (!b) {
-            b = TMALLOC(bin_list, 1);
+            b = TMALLOC(bin_list, 1);   /* zeroed */
             nghash_insert(bin_index, key, b);   /* the table keeps key */
         } else {
             tfree(key);
@@ -463,7 +508,12 @@ bin_index_build(void)
         if (b->n == b->cap) {
             b->cap = b->cap ? 2 * b->cap : 8;
             b->v = TREALLOC(INPmodel *, b->v, b->cap);
+            b->lim = TREALLOC(bin_lim, b->lim, b->cap);
+            b->state = TREALLOC(char, b->state, b->cap);
+            b->line = TREALLOC(char *, b->line, b->cap);
         }
+        b->state[b->n] = 0;
+        b->line[b->n] = NULL;
         b->v[b->n++] = m;
     }
     bin_index_head = modtab;
@@ -517,8 +567,18 @@ bin_select(char *name, double l, double w, double w_nf, bool outermax, bool lega
             return NULL;
         }
 
-        if (!parse_line(modtmp->INPmodLine->line, model_tokens, 4, parse_values, parse_found))
+        if (cands && !binsel_nocache()) {
+            char *ln = modtmp->INPmodLine->line;
+            if (cands->state[ci] == 0 || cands->line[ci] != ln) {
+                cands->state[ci] = parse_line(ln, model_tokens, 4, cands->lim[ci], parse_found) ? 1 : 2;
+                cands->line[ci] = ln;
+            }
+            if (cands->state[ci] != 1)
+                continue;
+            memcpy(parse_values, cands->lim[ci], sizeof parse_values);
+        } else if (!parse_line(modtmp->INPmodLine->line, model_tokens, 4, parse_values, parse_found)) {
             continue;
+        }
 
         if (hs_pruned &&
             !((float) l >= (float) parse_values[0] && (float) l < (float) parse_values[1] &&

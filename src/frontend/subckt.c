@@ -102,6 +102,9 @@ static int  numdevs(char *s);
 static wordlist *modtranslate(struct card *deck, char *subname, wordlist *new_modnames);
 static void devmodtranslate(struct card *deck, char *subname, wordlist * const orig_modnames);
 static bool su_has_wnflag(struct card *deck);
+static bool su_lw_direct(struct card *deck, bool *mos_nf);
+static void find_prune_scales(struct card *deck);
+int subckt_prune_default(void);
 
 /* hash table to store the global nodes
  * For now its use is limited to avoid double entries in global_nodes[] */
@@ -232,6 +235,9 @@ inp_subcktexpand(struct card *deck) {
         fprintf(stderr, "%3d:%s\n", c->linenum, c->line);
     }
 #endif
+
+    if (subckt_prune_default())
+        find_prune_scales(deck);
 
     nupa_signal(NUPADECKCOPY);
     /* get the subckt names from the deck */
@@ -430,6 +436,135 @@ su_has_wnflag(struct card *deck)
         if (*deck->line == 'm' && strstr(deck->line, " wnflag="))
             return TRUE;
     return FALSE;
+}
+
+
+/* Card #2060: in the default mode the expander keeps only the binned cards an instance may use, as it does
+   in hs/spe compatibility, when that is sure to keep the card INPgetModBin() chooses: every MOS line of the
+   subcircuit takes l={l} and w={w} as they are (once each), the subcircuit calls no other subcircuit and
+   defines none, the call gives l and w as numbers (inp_get_w_l_x), and nf when the bin may be chosen on w/nf.
+   *mos_nf is set if a MOS line gives nf. SUBCKT_PRUNE_OFF=1 keeps all the cards (as before);
+   SUBCKT_PRUNE_TRACE=1 prints the choice per call. */
+
+/* " name={name}" in line (spaces allowed around = and inside the braces), followed by a space or the end */
+static bool
+token_is(const char *line, const char *name)
+{
+    size_t n = strlen(name);
+    const char *p = line;
+    while ((p = strstr(p, name)) != NULL) {
+        const char *q = p + n;
+        if (p > line && isspace_c(p[-1])) {
+            q = skip_ws(q);
+            if (*q == '=') {
+                q = skip_ws(q + 1);
+                if (*q == '{') {
+                    q = skip_ws(q + 1);
+                    if (strncmp(q, name, n) == 0) {
+                        q = skip_ws(q + n);
+                        if (*q == '}' && (q[1] == '\0' || isspace_c(q[1])))
+                            return TRUE;
+                    }
+                }
+            }
+        }
+        p++;
+    }
+    return FALSE;
+}
+
+static bool
+su_lw_direct(struct card *deck, bool *mos_nf)
+{
+    int n_mos = 0;
+    *mos_nf = FALSE;
+    for (; deck; deck = deck->nextcard) {
+        char *ln = deck->line;
+        if (*ln == 'x' || ciprefix(".subckt", ln))
+            return FALSE;
+        if (*ln != 'm')
+            continue;
+        /* numparam has put placeholders for the {..}: look at the line it took */
+        const char *src = nupa_source_line(deck->linenum);
+        if (!src || *src != 'm' || !(token_is(src, "l") && token_is(src, "w")))
+            return FALSE;
+        /* l= or w= given twice: do not guess which one the device takes */
+        const char *p1 = strstr(ln, " l="), *p2 = strstr(ln, " w=");
+        if (!p1 || !p2 || strstr(p1 + 1, " l=") || strstr(p2 + 1, " w="))
+            return FALSE;
+        if (strstr(ln, " nf="))
+            *mos_nf = TRUE;
+        n_mos++;
+    }
+    return n_mos > 0;
+}
+
+/* The scales INPgetModBin() may apply to l and w (card #2060): the scale variable, every scale= on a .option card
+   of the deck and on an option line of a script (spinit, .spiceinit). In the default mode these become the
+   variable only after the expansion, and which one wins depends on their order: a card is kept if it may be
+   chosen under any of them. n_prune_scales < 0: a value could not be read, the default mode does not prune. */
+#define MAX_PRUNE_SCALES 8
+static double prune_scales[MAX_PRUNE_SCALES];
+static int n_prune_scales = -1;
+/* wnflag may be set by an option not yet applied: keep the cards for the total w and for w/nf */
+static bool prune_wnflag_maybe = FALSE;
+
+static void
+add_prune_scales_from(const char *line)
+{
+    const char *p = line;
+    if (strstr(line, "wnflag"))
+        prune_wnflag_maybe = TRUE;
+    while (n_prune_scales >= 0 && (p = strstr(p, "scale")) != NULL) {
+        const char *q;
+        if (p > line && !isspace_c(p[-1]) && p[-1] != ',') {
+            p++;
+            continue;
+        }
+        q = skip_ws(p + 5);
+        if (*q != '=') {
+            p++;
+            continue;
+        }
+        q = skip_ws(q + 1);
+        int err;
+        char *r = (char *) q;
+        double v = INPevaluate(&r, &err, 1);
+        if (err || v <= 0 || n_prune_scales == MAX_PRUNE_SCALES)
+            n_prune_scales = -1;
+        else
+            prune_scales[n_prune_scales++] = v;
+        p = q;
+    }
+}
+
+static void
+find_prune_scales(struct card *deck)
+{
+    double v;
+    struct card *c;
+    n_prune_scales = 0;
+    prune_wnflag_maybe = INPgetWnflag() != 0;
+    if (cp_getvar("scale", CP_REAL, &v, 0))
+        prune_scales[n_prune_scales++] = v;
+    for (c = deck; c && n_prune_scales >= 0; c = c->nextcard)
+        if (ciprefix(".opt", c->line))
+            add_prune_scales_from(c->line);
+    for (c = inp_deck_options(); c && n_prune_scales >= 0; c = c->nextcard)
+        add_prune_scales_from(c->line);
+    for (c = inp_com_options(); c && n_prune_scales >= 0; c = c->nextcard)
+        add_prune_scales_from(c->line);
+    if (n_prune_scales == 0)
+        prune_scales[n_prune_scales++] = 1.;
+}
+
+int
+subckt_prune_default(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("SUBCKT_PRUNE_OFF") ? 0 : 1;
+    return v;
 }
 
 
@@ -638,14 +773,28 @@ doit(struct card *deck, wordlist *modnames) {
                     /* If we have modern PDKs, we have to reduce the amount of memory required.
                        We try to reduce the models to the one really used.
                        Otherwise su_deck is full of unused binning models.*/
-                    if ((newcompat.hs || newcompat.spe) && c->w > 0 && c->l > 0) {
+                    bool hs_mode = newcompat.hs || newcompat.spe;
+                    bool prune = hs_mode;
+                    if (!hs_mode && subckt_prune_default() && c->w > 0 && c->l > 0) {
+                        bool mos_nf;
+                        prune = n_prune_scales > 0 && su_lw_direct(su_deck, &mos_nf);
+                        /* the bin is chosen on w/nf: nf must be known from the call */
+                        if (prune && mos_nf && (prune_wnflag_maybe || su_has_wnflag(su_deck)) && !c->nf_given)
+                            prune = FALSE;
+                        static int trace = -1;
+                        if (trace < 0)
+                            trace = getenv("SUBCKT_PRUNE_TRACE") ? 1 : 0;
+                        if (trace)
+                            fprintf(stderr, "prune %d: %s (w=%g l=%g nf=%g)\n", prune, c->line, c->w, c->l, c->nf);
+                    }
+                    if (prune && c->w > 0 && c->l > 0) {
                         /* extract wmin, wmax, lmin, lmax */
                         struct card* new_deck = su_deck;
                         struct card* prev = NULL;
                         /* wnflag on a MOS line of the subcircuit overrides the
                            option, and may be an expression: then keep the cards
                            for both w/nf and w, INPgetModBin() will choose */
-                        bool inst_wnflag = su_has_wnflag(su_deck);
+                        bool inst_wnflag = su_has_wnflag(su_deck) || (!hs_mode && prune_wnflag_maybe);
                         while (su_deck) {
                             if (!ciprefix(".model", su_deck->line)) {
                                 prev = su_deck;
@@ -721,25 +870,31 @@ doit(struct card *deck, wordlist *modnames) {
                                 continue;
                             }
 
-                            double csl = scale * c->l;
+                            bool keep = FALSE;
+                            int si, ns = hs_mode ? 1 : n_prune_scales;
+                            for (si = 0; si < ns && !keep; si++) {
+                            double sc = hs_mode ? scale : prune_scales[si];
+                            double csl = sc * c->l;
                             /* w per finger, or total w if wnflag is 0 */
-                            double csw = scale * c->w / (wnflag ? c->nf : 1.);
+                            double csw = sc * c->w / (wnflag ? c->nf : 1.);
                             /* the other width, if wnflag is given on the instance */
-                            double csw2 = scale * c->w / (wnflag ? 1. : c->nf);
+                            double csw2 = sc * c->w / (wnflag ? 1. : c->nf);
                             /* keep the card if INPgetModBin() may choose it, by the standard or by the
                                legacy rule: it looks at both for its bin-edge warning (#1766).
                                With binlegacy, keep what ngspice kept before 2026-10-30: min <= size < max
                                in float, on w/nf whatever wnflag says. */
-                            if (binlegacy
-                                ? ((float) ((float) scale * c->l) >= (float) flmin &&
-                                   (float) ((float) scale * c->l) < (float) flmax &&
-                                   (float) ((float) scale * c->w / c->nf) >= (float) fwmin &&
-                                   (float) ((float) scale * c->w / c->nf) < (float) fwmax)
+                            keep = (binlegacy && hs_mode)
+                                ? ((float) ((float) sc * c->l) >= (float) flmin &&
+                                   (float) ((float) sc * c->l) < (float) flmax &&
+                                   (float) ((float) sc * c->w / c->nf) >= (float) fwmin &&
+                                   (float) ((float) sc * c->w / c->nf) < (float) fwmax)
                                 : (INPbinMatch(csl, flmin, flmax, csw, fwmin, fwmax, outermax) > 0 ||
                                 INPbinMatchLegacy(csl, flmin, flmax, csw, fwmin, fwmax) > 0 ||
                                 (inst_wnflag &&
                                  (INPbinMatch(csl, flmin, flmax, csw2, fwmin, fwmax, outermax) > 0 ||
-                                  INPbinMatchLegacy(csl, flmin, flmax, csw2, fwmin, fwmax) > 0)))) {
+                                  INPbinMatchLegacy(csl, flmin, flmax, csw2, fwmin, fwmax) > 0)));
+                            }
+                            if (keep) {
                                 /* use the current .model card */
                                 prev = su_deck;
                                 su_deck = su_deck->nextcard;
@@ -860,6 +1015,7 @@ struct card * inp_deckcopy(struct card *deck) {
         d->w = deck->w;
         d->l = deck->l;
         d->nf = deck->nf;
+        d->nf_given = deck->nf_given;
         d->line = copy(deck->line);
         if (deck->error)
             d->error = copy(deck->error);
@@ -905,6 +1061,7 @@ struct card *inp_deckcopy_oc(struct card * deck)
         d->w = deck->w;
         d->l = deck->l;
         d->nf = deck->nf;
+        d->nf_given = deck->nf_given;
         d->linenum_orig = deck->linenum_orig;
         d->compmod = deck->compmod;
         d->linesource = deck->linesource;
@@ -964,6 +1121,7 @@ struct card* inp_deckcopy_ln(struct card* deck)
         d->w = deck->w;
         d->l = deck->l;
         d->nf = deck->nf;
+        d->nf_given = deck->nf_given;
         d->linenum_orig = deck->linenum_orig;
         d->linesource = deck->linesource;
         d->linenum = deck->linenum;

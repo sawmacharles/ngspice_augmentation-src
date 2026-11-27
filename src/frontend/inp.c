@@ -46,6 +46,22 @@ Author: 1985 Wayne A. Christopher
 #include "ngspice/compatmode.h"
 
 static struct card *com_options = NULL;
+
+/* the option lines of scripts (spinit, .spiceinit, *ng_script), for subckt.c (card #2060) */
+struct card *
+inp_com_options(void)
+{
+    return com_options;
+}
+
+/* the .option cards of the deck being read, taken out of it before the subcircuit expansion (card #2060) */
+static struct card *deck_options = NULL;
+
+struct card *
+inp_deck_options(void)
+{
+    return deck_options;
+}
 static struct card *mc_deck = NULL;
 static struct card *recent_deck = NULL;
 
@@ -644,6 +660,7 @@ inp_spsource(FILE *fp, bool comfile, char *filename, bool intfile)
     /* Extract the .option or option lines from the deck into 'options',
         and remove them from the deck. Exceptions are .option with params. */
     options = inp_getopts(deck, comfile);
+    deck_options = options;
     /* Check for '.option cshunt=val' and set a global variable cshunt_value.
        Same for rshunt, setting rshunt_value, and seed, setting rndseed. */
     eval_opt(options, comfile, fp, intfile);
@@ -1036,8 +1053,10 @@ inp_spsource(FILE *fp, bool comfile, char *filename, bool intfile)
                     line_free(realdeck, TRUE);
                     line_free(deck->actualLine, TRUE);
                     tfree(tt);
+                    deck_options = NULL;
                     return 1;
                 }
+            deck_options = NULL;   /* only for the expansion */
 
             /* replace agauss(x,y,z) in each b-line by suitable value, one for all */
             bool statlocal = cp_getvar("statlocal", CP_BOOL, NULL, 0);

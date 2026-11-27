@@ -192,6 +192,7 @@ static char* libprint(struct card* t, const char *dir);
 
 static void inp_repair_dc_ps(struct card* oldcard);
 static void inp_get_w_l_x(struct card* oldcard);
+extern int subckt_prune_default(void);
 
 static char* eval_m(char* line, char* tline);
 static char* eval_tc(char* line, char* tline);
@@ -959,6 +960,7 @@ void inp_get_w_l_x(struct card* card) {
 
         card->w = card->l = 0;
         card->nf = 1.;
+        card->nf_given = 0;
 
         /* exclude any command inside .control ... .endc */
         if (ciprefix(".control", curr_line)) {
@@ -973,7 +975,8 @@ void inp_get_w_l_x(struct card* card) {
             continue;
         }
         /* only subcircuit invocations */
-        if (*curr_line != 'x' || (!newcompat.hs && !newcompat.spe) || card->compmod > 0) {
+        /* card #2060: also in the default mode, for subckt.c's choice of the binned cards (subckt_prune_default) */
+        if (*curr_line != 'x' || (!newcompat.hs && !newcompat.spe && !subckt_prune_default()) || card->compmod > 0) {
             continue;
         }
 
@@ -1016,6 +1019,7 @@ void inp_get_w_l_x(struct card* card) {
                 card->nf = 1.;
                 continue;
             }
+            card->nf_given = 1;
         }
         else {
             continue;
@@ -8929,12 +8933,27 @@ static void inp_quote_params(struct card *c, struct card *end_c,
         if (strchr("fhmouydqjzswx", *curr_line))
             num_terminals++;
 
+        /* Card #2060: where the search starts (after the terminals and the token after them) was found again
+           for every parameter, num_params times per line; it is found once and again only after the line was
+           rewritten. INPQUOTE_OLD=1 keeps the per-parameter skip. */
+        static int quote_old = -1;
+        char *start_line = NULL;
+        ptrdiff_t start_off = 0;
+        if (quote_old < 0)
+            quote_old = getenv("INPQUOTE_OLD") ? 1 : 0;
+
         for (i = 0; i < num_params; i++) {
 
             char *s = curr_line;
 
-            for (j = 0; j < num_terminals + 1; j++)
-                s = skip_token(s);
+            if (quote_old || start_line != curr_line) {
+                for (j = 0; j < num_terminals + 1; j++)
+                    s = skip_token(s);
+                start_line = curr_line;
+                start_off = s - curr_line;
+            } else {
+                s = curr_line + start_off;
+            }
 
             while ((s = ya_search_identifier(
                             s, deps[i].param_name, curr_line)) != NULL) {

@@ -87,6 +87,7 @@ struct card {
     double w;
     double l;
     double nf;
+    int nf_given;   /* nf= on the x line (inp_get_w_l_x, card #2060) */
     int compmod;
 };
 

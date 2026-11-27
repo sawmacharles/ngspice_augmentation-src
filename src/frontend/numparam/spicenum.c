@@ -298,6 +298,16 @@ static dico_t *dicoS = NULL;
 static dico_t *dicos_list[100];
 
 
+/* The source line of linenum as numparam took it, with its {..} expressions (NULL if none). Card #2060. */
+const char *
+nupa_source_line(int linenum)
+{
+    if (!dicoS || !dicoS->dynrefptr || linenum < 0 || linenum > dicoS->linecount)
+        return NULL;
+    return dicoS->dynrefptr[linenum];
+}
+
+
 static void
 nupa_init(void)
 {
