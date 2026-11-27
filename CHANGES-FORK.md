@@ -529,3 +529,14 @@ PDK subcircuits such as sky130's `sky130_fd_pr__nfet_01v8` hold one MOSFET (`l={
 New test suite: `test_subckt_prune` (68 suites).
 
 - `e67656b79` subckt binned cards (#2060): keep only the cards an instance may use in the default mode; bin limits read once
+
+
+## s167 — BSIM1/BSIM2 noise and reverse-mode AC
+
+1 commit.
+
+The BSIM1 (level 4) and BSIM2 (level 5) noise code used `inst->B1gm` and `inst->B1cd` (B2 likewise) as values; they are offsets into the state vector (`B1states + 7`, `+ 4`). The channel thermal noise therefore used a small integer as gm (amplitude 108-161 times too large on the ngspice test cards tests/bsim1 and tests/bsim2) and the flicker noise one as the drain current, so it did not follow the bias. The noise now reads the state values: the thermal noise equals sqrt(4kT 2/3 gm) and the flicker PSD follows the drain current. In the reverse mode (vds < 0) the load filled the source-charge derivatives but stored the drain-charge ones for the AC analysis and the bypass path, left from the previous instance; they are now derived from charge conservation, so a reversed transistor's AC response equals the mirrored connection. DC and transient results are unchanged.
+
+New test suite: `test_bsim12_noise_ac` (69 suites).
+
+- `15478ff97` BSIM1/BSIM2 (#2090): noise read gm and cd from the state vector; reverse-mode drain charge derivatives for AC and bypass
