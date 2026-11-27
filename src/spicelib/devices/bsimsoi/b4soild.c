@@ -9907,7 +9907,8 @@ line860:
             /* v3.1 added for RF */
             if (here->B4SOIrgateMod == 3)
                 ceqqgmid = *(ckt->CKTstate0 + here->B4SOIcqgmid)
-                    + gcgmdb * vbd + gcgmsb * vbs - gcgmgmb * vgmb;/* 3.2 bug fix */
+                    + gcgmdb * vbd + gcgmsb * vbs - gcgmgmb * vgmb/* 3.2 bug fix */
+                    - gcgmeb * veb; /* the cgeo term: the matrix has gcgmeb in the E column */
             else
                 ceqqgmid = 0.0;
             /* v3.1 added for RF end */
