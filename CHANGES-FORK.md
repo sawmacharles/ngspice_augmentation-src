@@ -540,3 +540,14 @@ The BSIM1 (level 4) and BSIM2 (level 5) noise code used `inst->B1gm` and `inst->
 New test suite: `test_bsim12_noise_ac` (69 suites).
 
 - `15478ff97` BSIM1/BSIM2 (#2090): noise read gm and cd from the state vector; reverse-mode drain charge derivatives for AC and bypass
+
+
+## s168 — B4SOI rgatemod=3 gate current
+
+1 commit.
+
+With `rgatemod=3` the overlap charge at B4SOI's internal gate node is qgmid = cgdo vgmd + cgso vgms + cgeo vgme. The matrix stamps its derivative with respect to the substrate node (gcgmeb), but the companion current left out the matching -gcgmeb veb term. With a floating body veb is not zero at rest, so every transient carried a constant false gate current of about cgeo W nf (2/dt) veb: -1.7 uA at rest on a 5 um test device at 1 ps steps where the operating point gives 1e-18 A, another value at another step, and the gate charge drifted (-5e-14 C per period on the test card). The term is added; rgatemod 0/1/2, DC and AC are unchanged.
+
+New test suite: `test_b4soi_rgate3` (70 suites).
+
+- `428fe199a` B4SOI rgatemod=3 (#2096): the cgeo term in the internal gate node's companion current
