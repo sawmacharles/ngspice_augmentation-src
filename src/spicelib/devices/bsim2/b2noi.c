@@ -88,14 +88,14 @@ B2noise (int mode, int operation, GENmodel *genmodel, CKTcircuit *ckt,
 
 		    NevalSrc(&noizDens[B2IDNOIZ],&lnNdens[B2IDNOIZ],
 				 ckt,THERMNOISE,inst->B2dNodePrime,inst->B2sNodePrime,
-                                 (2.0/3.0 * fabs(inst->B2gm * inst->B2m)));
+                                 (2.0/3.0 * fabs(*(ckt->CKTstate0 + inst->B2gm) * inst->B2m)));
 
 		    NevalSrc(&noizDens[B2FLNOIZ], NULL, ckt,
 				 N_GAIN,inst->B2dNodePrime, inst->B2sNodePrime,
 				 (double)0.0);
 		    noizDens[B2FLNOIZ] *= model->B2fNcoef * inst->B2m *
 				 exp(model->B2fNexp *
-				 log(MAX(fabs((double)inst->B2cd),N_MINLOG))) /
+				 log(MAX(fabs(*(ckt->CKTstate0 + inst->B2cd)),N_MINLOG))) /
 				 (data->freq *
 				 (inst->B2w - model->B2deltaW * 1e-6) *
 				 (inst->B2l - model->B2deltaL * 1e-6) *

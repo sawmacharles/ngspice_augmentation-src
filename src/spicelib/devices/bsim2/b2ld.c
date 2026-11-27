@@ -335,6 +335,11 @@ B2load(GENmodel *inModel, CKTcircuit *ckt)
                         cdgb = *(ckt->CKTstate0 + here->B2cdgb);
                         cddb = *(ckt->CKTstate0 + here->B2cddb);
                         cdsb = *(ckt->CKTstate0 + here->B2cdsb);
+                        if (here->B2mode < 0) {
+                            csgb = -(cggb + cbgb + cdgb);
+                            csdb = -(cgdb + cbdb + cddb);
+                            cssb = -(cgsb + cbsb + cdsb);
+                        }
                         capbs = *(ckt->CKTstate0 + here->B2capbs);
                         capbd = *(ckt->CKTstate0 + here->B2capbd);
                         ByPass = 1;
@@ -414,6 +419,12 @@ B2load(GENmodel *inModel, CKTcircuit *ckt)
                 B2evaluate(-vds,vbd,vgd,here,model,&gm,&gds,&gmbs,&qgate,
                     &qbulk,&qsrc,&cggb,&cgsb,&cgdb,&cbgb,&cbsb,&cbdb,&csgb,
                     &cssb,&csdb,&cdrain,&von,&vdsat,ckt);
+                /* reverse mode: the drain charge derivatives (physical
+                 * terminals) are needed for the AC/bypass state; they were
+                 * left from the previous instance before */
+                cdgb = -(cggb + cbgb + csgb);
+                cddb = -(cgdb + cbdb + csdb);
+                cdsb = -(cgsb + cbsb + cssb);
             }
           
             here->B2von = model->B2type * von;
