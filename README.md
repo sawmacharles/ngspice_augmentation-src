@@ -10,8 +10,8 @@ without changing their results.
 - **Base:** the ngspice development branch (`pre-master-48`) at commit `aaba50ba3f49`
   (2026-09-27), kept on the branch [`upstream-base`](../../tree/upstream-base). Since `s155`
   every later upstream commit up to `47eb8ad02` (2026-11-21) is picked on top, unchanged.
-- **This fork:** 256 commits on top of that base (87 of them upstream), the branch `main`.
-  Releases are the tags `s125` … `s165`; `s165` is the latest.
+- **This fork:** 257 commits on top of that base (87 of them upstream), the branch `main`.
+  Releases are the tags `s125` … `s166`; `s166` is the latest.
 - **Size of the change** (against upstream `47eb8ad02`): 92 files, about 27 000 lines added, 267 removed.
 - **License:** unchanged, the ngspice licenses (see `COPYING`). Upstream authorship is kept in the
   history.
@@ -295,7 +295,7 @@ stock injected-tone route drifts toward half the switching frequency. On an idea
 
 ## How it is tested
 
-Each release was run through the full set of test suites (67 at `s165`: stability, periodic analyses, noise,
+Each release was run through the full set of test suites (68 at `s166`: stability, periodic analyses, noise,
 sensitivities, XSPICE, speed, checkpointing, Monte Carlo and yield tools), also on a build with
 AddressSanitizer, plus about 210 checks of documented example results. A fix comes with a
 "red proof": its test is run on the previous build, or with the fix switched off, and must
@@ -309,7 +309,7 @@ an analytic reference for plain transient.
 
 ## Building
 
-A Linux x86-64 binary of `s165` is attached to the [s165 release](../../releases/tag/s165)
+A Linux x86-64 binary of `s166` is attached to the [s166 release](../../releases/tag/s166)
 (extract anywhere, run `bin/ngspice-aug`). To build, Linux, same as stock ngspice:
 
 ```sh
@@ -365,3 +365,4 @@ change on its own. The tags are:
 | s163 | CPL lines: the real pole of complex-pole entries now uses the line's own trapezoidal rule; lines with three or more conductors no longer settle to a step-dependent wrong level (cpl3_4_line.sp: 3.72 to 5.03 V before, 4.985 V at every step now; stock ngspice has the same fault), single lines settle exactly |
 | s164 | model binning indexed by base name: netlists built from PDK subcircuits with their own binned cards (sky130 and others) no longer take time growing with the square of the transistor count (5120-transistor sky130 netlist: 730 s before, 86 s now, same results) |
 | s165 | `autoklu` on by default: a circuit of 2000 nodes or more that names no solver runs on KLU (5120-transistor sky130 netlist: factor 26 s -> 1.8 s, run 86 s -> 47 s); `.options sparse` keeps SPARSE |
+| s166 | PDK subcircuits with their own binned cards (sky130 and others): each instance keeps only the cards it may use when that cannot change the chosen card (as hs/spe compatibility did), and a card's size limits are read once (5120-transistor sky130 netlist: 58-66 s -> 26-27 s, peak memory 3.8 GB -> 0.39 GB, same results); `SUBCKT_PRUNE_OFF=1` keeps all the cards |

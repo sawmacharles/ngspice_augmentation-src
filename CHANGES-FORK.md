@@ -518,3 +518,14 @@ New test suite: `test_binsel_scale` (66 suites).
 New test suite: `test_autoklu_default` (67 suites).
 
 - `ccd51733a` autoklu (#1907): on by default; a circuit of 2000 nodes or more that states no solver runs on KLU
+
+
+## s166 — PDK netlists: only the binned cards an instance may use
+
+1 commit.
+
+PDK subcircuits such as sky130's `sky130_fd_pr__nfet_01v8` hold one MOSFET (`l={l} w={w} nf={nf}`) and 100-180 binned `.model` cards. Every instance got a copy of all of them, numparam evaluated every card per instance, and the bin choice read each candidate card's whole text twice with an allocation per token. The card pruning that hs/spe compatibility already did now also runs in the default mode when it cannot change the chosen card: every MOS line of the subcircuit takes `l={l}` and `w={w}` as they are, the subcircuit calls and defines no other subcircuit, the call gives l and w as numbers (and nf when the bin may be chosen on w/nf). A card is kept if the standard or the legacy binning rule may choose it, under every scale that may apply and for both w and w/nf when `wnflag` may be set, so the bin-edge warnings are unchanged. The bin choice reads a card's `lmin/lmax/wmin/wmax` once and without allocating, and the automatic `{..}` around parameters finds each line's search start once instead of once per `.param`. Generated 5120-transistor sky130 netlist: 58-66 s -> 26-27 s, peak memory 3.84 GB -> 0.39 GB, the same time points and measurements. `SUBCKT_PRUNE_OFF=1`, `BINSEL_NOCACHE=1` and `INPQUOTE_OLD=1` keep the old behaviour of each part.
+
+New test suite: `test_subckt_prune` (68 suites).
+
+- `e67656b79` subckt binned cards (#2060): keep only the cards an instance may use in the default mode; bin limits read once
